@@ -15,6 +15,8 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 pub mod anthropic;
+pub mod persist;
+pub use persist::default_config_path;
 
 /// Short model name resolved by [`canonical_model`] to the
 /// Sonnet 4.6 model id. PRD §1.2 / §2.6.
@@ -160,6 +162,15 @@ pub enum BrainError {
     /// Required runtime resource is missing.
     #[error("missing required resource: {0}")]
     Missing(String),
+    /// Config file present but contents could not be deserialised
+    /// into a [`BrainConfig`].
+    #[error("invalid config at {path}: {reason}")]
+    InvalidConfig {
+        /// Path to the offending file.
+        path: PathBuf,
+        /// Human-readable parse failure.
+        reason: String,
+    },
 }
 
 /// Reject model names that are not in [`ALLOWED_MODEL_NAMES`].
