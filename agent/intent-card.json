@@ -1,0 +1,162 @@
+{
+  "schema": "autobuilder.intent_card.v1",
+  "intent_slug": "wintermute-brain",
+  "prd_source": "/home/jsy/wintermute/autobuilder/PRD-wintermute-brain.md",
+  "root_motivation": "wintermute's brain is a long-running Claude API conversation loop with persistent memory backed by recall-daemon. Default model Sonnet 4.6 (Opus 4.7 opt-in per turn), prompt cache on the persistent profile + today's thread, sub-10 ms recall retrieval. Tool router gives Fleet 2 the seam for browser/mail/desktop tools. Destructive intents always route back through wm-dialog for verbal confirmation; brain never acts destructively unilaterally. Offline → friendly spoken apology, pending utterance replays on restore.",
+  "user_persona": "Two consumers. Primary: wm-dialog forwards transcribed user utterances via the wm.dialog.turn.user agorabus topic and consumes wm.brain.reply / wm.brain.reply.destructive to drive wm-tts and confirmation flows. Secondary: operators issue `wmd --model opus` to override the next-turn model or `wmd --default-model` to change the persistent default. The non-literate end-user never invokes wmd directly — she experiences the brain only through dialog ↔ tts.",
+  "unfakeable_metric": {
+    "name": "acceptance_tests_passing",
+    "lower_is_better": false,
+    "harness_command": "cargo test --release --quiet -- --format=terse 2>&1 | awk '/test result:/ {gsub(\";\",\"\",$4); print $4}' | tail -1",
+    "target": 5
+  },
+  "acceptance_criteria": [
+    {
+      "id": "AC1",
+      "level": "MUST",
+      "description": "End-to-end wake → first TTS audio of brain reply ≤2 s for a short query with all components warm and prompt cache hot.",
+      "test": "tests/acceptance_ac1.rs::wake_to_first_audio_under_2s — gated #[ignore] (requires live fleet + Anthropic API + cache primed). Unit-level path measures wall-clock from wm.dialog.turn.user publish to wm.brain.reply publish against a fake Anthropic client returning a 1-sentence response after a synthetic 200 ms latency; asserts brain-loop overhead (subtract fake-API latency) ≤ 1500 ms."
+    },
+    {
+      "id": "AC2",
+      "level": "MUST",
+      "description": "Conversation context survives reboot — after restart, asking 'what were we talking about?' surfaces today's earlier turns via recall.",
+      "test": "tests/acceptance_ac2.rs::today_thread_persists_across_restart — drives 3 turns through a fake-API daemon; tears down DaemonState; constructs a new DaemonState pointing at the same recall root and same wintermute-thread-<date> subject; on a probe turn, asserts the prior 3 turns appear in the retrieved memories passed to the API client (captured by a recording fake)."
+    },
+    {
+      "id": "AC3",
+      "level": "MUST",
+      "description": "Prompt cache hit rate ≥60% across a typical day of conversation, measured by cache_read_input_tokens / input_tokens from API responses.",
+      "test": "tests/acceptance_ac3.rs::cache_hit_ratio_above_60pct — replays a recorded 50-turn fixture against a fake Anthropic client that mimics the cache_read_input_tokens semantics (echoes the cache_control breakpoints brain sent); asserts sum(cache_read) / sum(input_tokens) ≥ 0.6. Real-API path #[ignore]'d with manual procedure (8-hour run + per-response counter aggregation)."
+    },
+    {
+      "id": "AC4",
+      "level": "MUST",
+      "description": "Network drop → spoken apology within 3 s, no hang or crash. Pending utterance replays on network restore.",
+      "test": "tests/acceptance_ac4.rs::offline_apology_and_pending_replay — fake Anthropic client returns Err(Transport) for the first 3 attempts then Ok on the 4th; asserts (a) wm.brain.reply with the apology copy fires within 3 s of the initial publish, (b) utterance is queued under pending: true, (c) on the synthetic `back online` tick (controlled clock advance ≥30 s), the pending utterance is re-attempted and produces a normal wm.brain.reply."
+    },
+    {
+      "id": "AC5",
+      "level": "MUST",
+      "description": "Destructive intent test suite: 10 scripted destructive prompts each produce a wm.brain.reply.destructive event with valid intent_id and confirm_keyword; none execute without granted confirmation.",
+      "test": "tests/acceptance_ac5.rs::destructive_intents_gate_before_execute — feeds 10 destructive prompts through a fake Anthropic client returning canned JSON-block responses; asserts each (a) emits wm.brain.reply.destructive with parsed intent_id + confirm_keyword + summary, (b) no wm.brain.tool.call is emitted before wm.dialog.confirm.granted is observed, (c) on grant, the tool.call fires exactly once with the intended args; on deny, a cancellation reply fires and the intent is dropped."
+    },
+    {
+      "id": "AC6",
+      "level": "MUST",
+      "description": "Model swap via `wmd --model opus` for next turn uses Opus exactly once, then reverts to default.",
+      "test": "tests/acceptance_ac6.rs::next_turn_model_swap_reverts — sends a control event (or invokes the CLI runtime helper) setting next-turn override=opus; observes the recording fake API client: turn N uses model=opus, turn N+1 uses the configured default (sonnet)."
+    },
+    {
+      "id": "AC7",
+      "level": "MUST",
+      "description": "wm.recall.save_fact and wm.recall.search tool calls work end-to-end (verified via `recall list --subject wintermute-profile`).",
+      "test": "tests/acceptance_ac7.rs::recall_tools_roundtrip — fake Anthropic client emits a tool_use for wm.recall.save_fact; asserts a record lands under wintermute-profile in a tmpdir-overridden recall root. A second turn emits wm.recall.search; asserts the saved fact appears in the tool_result payload threaded back to the API."
+    },
+    {
+      "id": "AC8",
+      "level": "MUST",
+      "description": "8-hour steady-state run with simulated 100 turns: no leaks (RSS growth <100 MB), no missed dialog events, no zombie pending utterances.",
+      "test": "tests/acceptance_ac8.rs::soak_8h_no_leaks_no_zombies — gated #[ignore] (long-running). Manual procedure documented in test doc-comment: run wmd under procstat for 8h with a 100-turn fake-driver; assert peak RSS - startup RSS < 100 MB, event-count parity dialog↔brain, and zero rows in the pending queue at shutdown."
+    }
+  ],
+  "scope": [
+    "Rust binary `wmd`: long-lived daemon. On startup loads WM_ANTHROPIC_API_KEY, connects to recall-daemon UDS at $XDG_RUNTIME_DIR/recall.sock (in-process fallback when daemon down), loads profile (WM_USER_NAME, WM_TIMEZONE, recall subject wintermute-profile), subscribes wm.dialog.turn.user / wm.dialog.confirm.*, publishes wm.brain.reply / wm.brain.reply.destructive / wm.brain.tool.call / wm.brain.tool.result / wm.brain.error.",
+    "Conversation loop: retrieve top-K memories filtered by subject wintermute-thread-<YYYY-MM-DD> + wintermute-profile; compose Anthropic request with two prompt-cache breakpoints (profile + today's history); call (stream=true; v1 buffers full response); route tool calls / destructive intents; memorize (USER, ASSISTANT) pair to today's thread subject.",
+    "Tool router (Fleet 1 minimum): wm.time.now, wm.weather.today (wttr.in, 15 min cache), wm.recall.search, wm.recall.save_fact (writes wintermute-profile), wm.tts.tone, wm.fleet2.* (return 'not yet' gracefully). Async dispatch; results fed back as tool_result blocks. Fleet 2 plugs new tools through the same router shape.",
+    "Destructive intent gating: system prompt instructs model to emit a fenced JSON block {intent, summary, confirm_keyword} for destructive actions and NOT to execute. wmd parses; publishes wm.brain.reply.destructive; awaits wm.dialog.confirm.granted before firing the actual tool.call; on denied, emits cancellation reply and drops the intent.",
+    "Offline behavior: cache user utterance with pending: true on API failure (network, rate limit, 5xx); speak friendly apology via wm.brain.reply text; retry every 30 s on a background task; replay pending on success. Fleet 1 minimum is the apology + time. (Cached news / music are Fleet 2.)",
+    "Model swap: `wmd --model opus` for the next turn only; `wmd --default-model sonnet|opus` updates the persistent default. Implemented via a single Mutex<NextTurnOverride> + persisted Default field in the daemon's runtime config.",
+    "Recall integration: each turn → one memory under wintermute-thread-<YYYY-MM-DD> with USER/ASSISTANT fields. Profile facts → wintermute-profile. Nightly digest under wintermute-day-digest; trim raw turns >30 days. (Nightly digest job MAY land in iter-2.)",
+    "Anthropic API client: prefer official Rust SDK if present at build time; otherwise reqwest + hand-rolled JSON for streaming + tool-use. Trait-object boundary so the conversation loop is tested with a recording fake."
+  ],
+  "non_goals": [
+    "Browser / mail / desktop / calendar / music tools — Fleet 2 plugs them into the same tool-router.",
+    "Multi-day thread continuity beyond recall summarization — Fleet 3.",
+    "Voice profile / speaker recognition — Fleet 3.",
+    "Sentiment-aware reply tuning — Fleet 3.",
+    "Sentence-stream-to-TTS for sub-1-s perceived latency — Fleet 2 optimization (v1 buffers full response).",
+    "Turn-taking, barge-in, verbal-confirm prompts/UX — owned by wm-dialog (this PRD only emits the events; wm-dialog handles the spoken side).",
+    "Daily cost telemetry (`wm cost`) — small follow-up PRD per Risk note.",
+    "Defining the systemd .service file for wmd — installed by wintermute-platform's hook portion."
+  ],
+  "hard_constraints": {
+    "rust_edition": "2024",
+    "target_kind": "cli",
+    "deny_unsafe": true,
+    "max_deps": 25,
+    "msrv": "1.85",
+    "additional": {
+      "bin_name": "wmd",
+      "default_model": "claude-sonnet-4-6",
+      "opus_model": "claude-opus-4-7",
+      "api_key_env": "WM_ANTHROPIC_API_KEY",
+      "user_name_env": "WM_USER_NAME",
+      "timezone_env": "WM_TIMEZONE",
+      "recall_socket": "$XDG_RUNTIME_DIR/recall.sock",
+      "today_thread_subject": "wintermute-thread-<YYYY-MM-DD>",
+      "profile_subject": "wintermute-profile",
+      "day_digest_subject": "wintermute-day-digest",
+      "raw_turn_retention_days": 30,
+      "agorabus_topics_in": "wm.dialog.turn.user,wm.dialog.confirm.granted,wm.dialog.confirm.denied",
+      "agorabus_topics_out": "wm.brain.reply,wm.brain.reply.destructive,wm.brain.tool.call,wm.brain.tool.result,wm.brain.error",
+      "fleet1_tools": "wm.time.now,wm.weather.today,wm.recall.search,wm.recall.save_fact,wm.tts.tone",
+      "destructive_intent_block_shape": "{intent: '...', summary: '...', confirm_keyword: '...'}",
+      "install_path": "~/.local/bin/ (per CLAUDE_SELF.md convention; same as wintermute-platform and wm-tts)",
+      "wake_to_first_audio_target_ms": 2000,
+      "offline_apology_target_ms": 3000,
+      "prompt_cache_hit_ratio_target": 0.6,
+      "soak_rss_growth_mb_max": 100
+    }
+  },
+  "five_whys_trace": [
+    {
+      "why": 1,
+      "q": "Why a dedicated wmd daemon rather than letting wm-dialog hold the Claude API loop itself?",
+      "a": "Because dialog's job (turn-taking, barge-in, verbal confirm) is event-paced human-timescale work; brain's job (API request composition, prompt-cache management, tool routing, recall retrieval) is compute-paced and can block on network. Cleaving them prevents an API stall from also stalling barge-in cancellation. They share agorabus topics so the seam is debuggable from the outside — wm.dialog.turn.user / wm.brain.reply traces tell the whole turn story."
+    },
+    {
+      "why": 2,
+      "q": "Why Sonnet 4.6 as the default rather than Opus 4.7?",
+      "a": "Cost + latency. A chatty day with Sonnet is ~$0.50-$2; the same day with Opus would 10× that. Sonnet handles ~95% of casual conversation well; Opus is the right tool for deep questions (writing a letter, planning a trip). `wmd --model opus` is the per-turn escape hatch — explicit opt-in for the cases that justify the cost."
+    },
+    {
+      "why": 3,
+      "q": "Why route destructive intents back through wm-dialog for verbal confirm rather than confirming in the brain itself?",
+      "a": "Because confirmation is a turn — it needs the same TTS / barge-in / wake-word machinery dialog already owns. Duplicating that in brain would double-implement turn-taking, and the failure mode of a destructive action getting executed because brain's confirm UI had a bug is far worse than the failure mode of dialog timing out a confirm. Single owner per concern."
+    },
+    {
+      "why": 4,
+      "q": "Why two prompt-cache breakpoints (profile + today's thread) rather than one large blob?",
+      "a": "Different TTLs. Profile rarely changes — it's a long-tail cache that benefits from extended-cache pricing once volume warrants. Today's thread grows monotonically through the day and rotates at midnight — needs cache-warm at every turn but invalidates daily. Two breakpoints let each tier amortize correctly. The Anthropic SDK supports up to 4 breakpoints so we have headroom for a third (e.g. recall-retrieved memories) if measurement shows it'd help."
+    },
+    {
+      "why": 5,
+      "q": "Why pending+replay on network drop rather than just surfacing the error and moving on?",
+      "a": "Because the conversational contract is 'I heard you.' A heard-but-not-answered utterance is a far better failure mode than a dropped one — the user said something, the system acknowledged with the apology, and when the network returns the conversation continues. Dropping the utterance silently would erode trust in the system over time even if individual outages are short."
+    }
+  ],
+  "ambiguities_resolved": [
+    {
+      "question": "PRD §3 lists 'anthropic-sdk-rust (or hand-rolled via reqwest)' — which does iter-1 commit to?",
+      "resolution": "Hand-rolled reqwest + serde_json. There is no widely-adopted official Anthropic Rust SDK at PRD-write time; pulling a third-party crate adds risk vs. reward for the small surface we need (Messages API + streaming + tool_use + prompt cache control). Iter-1 ships a trait-object Anthropic client with a hand-rolled reqwest implementation + a recording fake for tests; swapping to an official SDK later is mechanical."
+    },
+    {
+      "question": "PRD §2.3 streaming: `stream: true` is mentioned but v1 'buffers full response'. What ships iter-1?",
+      "resolution": "Iter-1 issues stream: true but accumulates the full response before publishing wm.brain.reply. The sentence-boundary handoff to TTS is a Fleet 2 optimization (PRD §5). Choosing stream: true now keeps the API contract stable — when Fleet 2 wires sentence-level streaming, the wire format doesn't change."
+    },
+    {
+      "question": "PRD §2.4 destructive block parsing — what's the parser shape and what happens on parse failure?",
+      "resolution": "Parser scans the response text for a final fenced code block with language=json (```json ... ```), then attempts serde_json::from_str into a struct {intent: String, summary: String, confirm_keyword: String}. On parse failure (malformed JSON, missing fields, wrong type), the response is treated as non-destructive and logged at WARN; this matches PRD §6 'Mitigation: ... on parse failure, treat as non-destructive and log for debugging.'"
+    },
+    {
+      "question": "PRD §2.7 nightly digest job — iter-1 or later?",
+      "resolution": "Deferred to iter-2 or later. Iter-1 ships the per-turn memorize path and the 30-day retention is enforced lazily on next-day-of-startup. The nightly summarization job (model-generated digest under wintermute-day-digest) is a separate background task; deferring keeps iter-1 focused on the live conversation loop. PRD §7 leans 'model-generated, cached, overnight' — consistent with iter-2+ scheduling."
+    },
+    {
+      "question": "PRD §2.6 model swap state — where does the persistent default live?",
+      "resolution": "wmd writes its runtime config to $XDG_CONFIG_HOME/wintermute/brain.toml (default model + last_started_at). Per-turn `--model opus` override lives in-memory only and consumes itself on the next turn. `wmd --default-model opus` rewrites brain.toml atomically. CLI invocations without a running daemon return rc=0 after writing config (a future `wmd ctl` RPC will hot-reload in iter-2)."
+    }
+  ],
+  "created_at": "2026-05-26T03:21:58Z"
+}
