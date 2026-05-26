@@ -14,6 +14,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+pub mod anthropic;
+
 /// Short model name resolved by [`canonical_model`] to the
 /// Sonnet 4.6 model id. PRD §1.2 / §2.6.
 pub const SHORT_MODEL_SONNET: &str = "sonnet";
