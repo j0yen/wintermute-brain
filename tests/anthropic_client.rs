@@ -27,6 +27,7 @@ use axum::{
 };
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
+use futures_util::StreamExt;
 use wintermute_brain::anthropic::{
     AnthropicClient, ClientError, Message, MessageRequest, Role, StreamEvent,
 };
@@ -207,6 +208,63 @@ async fn collect_messages_surfaces_non_2xx_as_status_error() {
             assert!(body.contains("authentication_error"));
         }
         other => panic!("expected Status error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn stream_messages_emits_events_in_order() {
+    let sse = "event: message_start\n\
+               data: {\"type\":\"message_start\"}\n\n\
+               event: content_block_start\n\
+               data: {\"type\":\"content_block_start\",\"index\":0}\n\n\
+               event: content_block_delta\n\
+               data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n\
+               event: message_stop\n\
+               data: {\"type\":\"message_stop\"}\n\n";
+    let (base, _recorded) = spawn_mock(StatusCode::OK, sse, "text/event-stream").await;
+    let client = AnthropicClient::new("k").unwrap().with_base_url(base);
+
+    let mut stream = client
+        .stream_messages(&sample_request())
+        .await
+        .expect("stream construction");
+    let mut events = Vec::new();
+    while let Some(item) = stream.next().await {
+        events.push(item.expect("stream yields ok"));
+    }
+    assert_eq!(
+        events,
+        vec![
+            StreamEvent::MessageStart,
+            StreamEvent::ContentBlockStart { index: 0 },
+            StreamEvent::TextDelta {
+                index: 0,
+                text: "hi".to_string()
+            },
+            StreamEvent::MessageStop,
+        ]
+    );
+}
+
+#[tokio::test]
+async fn stream_messages_surfaces_non_2xx_before_any_item() {
+    let (base, _recorded) = spawn_mock(
+        StatusCode::TOO_MANY_REQUESTS,
+        r#"{"type":"error","error":{"type":"rate_limit","message":"slow down"}}"#,
+        "application/json",
+    )
+    .await;
+    let client = AnthropicClient::new("k").unwrap().with_base_url(base);
+    let err = client
+        .stream_messages(&sample_request())
+        .await
+        .expect_err("non-2xx must surface eagerly");
+    match err {
+        ClientError::Status { code, body } => {
+            assert_eq!(code, 429);
+            assert!(body.contains("rate_limit"));
+        }
+        other => panic!("expected Status, got {other:?}"),
     }
 }
 

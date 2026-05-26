@@ -8,6 +8,10 @@
 //! only the streaming-message shape used by `wmd`'s conversation loop;
 //! tool-use and citations are deferred.
 
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use futures_util::Stream;
 use serde::{Deserialize, Serialize};
 
 /// Anthropic-API role labels. The Messages API accepts only `user` and
@@ -362,6 +366,246 @@ impl AnthropicClient {
         let body = resp.text().await?;
         decode_sse_body(&body)
     }
+
+    /// POST a streaming Messages request and return an asynchronous
+    /// [`Stream`] of [`StreamEvent`]s as the API emits them.
+    ///
+    /// Unlike [`collect_messages`], the response body is consumed
+    /// incrementally — events surface as soon as the upstream HTTP
+    /// layer flushes the relevant bytes, enabling sentence-boundary
+    /// TTS handoff (PRD §1.3.3 Fleet 2). Non-2xx responses are
+    /// surfaced eagerly during stream construction.
+    ///
+    /// # Errors
+    /// Returns [`ClientError::Transport`] if the request fails to
+    /// send, [`ClientError::Status`] if the server responded non-2xx
+    /// (body truncated to 4 KiB), or errors during streaming surface
+    /// as individual [`Stream::Item`] values.
+    ///
+    /// [`collect_messages`]: AnthropicClient::collect_messages
+    pub async fn stream_messages(
+        &self,
+        req: &MessageRequest,
+    ) -> Result<EventStream, ClientError> {
+        let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
+        let resp = self
+            .http
+            .post(&url)
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", &self.anthropic_version)
+            .header("content-type", "application/json")
+            .header("accept", "text/event-stream")
+            .json(req)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            let truncated = if body.len() > 4096 {
+                body.get(..4096).unwrap_or("").to_string()
+            } else {
+                body
+            };
+            return Err(ClientError::Status {
+                code: status.as_u16(),
+                body: truncated,
+            });
+        }
+
+        Ok(EventStream::from_bytes_stream(resp.bytes_stream()))
+    }
+}
+
+/// Incremental SSE decoder.
+///
+/// Bytes arrive in arbitrarily-sized chunks (a single TCP read may
+/// split a multi-byte UTF-8 codepoint or land in the middle of an
+/// event). The decoder accumulates them, only attempting UTF-8
+/// decoding up to the most recent valid prefix, and yields one
+/// [`StreamEvent`] per call to [`pop_event`] until the buffered text
+/// has no more `\n\n` (or `\r\n\r\n`) delimited blocks.
+///
+/// [`pop_event`]: SseDecoder::pop_event
+#[derive(Debug, Default)]
+pub struct SseDecoder {
+    text: String,
+    incomplete_utf8: Vec<u8>,
+}
+
+impl SseDecoder {
+    /// Construct an empty decoder.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append one chunk of bytes to the decoder's buffer.
+    ///
+    /// Bytes that complete a UTF-8 codepoint are folded into the
+    /// internal text buffer; a partial codepoint at the tail is held
+    /// over until the next chunk arrives.
+    pub fn feed(&mut self, chunk: &[u8]) {
+        let mut combined = std::mem::take(&mut self.incomplete_utf8);
+        combined.extend_from_slice(chunk);
+        match std::str::from_utf8(&combined) {
+            Ok(s) => self.text.push_str(s),
+            Err(e) => {
+                let valid_up_to = e.valid_up_to();
+                let valid_prefix = combined.get(..valid_up_to).unwrap_or(&[]);
+                if let Ok(valid_str) = std::str::from_utf8(valid_prefix) {
+                    self.text.push_str(valid_str);
+                }
+                let suffix = combined.get(valid_up_to..).unwrap_or(&[]);
+                self.incomplete_utf8 = suffix.to_vec();
+            }
+        }
+    }
+
+    /// Extract the next decoded event from the buffer, if a complete
+    /// event-block is present.
+    ///
+    /// Returns:
+    /// - `Some(Ok(event))` when a complete block was found and parsed.
+    /// - `Some(Err(_))` when a complete block was found but the
+    ///   payload was malformed. The block is consumed regardless so
+    ///   the decoder can make forward progress.
+    /// - `None` when the buffer holds no terminated block yet (caller
+    ///   should feed more bytes).
+    pub fn pop_event(&mut self) -> Option<Result<StreamEvent, ClientError>> {
+        loop {
+            let (block_len, delim_len) = find_block_boundary(&self.text)?;
+            // Build the block string and drop the consumed prefix
+            // (block + delimiter) from the buffer in one drain call.
+            let drained: String = self.text.drain(..block_len + delim_len).collect();
+            let block = drained.get(..block_len).unwrap_or("");
+            match parse_event_block(block) {
+                Ok(Some(ev)) => return Some(Ok(ev)),
+                Ok(None) => continue,
+                Err(e) => return Some(Err(e)),
+            }
+        }
+    }
+}
+
+/// Search the buffer for the first SSE block boundary (`\n\n` or
+/// `\r\n\r\n`). Returns `(block_byte_len, delim_byte_len)` such that
+/// `text[..block_byte_len]` is the block payload and
+/// `text[block_byte_len..block_byte_len + delim_byte_len]` is the
+/// delimiter.
+fn find_block_boundary(text: &str) -> Option<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len {
+        let b = bytes.get(i).copied()?;
+        if b == b'\n' {
+            if bytes.get(i + 1).copied() == Some(b'\n') {
+                return Some((i, 2));
+            }
+        } else if b == b'\r'
+            && bytes.get(i + 1).copied() == Some(b'\n')
+            && bytes.get(i + 2).copied() == Some(b'\r')
+            && bytes.get(i + 3).copied() == Some(b'\n')
+        {
+            return Some((i, 4));
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Parse one event block (the substring between two boundaries) into
+/// at most one [`StreamEvent`].
+///
+/// Returns `Ok(None)` for comment-only blocks (lines starting with
+/// `:`) and `event:`-only keepalives that carry no `data:` payload.
+fn parse_event_block(block: &str) -> Result<Option<StreamEvent>, ClientError> {
+    let trimmed = block.trim_matches(|c: char| c == '\n' || c == '\r');
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let mut data_lines: Vec<&str> = Vec::new();
+    for raw_line in trimmed.split('\n') {
+        let line = raw_line.trim_end_matches('\r');
+        if line.starts_with(':') || line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("data:") {
+            let payload = rest.strip_prefix(' ').unwrap_or(rest);
+            data_lines.push(payload);
+        }
+    }
+    if data_lines.is_empty() {
+        return Ok(None);
+    }
+    let payload = data_lines.join("\n");
+    Ok(Some(parse_sse_event(&payload)?))
+}
+
+/// Asynchronous stream of [`StreamEvent`]s produced by
+/// [`AnthropicClient::stream_messages`].
+///
+/// The stream wraps reqwest's `bytes_stream()` and feeds incoming
+/// chunks into an [`SseDecoder`]. Each call to `poll_next` first
+/// drains any complete event the decoder already holds, then pulls
+/// more bytes from upstream.
+pub struct EventStream {
+    inner: Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>,
+    decoder: SseDecoder,
+    upstream_done: bool,
+}
+
+impl std::fmt::Debug for EventStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EventStream")
+            .field("decoder", &self.decoder)
+            .field("upstream_done", &self.upstream_done)
+            .finish_non_exhaustive()
+    }
+}
+
+impl EventStream {
+    /// Wrap a `Stream` of HTTP body chunks. Visible to tests; production
+    /// code reaches this through [`AnthropicClient::stream_messages`].
+    pub(crate) fn from_bytes_stream<S>(inner: S) -> Self
+    where
+        S: Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
+    {
+        Self {
+            inner: Box::pin(inner),
+            decoder: SseDecoder::new(),
+            upstream_done: false,
+        }
+    }
+}
+
+impl Stream for EventStream {
+    type Item = Result<StreamEvent, ClientError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        loop {
+            if let Some(ev) = this.decoder.pop_event() {
+                return Poll::Ready(Some(ev));
+            }
+            if this.upstream_done {
+                return Poll::Ready(None);
+            }
+            match this.inner.as_mut().poll_next(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Some(Ok(chunk))) => {
+                    this.decoder.feed(chunk.as_ref());
+                }
+                Poll::Ready(Some(Err(e))) => {
+                    return Poll::Ready(Some(Err(ClientError::Transport(e))));
+                }
+                Poll::Ready(None) => {
+                    this.upstream_done = true;
+                }
+            }
+        }
+    }
 }
 
 /// Decode a buffered SSE body into the ordered sequence of
@@ -377,30 +621,11 @@ impl AnthropicClient {
 /// `data:` line, and [`ClientError::Parse`] when the payload fails
 /// `parse_sse_event`.
 pub fn decode_sse_body(body: &str) -> Result<Vec<StreamEvent>, ClientError> {
-    let normalized = body.replace("\r\n", "\n");
+    let mut decoder = SseDecoder::new();
+    decoder.feed(body.as_bytes());
     let mut out = Vec::new();
-    for block in normalized.split("\n\n") {
-        let trimmed = block.trim_matches('\n');
-        if trimmed.is_empty() {
-            continue;
-        }
-        let mut data_lines: Vec<&str> = Vec::new();
-        for line in trimmed.split('\n') {
-            if line.starts_with(':') || line.is_empty() {
-                continue;
-            }
-            if let Some(rest) = line.strip_prefix("data:") {
-                let payload = rest.strip_prefix(' ').unwrap_or(rest);
-                data_lines.push(payload);
-            }
-        }
-        // Comment-only blocks (`: ping`) and event-meta-only blocks
-        // (`event: ping` with no payload) are valid SSE keepalives — skip.
-        if data_lines.is_empty() {
-            continue;
-        }
-        let payload = data_lines.join("\n");
-        out.push(parse_sse_event(&payload)?);
+    while let Some(ev) = decoder.pop_event() {
+        out.push(ev?);
     }
     Ok(out)
 }
@@ -648,5 +873,95 @@ mod tests {
             .unwrap()
             .with_base_url("http://localhost:9999");
         assert_eq!(client.base_url, "http://localhost:9999");
+    }
+
+    #[test]
+    fn sse_decoder_yields_nothing_on_partial_block() {
+        let mut d = SseDecoder::new();
+        d.feed(b"event: message_start\ndata: {\"type\":\"message_start\"}");
+        assert!(d.pop_event().is_none());
+        d.feed(b"\n\n");
+        let ev = d.pop_event().unwrap().unwrap();
+        assert_eq!(ev, StreamEvent::MessageStart);
+        assert!(d.pop_event().is_none());
+    }
+
+    #[test]
+    fn sse_decoder_splits_across_chunks_byte_by_byte() {
+        let body = "event: message_start\n\
+                    data: {\"type\":\"message_start\"}\n\n\
+                    event: content_block_delta\n\
+                    data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n\
+                    event: message_stop\n\
+                    data: {\"type\":\"message_stop\"}\n\n";
+        let mut d = SseDecoder::new();
+        let mut events: Vec<StreamEvent> = Vec::new();
+        for byte in body.as_bytes() {
+            d.feed(&[*byte]);
+            while let Some(ev) = d.pop_event() {
+                events.push(ev.unwrap());
+            }
+        }
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::MessageStart,
+                StreamEvent::TextDelta {
+                    index: 0,
+                    text: "hi".to_string()
+                },
+                StreamEvent::MessageStop,
+            ]
+        );
+    }
+
+    #[test]
+    fn sse_decoder_handles_partial_utf8_across_chunks() {
+        // "é" is 0xC3 0xA9 in UTF-8 — split it across two feeds and
+        // confirm the decoder reassembles it before emitting the event.
+        let part1 = b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"caf\xC3";
+        let part2 = b"\xA9\"}}\n\n";
+        let mut d = SseDecoder::new();
+        d.feed(part1);
+        assert!(d.pop_event().is_none(), "no complete block yet");
+        d.feed(part2);
+        let ev = d.pop_event().unwrap().unwrap();
+        assert_eq!(
+            ev,
+            StreamEvent::TextDelta {
+                index: 0,
+                text: "café".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn sse_decoder_skips_comment_and_eventonly_keepalives() {
+        let mut d = SseDecoder::new();
+        d.feed(b": ping\n\nevent: ping\n\ndata: {\"type\":\"message_stop\"}\n\n");
+        let ev = d.pop_event().unwrap().unwrap();
+        assert_eq!(ev, StreamEvent::MessageStop);
+        assert!(d.pop_event().is_none());
+    }
+
+    #[test]
+    fn sse_decoder_consumes_malformed_block_and_recovers() {
+        let mut d = SseDecoder::new();
+        d.feed(b"data: not-json\n\ndata: {\"type\":\"message_stop\"}\n\n");
+        let first = d.pop_event().unwrap();
+        assert!(matches!(first, Err(ClientError::Parse(ParseError::Json(_)))));
+        let second = d.pop_event().unwrap().unwrap();
+        assert_eq!(second, StreamEvent::MessageStop);
+        assert!(d.pop_event().is_none());
+    }
+
+    #[test]
+    fn sse_decoder_handles_crlf_delimiter() {
+        let mut d = SseDecoder::new();
+        d.feed(b"event: message_start\r\ndata: {\"type\":\"message_start\"}\r\n\r\nevent: message_stop\r\ndata: {\"type\":\"message_stop\"}\r\n\r\n");
+        let a = d.pop_event().unwrap().unwrap();
+        let b = d.pop_event().unwrap().unwrap();
+        assert_eq!(a, StreamEvent::MessageStart);
+        assert_eq!(b, StreamEvent::MessageStop);
     }
 }
