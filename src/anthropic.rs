@@ -244,6 +244,167 @@ fn require_index(v: &serde_json::Value, kind: &str) -> Result<u32, ParseError> {
     })
 }
 
+/// Anthropic Messages API base URL used in production.
+pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
+
+/// `anthropic-version` request header value pinned by the brain.
+///
+/// Bumping requires re-validating that the SSE event shape we model in
+/// [`StreamEvent`] still matches the new API contract.
+pub const ANTHROPIC_VERSION: &str = "2023-06-01";
+
+/// Errors raised by [`AnthropicClient`] when calling the Messages API.
+#[derive(Debug, thiserror::Error)]
+pub enum ClientError {
+    /// Network, TLS, timeout, or other transport-level failure.
+    #[error("transport error: {0}")]
+    Transport(#[from] reqwest::Error),
+    /// API returned a non-2xx HTTP status; body is captured for logging.
+    #[error("anthropic api status {code}: {body}")]
+    Status {
+        /// HTTP status code.
+        code: u16,
+        /// Response body, truncated to 4 KiB for the message.
+        body: String,
+    },
+    /// SSE framing layer found a malformed event before `parse_sse_event`
+    /// could be called (e.g., event block with no `data:` line).
+    #[error("sse framing error: {reason}")]
+    Frame {
+        /// Human-readable diagnosis.
+        reason: String,
+    },
+    /// A `data:` payload could not be decoded into a [`StreamEvent`].
+    #[error("sse parse error: {0}")]
+    Parse(#[from] ParseError),
+}
+
+/// Live HTTP client for `POST /v1/messages` with SSE streaming responses.
+///
+/// iter-4 buffers the full SSE response before dispatching events; per
+/// PRD §2.2.3 the v1 brain consumes the whole reply before handing to
+/// wm-tts. iter-5 will swap [`collect_messages`] for a true streaming
+/// surface once sentence-handoff lands.
+///
+/// [`collect_messages`]: AnthropicClient::collect_messages
+#[derive(Debug, Clone)]
+pub struct AnthropicClient {
+    http: reqwest::Client,
+    base_url: String,
+    api_key: String,
+    anthropic_version: String,
+}
+
+impl AnthropicClient {
+    /// Construct a client with the production base URL and the standard
+    /// `anthropic-version` header. The HTTP client is built lazily and
+    /// reuses connection pooling across calls.
+    ///
+    /// # Errors
+    /// Returns a [`ClientError::Transport`] if reqwest cannot construct
+    /// its default TLS-capable client (rare — happens only when the
+    /// rustls feature is mis-built).
+    pub fn new(api_key: impl Into<String>) -> Result<Self, ClientError> {
+        let http = reqwest::Client::builder().build()?;
+        Ok(Self {
+            http,
+            base_url: DEFAULT_BASE_URL.to_string(),
+            api_key: api_key.into(),
+            anthropic_version: ANTHROPIC_VERSION.to_string(),
+        })
+    }
+
+    /// Override the base URL (used by tests against an in-process mock
+    /// server). Production code should leave this untouched.
+    #[must_use]
+    pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
+        self.base_url = url.into();
+        self
+    }
+
+    /// POST a streaming Messages request and collect every SSE event
+    /// into a `Vec`, in order. Non-2xx responses become
+    /// [`ClientError::Status`]; framing or per-event decode failures
+    /// become [`ClientError::Frame`] / [`ClientError::Parse`].
+    ///
+    /// # Errors
+    /// See [`ClientError`] variants.
+    pub async fn collect_messages(
+        &self,
+        req: &MessageRequest,
+    ) -> Result<Vec<StreamEvent>, ClientError> {
+        let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
+        let resp = self
+            .http
+            .post(&url)
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", &self.anthropic_version)
+            .header("content-type", "application/json")
+            .header("accept", "text/event-stream")
+            .json(req)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            let truncated = if body.len() > 4096 {
+                body.get(..4096).unwrap_or("").to_string()
+            } else {
+                body
+            };
+            return Err(ClientError::Status {
+                code: status.as_u16(),
+                body: truncated,
+            });
+        }
+
+        let body = resp.text().await?;
+        decode_sse_body(&body)
+    }
+}
+
+/// Decode a buffered SSE body into the ordered sequence of
+/// [`StreamEvent`]s it carries.
+///
+/// Events are separated by a blank line; within each event we look for
+/// `data:` (or `data: ` with optional leading space) lines and feed
+/// their payload to [`parse_sse_event`]. Comment lines (`:` prefix) and
+/// non-`data:` fields are ignored.
+///
+/// # Errors
+/// Returns [`ClientError::Frame`] when an event block contains no
+/// `data:` line, and [`ClientError::Parse`] when the payload fails
+/// `parse_sse_event`.
+pub fn decode_sse_body(body: &str) -> Result<Vec<StreamEvent>, ClientError> {
+    let normalized = body.replace("\r\n", "\n");
+    let mut out = Vec::new();
+    for block in normalized.split("\n\n") {
+        let trimmed = block.trim_matches('\n');
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut data_lines: Vec<&str> = Vec::new();
+        for line in trimmed.split('\n') {
+            if line.starts_with(':') || line.is_empty() {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("data:") {
+                let payload = rest.strip_prefix(' ').unwrap_or(rest);
+                data_lines.push(payload);
+            }
+        }
+        // Comment-only blocks (`: ping`) and event-meta-only blocks
+        // (`event: ping` with no payload) are valid SSE keepalives — skip.
+        if data_lines.is_empty() {
+            continue;
+        }
+        let payload = data_lines.join("\n");
+        out.push(parse_sse_event(&payload)?);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -405,5 +566,87 @@ mod tests {
         let raw = r#"{"type":"content_block_start","content_block":{}}"#;
         let err = parse_sse_event(raw).unwrap_err();
         assert!(matches!(err, ParseError::Shape { ref kind, .. } if kind == "content_block_start"));
+    }
+
+    #[test]
+    fn decode_sse_body_single_event() {
+        let body = "event: message_start\n\
+                    data: {\"type\":\"message_start\"}\n\n";
+        let evs = decode_sse_body(body).unwrap();
+        assert_eq!(evs, vec![StreamEvent::MessageStart]);
+    }
+
+    #[test]
+    fn decode_sse_body_multi_event_in_order() {
+        let body = "event: message_start\n\
+                    data: {\"type\":\"message_start\"}\n\n\
+                    event: content_block_start\n\
+                    data: {\"type\":\"content_block_start\",\"index\":0}\n\n\
+                    event: content_block_delta\n\
+                    data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n\
+                    event: message_stop\n\
+                    data: {\"type\":\"message_stop\"}\n\n";
+        let evs = decode_sse_body(body).unwrap();
+        assert_eq!(evs.len(), 4);
+        assert_eq!(evs[0], StreamEvent::MessageStart);
+        assert_eq!(evs[1], StreamEvent::ContentBlockStart { index: 0 });
+        assert_eq!(
+            evs[2],
+            StreamEvent::TextDelta {
+                index: 0,
+                text: "hi".to_string(),
+            }
+        );
+        assert_eq!(evs[3], StreamEvent::MessageStop);
+    }
+
+    #[test]
+    fn decode_sse_body_handles_crlf() {
+        let body = "event: message_start\r\n\
+                    data: {\"type\":\"message_start\"}\r\n\r\n\
+                    event: message_stop\r\n\
+                    data: {\"type\":\"message_stop\"}\r\n\r\n";
+        let evs = decode_sse_body(body).unwrap();
+        assert_eq!(evs, vec![StreamEvent::MessageStart, StreamEvent::MessageStop]);
+    }
+
+    #[test]
+    fn decode_sse_body_skips_comment_and_event_only_blocks() {
+        let body = ": ping\n\n\
+                    event: ping\n\n\
+                    event: message_start\n\
+                    data: {\"type\":\"message_start\"}\n\n";
+        let evs = decode_sse_body(body).unwrap();
+        assert_eq!(evs, vec![StreamEvent::MessageStart]);
+    }
+
+    #[test]
+    fn decode_sse_body_handles_no_space_after_data_colon() {
+        let body = "data:{\"type\":\"message_stop\"}\n\n";
+        let evs = decode_sse_body(body).unwrap();
+        assert_eq!(evs, vec![StreamEvent::MessageStop]);
+    }
+
+    #[test]
+    fn decode_sse_body_surfaces_parse_error() {
+        let body = "data: not-json\n\n";
+        let err = decode_sse_body(body).unwrap_err();
+        assert!(matches!(err, ClientError::Parse(ParseError::Json(_))));
+    }
+
+    #[test]
+    fn client_new_succeeds_with_default_settings() {
+        let client = AnthropicClient::new("test-key").unwrap();
+        assert_eq!(client.base_url, DEFAULT_BASE_URL);
+        assert_eq!(client.anthropic_version, ANTHROPIC_VERSION);
+        assert_eq!(client.api_key, "test-key");
+    }
+
+    #[test]
+    fn client_with_base_url_overrides() {
+        let client = AnthropicClient::new("k")
+            .unwrap()
+            .with_base_url("http://localhost:9999");
+        assert_eq!(client.base_url, "http://localhost:9999");
     }
 }
