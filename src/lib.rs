@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod anthropic;
 pub mod persist;
+pub mod recall_client;
 pub use persist::default_config_path;
 
 /// Short model name resolved by [`canonical_model`] to the
