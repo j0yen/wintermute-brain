@@ -13,10 +13,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 use wintermute_brain::{
-    BrainConfig, BrainError, DEFAULT_API_KEY_ENV, default_config_path, validate_model_name,
+    BrainConfig, BrainError, DEFAULT_API_KEY_ENV, daemon, default_config_path, validate_model_name,
 };
 
 #[derive(Parser, Debug)]
@@ -151,10 +151,26 @@ fn load_effective(
     Ok(cfg)
 }
 
+#[allow(clippy::cognitive_complexity, reason = "runtime build + block_on + ExitCode shell")]
 fn run_start(cfg: &BrainConfig) -> ExitCode {
     info!(?cfg, "wmd start: config resolved");
-    warn!("wmd start: daemon loop deferred to iter-6");
-    ExitCode::from(2)
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(err) => {
+            error!(error = %err, "wmd start: tokio runtime build failed");
+            return ExitCode::from(1);
+        }
+    };
+    match runtime.block_on(daemon::run(cfg.clone())) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            error!(error = %err, "wmd start: daemon exited with error");
+            ExitCode::from(1)
+        }
+    }
 }
 
 #[allow(clippy::cognitive_complexity, reason = "validate -> load -> mutate -> save shell")]

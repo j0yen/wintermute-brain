@@ -57,7 +57,9 @@ name = "wmd"
 path = "src/main.rs"
 
 [dependencies]
+agorabus = { path = "../agorabus" }
 anyhow = "1"
+async-trait = "0.1"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }

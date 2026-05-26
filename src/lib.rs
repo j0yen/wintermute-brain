@@ -15,6 +15,8 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 pub mod anthropic;
+pub mod bus;
+pub mod daemon;
 pub mod persist;
 pub mod recall_client;
 pub use persist::default_config_path;
