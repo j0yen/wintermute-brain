@@ -475,6 +475,11 @@ impl EventSink for AgoraSink {
 pub struct DaemonState {
     /// Resolved runtime config (model defaults, recall socket, …).
     pub config: Mutex<BrainConfig>,
+    /// On-disk config path. When set, AC6 pending-model consumption is
+    /// persisted via [`BrainConfig::save_to_file`] after the turn that
+    /// used it. `None` keeps consume in-memory (tests, headless runs
+    /// without an XDG location).
+    pub config_path: Option<PathBuf>,
     /// Anthropic Messages client. `None` means the daemon is running
     /// without an API key — turn events are logged and dropped without
     /// publishing.
@@ -505,6 +510,7 @@ impl DaemonState {
     pub fn new(config: BrainConfig) -> Self {
         Self {
             config: Mutex::new(config),
+            config_path: None,
             llm: None,
             recall: Arc::new(NullRecall),
             tool_router: Arc::new(NoToolsRouter),
@@ -512,6 +518,15 @@ impl DaemonState {
             pending: Mutex::new(HashMap::new()),
             intent_counter: AtomicU64::new(0),
         }
+    }
+
+    /// Attach the on-disk config path that AC6 pending-model consume
+    /// should persist to. `None` (the default) keeps consumption
+    /// in-memory.
+    #[must_use]
+    pub fn with_config_path(mut self, path: PathBuf) -> Self {
+        self.config_path = Some(path);
+        self
     }
 
     /// Mint a stable id for a destructive intent. Combines the
@@ -604,13 +619,27 @@ pub async fn dispatch(
     req: Request,
     now_ms: u64,
 ) -> Result<()> {
-    let (model, child_lock) = {
-        let cfg = state.config.lock().await;
-        (cfg.effective_model().to_string(), cfg.child_lock)
-    };
     match req {
         Request::TurnUser(t) => {
+            // AC6: `wmd --model opus` for the next turn only. Read
+            // effective_model + child_lock and, if pending_model was
+            // set, clear it now so the *next* turn uses the default.
+            // Persistence happens after the turn handler returns so a
+            // crash during dispatch doesn't strand an empty pending on
+            // disk.
+            let (model, child_lock, consumed_pending) = {
+                let mut cfg = state.config.lock().await;
+                let model = cfg.effective_model().to_string();
+                let had_pending = cfg.pending_model.is_some();
+                if had_pending {
+                    cfg.consume_pending();
+                }
+                (model, cfg.child_lock, had_pending)
+            };
             handle_turn_user(state, publish, &model, child_lock, &t, now_ms).await?;
+            if consumed_pending {
+                persist_after_pending_consume(state).await;
+            }
         }
         Request::ConfirmGranted(c) => {
             handle_confirm_granted(state, publish, &c, now_ms).await?;
@@ -620,6 +649,24 @@ pub async fn dispatch(
         }
     }
     Ok(())
+}
+
+/// Persist the post-consume config when [`DaemonState::config_path`] is
+/// set. Save failures are logged and swallowed: the in-memory cfg has
+/// already been mutated, so the running daemon keeps the AC6 contract;
+/// only the on-disk record lags until the next successful save.
+async fn persist_after_pending_consume(state: &DaemonState) {
+    let Some(path) = state.config_path.as_ref() else {
+        return;
+    };
+    let cfg_snapshot = { state.config.lock().await.clone() };
+    if let Err(err) = cfg_snapshot.save_to_file(path) {
+        warn!(
+            err = %err,
+            path = %path.display(),
+            "wm-brain: persisting post-consume config failed; in-memory state still reverted"
+        );
+    }
 }
 
 #[allow(
@@ -887,7 +934,7 @@ fn build_llm_from_env(api_key_env: &str) -> Option<Arc<dyn LlmClient>> {
 /// client. A missing agorabus socket is *not* an error: the daemon
 /// logs and exits cleanly so the systemd unit restarts it when the bus
 /// comes back (same pattern as `wm-stt` / `wm-tts`).
-pub async fn run(cfg: BrainConfig) -> Result<()> {
+pub async fn run(cfg: BrainConfig, config_path: Option<PathBuf>) -> Result<()> {
     cfg.validate().context("wm-brain: config validation failed")?;
 
     let llm = build_llm_from_env(&cfg.api_key_env);
@@ -897,7 +944,10 @@ pub async fn run(cfg: BrainConfig) -> Result<()> {
         "wm-brain: recall source attached (live, connects per turn)"
     );
     let state = Arc::new({
-        let base = DaemonState::new(cfg).with_recall(recall);
+        let mut base = DaemonState::new(cfg).with_recall(recall);
+        if let Some(p) = config_path {
+            base = base.with_config_path(p);
+        }
         match llm {
             Some(client) => base.with_llm(client),
             None => base,
@@ -2309,5 +2359,166 @@ mod tests {
             10,
             "all 10 scripts produced a destructive event"
         );
+    }
+
+    // ----- iter-13: AC6 pending-model consume tests -----
+    //
+    // Re-uses the existing `CapturingLlm` (above) so the model used per
+    // turn is inspectable via `llm.captured.lock().unwrap()`.
+
+    fn capturing_llm_ok() -> CapturingLlm {
+        CapturingLlm {
+            captured: Arc::new(StdMutex::new(Vec::new())),
+            response: vec![
+                StreamEvent::MessageStart,
+                StreamEvent::TextDelta {
+                    index: 0,
+                    text: "ok".to_string(),
+                },
+                StreamEvent::MessageStop,
+            ],
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_turn_user_consumes_pending_model_in_memory() {
+        let cfg = BrainConfig {
+            pending_model: Some(crate::SHORT_MODEL_OPUS.to_string()),
+            ..BrainConfig::default()
+        };
+        let llm = capturing_llm_ok();
+        let captured = Arc::clone(&llm.captured);
+        let state = Arc::new(DaemonState::new(cfg).with_llm(into_dyn_llm(llm)));
+        let mut sink = MemSink::default();
+        dispatch(
+            state.as_ref(),
+            &mut sink,
+            Request::TurnUser(TurnUserEvent {
+                transcript: "hi".to_string(),
+                confidence: 1.0,
+                ts: 1,
+            }),
+            1,
+        )
+        .await
+        .expect("dispatch ok");
+
+        let reqs = captured.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 1, "exactly one LLM request");
+        assert_eq!(reqs[0].model, canonical_model(crate::SHORT_MODEL_OPUS));
+        let cfg_after = state.config.lock().await.clone();
+        assert!(
+            cfg_after.pending_model.is_none(),
+            "in-memory pending_model cleared after AC6 turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_turn_user_without_pending_does_not_mutate_cfg() {
+        let cfg = BrainConfig::default();
+        let llm = capturing_llm_ok();
+        let captured = Arc::clone(&llm.captured);
+        let state = Arc::new(DaemonState::new(cfg).with_llm(into_dyn_llm(llm)));
+        let mut sink = MemSink::default();
+        dispatch(
+            state.as_ref(),
+            &mut sink,
+            Request::TurnUser(TurnUserEvent {
+                transcript: "hi".to_string(),
+                confidence: 1.0,
+                ts: 1,
+            }),
+            1,
+        )
+        .await
+        .expect("dispatch ok");
+
+        let reqs = captured.lock().unwrap().clone();
+        assert_eq!(reqs[0].model, canonical_model(crate::DEFAULT_MODEL_NAME));
+        let cfg_after = state.config.lock().await.clone();
+        assert!(cfg_after.pending_model.is_none());
+        assert_eq!(cfg_after.default_model, BrainConfig::default().default_model);
+    }
+
+    #[tokio::test]
+    async fn dispatch_turn_user_persists_pending_consume_to_config_path() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let cfg = BrainConfig {
+            pending_model: Some(crate::SHORT_MODEL_OPUS.to_string()),
+            ..BrainConfig::default()
+        };
+        cfg.save_to_file(&path).expect("seed save ok");
+
+        let state = Arc::new(
+            DaemonState::new(cfg)
+                .with_llm(into_dyn_llm(capturing_llm_ok()))
+                .with_config_path(path.clone()),
+        );
+        let mut sink = MemSink::default();
+        dispatch(
+            state.as_ref(),
+            &mut sink,
+            Request::TurnUser(TurnUserEvent {
+                transcript: "hi".to_string(),
+                confidence: 1.0,
+                ts: 1,
+            }),
+            1,
+        )
+        .await
+        .expect("dispatch ok");
+
+        let on_disk = BrainConfig::load_from_file(&path).expect("load post-consume");
+        assert!(
+            on_disk.pending_model.is_none(),
+            "on-disk pending_model cleared after AC6 turn; got {:?}",
+            on_disk.pending_model
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_turn_user_pending_used_exactly_once() {
+        // AC6 end-to-end: pending_model = opus -> first turn uses opus,
+        // second turn reverts to the configured default.
+        let cfg = BrainConfig {
+            pending_model: Some(crate::SHORT_MODEL_OPUS.to_string()),
+            ..BrainConfig::default()
+        };
+        let llm = capturing_llm_ok();
+        let captured = Arc::clone(&llm.captured);
+        let state = Arc::new(DaemonState::new(cfg).with_llm(into_dyn_llm(llm)));
+        let mut sink = MemSink::default();
+
+        dispatch(
+            state.as_ref(),
+            &mut sink,
+            Request::TurnUser(TurnUserEvent {
+                transcript: "one".to_string(),
+                confidence: 1.0,
+                ts: 1,
+            }),
+            1,
+        )
+        .await
+        .expect("dispatch 1 ok");
+        dispatch(
+            state.as_ref(),
+            &mut sink,
+            Request::TurnUser(TurnUserEvent {
+                transcript: "two".to_string(),
+                confidence: 1.0,
+                ts: 2,
+            }),
+            2,
+        )
+        .await
+        .expect("dispatch 2 ok");
+
+        let reqs = captured.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 2, "two turns dispatched");
+        assert_eq!(reqs[0].model, canonical_model(crate::SHORT_MODEL_OPUS));
+        assert_eq!(reqs[1].model, canonical_model(crate::DEFAULT_MODEL_NAME));
     }
 }

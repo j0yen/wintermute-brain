@@ -85,7 +85,7 @@ fn main() -> ExitCode {
 
     match cli.command {
         Command::Start => match load_effective(&config_path, cli.recall_sock, &cli.api_key_env) {
-            Ok(cfg) => run_start(&cfg),
+            Ok(cfg) => run_start(&cfg, &config_path),
             Err(err) => {
                 error!(error = %err, "wmd start: config load failed");
                 ExitCode::from(1)
@@ -152,7 +152,7 @@ fn load_effective(
 }
 
 #[allow(clippy::cognitive_complexity, reason = "runtime build + block_on + ExitCode shell")]
-fn run_start(cfg: &BrainConfig) -> ExitCode {
+fn run_start(cfg: &BrainConfig, config_path: &std::path::Path) -> ExitCode {
     info!(?cfg, "wmd start: config resolved");
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -164,7 +164,7 @@ fn run_start(cfg: &BrainConfig) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    match runtime.block_on(daemon::run(cfg.clone())) {
+    match runtime.block_on(daemon::run(cfg.clone(), Some(config_path.to_path_buf()))) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             error!(error = %err, "wmd start: daemon exited with error");
