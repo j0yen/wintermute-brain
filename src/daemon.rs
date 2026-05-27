@@ -202,14 +202,70 @@ pub trait RecallSource: Send + Sync {
     async fn touch(&self, _ids: &[&str]) -> Result<(), RecallSourceError> {
         Ok(())
     }
+
+    /// Ad-hoc retrieval for the `wm.recall.search` tool call. Differs
+    /// from [`Self::fetch`] in two ways: `subject` is caller-controlled
+    /// (the tool exposes any subject scope, not just the per-turn
+    /// profile lookup) and `limit` is caller-controlled (defaults to the
+    /// daemon's own default when `None`).
+    ///
+    /// Default impl delegates to [`Self::fetch`], dropping the caller's
+    /// subject / limit overrides — useful for test fakes that want to
+    /// reuse a single canned hit set.
+    ///
+    /// # Errors
+    /// Implementations surface transport / decode failures as
+    /// [`RecallSourceError`].
+    async fn search(
+        &self,
+        text: &str,
+        _subject: Option<&str>,
+        _limit: Option<usize>,
+    ) -> Result<Vec<QueryHit>, RecallSourceError> {
+        self.fetch(text).await
+    }
+
+    /// Persist a single fact body under `subject`. Used by the
+    /// `wm.recall.save_fact` tool to write profile facts (PRD §2.3,
+    /// AC7). Default impl returns
+    /// [`RecallSourceError::Unsupported`] so test fakes that don't care
+    /// about the write path can opt out by inheriting the default.
+    ///
+    /// Returns the new memory id on success.
+    ///
+    /// # Errors
+    /// [`RecallSourceError::Unsupported`] from the default impl;
+    /// production implementations surface
+    /// [`RecallSourceError::Client`] or [`RecallSourceError::Write`].
+    async fn save_fact(
+        &self,
+        _subject: &str,
+        _body: &str,
+    ) -> Result<String, RecallSourceError> {
+        Err(RecallSourceError::Unsupported("save_fact"))
+    }
 }
 
-/// Errors surfaced by [`RecallSource::fetch`].
+/// Errors surfaced by [`RecallSource::fetch`] and friends.
 #[derive(Debug, thiserror::Error)]
 pub enum RecallSourceError {
     /// Underlying recall-daemon client failure.
     #[error("recall client: {0}")]
     Client(#[from] recall_client::ClientError),
+    /// The recall source does not implement the requested operation
+    /// (typically `save_fact` on a test fake or a read-only source).
+    #[error("recall source does not support {0}")]
+    Unsupported(&'static str),
+    /// Subprocess-backed write (e.g. `recall write`) failed. Carries the
+    /// exit status as a non-zero code or `-1` if the process never
+    /// returned a status, plus a captured stderr fragment for tracing.
+    #[error("recall write subprocess failed (code={code}): {message}")]
+    Write {
+        /// Exit code reported by the subprocess (or `-1` if unavailable).
+        code: i32,
+        /// Truncated stderr fragment for diagnostics.
+        message: String,
+    },
 }
 
 /// Zero-cost no-op [`RecallSource`]. Returned by [`DaemonState`] when
@@ -225,6 +281,22 @@ impl RecallSource for NullRecall {
     }
 }
 
+/// Default kind passed to `recall write` by [`LiveRecallSource::save_fact`].
+///
+/// Maps the brain's "fact" tool-call vocabulary onto the closest recall
+/// built-in kind (PRD §2.3 + `recall write --kind semantic` accepts the
+/// four canonical kinds: episodic / semantic / procedural / reflective).
+pub const DEFAULT_SAVE_KIND: &str = "semantic";
+
+/// Default subprocess binary name for `recall write`. The OS PATH
+/// resolves this to whatever user-installed `recall` is first on PATH;
+/// tests can override via [`LiveRecallSource::with_recall_bin`].
+pub const DEFAULT_RECALL_BIN: &str = "recall";
+
+/// Truncation cap for captured stderr inside
+/// [`RecallSourceError::Write`]. Keeps event payloads bounded.
+const STDERR_TRUNCATE_BYTES: usize = 4096;
+
 /// Production [`RecallSource`]: opens a fresh recall-daemon socket
 /// connection per turn. Fleet 1 trades the per-call connect for
 /// simplicity; pooling and connection reuse are Fleet 2 work.
@@ -233,6 +305,16 @@ pub struct LiveRecallSource {
     socket: PathBuf,
     profile_subject: String,
     limit: usize,
+    /// Optional recall data root passed as `--root <path>` to the
+    /// `recall write` subprocess. `None` lets the binary fall back to
+    /// `$RECALL_HOME` or `~/.claude/recall` (recall's own defaults).
+    data_root: Option<PathBuf>,
+    /// Binary invoked for `save_fact` subprocess writes. Defaults to
+    /// [`DEFAULT_RECALL_BIN`].
+    recall_bin: PathBuf,
+    /// Memory kind passed to `recall write --kind`. Defaults to
+    /// [`DEFAULT_SAVE_KIND`].
+    save_kind: String,
 }
 
 impl LiveRecallSource {
@@ -245,6 +327,9 @@ impl LiveRecallSource {
             socket,
             profile_subject: PROFILE_SUBJECT.to_string(),
             limit: DEFAULT_RECALL_LIMIT,
+            data_root: None,
+            recall_bin: PathBuf::from(DEFAULT_RECALL_BIN),
+            save_kind: DEFAULT_SAVE_KIND.to_string(),
         }
     }
 
@@ -259,6 +344,30 @@ impl LiveRecallSource {
     #[must_use]
     pub const fn with_limit(mut self, limit: usize) -> Self {
         self.limit = limit;
+        self
+    }
+
+    /// Pin the recall data root that `recall write` should target via
+    /// `--root <path>`. Set this when `$RECALL_HOME` may not be
+    /// inherited by the brain process.
+    #[must_use]
+    pub fn with_data_root(mut self, root: PathBuf) -> Self {
+        self.data_root = Some(root);
+        self
+    }
+
+    /// Override the `recall write` binary path. Mainly for tests that
+    /// point at a stub script.
+    #[must_use]
+    pub fn with_recall_bin(mut self, bin: PathBuf) -> Self {
+        self.recall_bin = bin;
+        self
+    }
+
+    /// Override the memory kind passed to `recall write --kind`.
+    #[must_use]
+    pub fn with_save_kind(mut self, kind: impl Into<String>) -> Self {
+        self.save_kind = kind.into();
         self
     }
 }
@@ -287,6 +396,64 @@ impl RecallSource for LiveRecallSource {
             client.touch(&args).await?;
         }
         Ok(())
+    }
+
+    async fn search(
+        &self,
+        text: &str,
+        subject: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Vec<QueryHit>, RecallSourceError> {
+        let mut client = RecallClient::connect(&self.socket).await?;
+        let args = QueryArgs {
+            text: text.to_string(),
+            limit,
+            hybrid: None,
+            project_subject: subject.map(str::to_string),
+        };
+        let resp = client.query(&args).await?;
+        Ok(resp.ranked_hits)
+    }
+
+    async fn save_fact(
+        &self,
+        subject: &str,
+        body: &str,
+    ) -> Result<String, RecallSourceError> {
+        let mut cmd = tokio::process::Command::new(&self.recall_bin);
+        if let Some(root) = &self.data_root {
+            cmd.arg("--root").arg(root);
+        }
+        cmd.arg("write")
+            .arg("--kind")
+            .arg(&self.save_kind)
+            .arg("--subject")
+            .arg(subject)
+            .arg("--body")
+            .arg(body)
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let output = cmd.output().await.map_err(|e| RecallSourceError::Write {
+            code: -1,
+            message: format!("spawn {}: {e}", self.recall_bin.display()),
+        })?;
+        if !output.status.success() {
+            let code = output.status.code().unwrap_or(-1);
+            let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            if stderr.len() > STDERR_TRUNCATE_BYTES {
+                stderr.truncate(STDERR_TRUNCATE_BYTES);
+                stderr.push('…');
+            }
+            return Err(RecallSourceError::Write { code, message: stderr });
+        }
+        let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if id.is_empty() {
+            return Err(RecallSourceError::Write {
+                code: 0,
+                message: "recall write succeeded but emitted no id".to_string(),
+            });
+        }
+        Ok(id)
     }
 }
 
@@ -332,6 +499,182 @@ impl ToolRouter for NoToolsRouter {
                 "tool": name,
             }),
         }
+    }
+}
+
+/// Tool names handled by [`RecallToolsRouter`] (PRD §2.3 — Fleet 1
+/// recall surface). Anything else falls through to the configured
+/// fallback router.
+pub const TOOL_RECALL_SEARCH: &str = "wm.recall.search";
+/// See [`TOOL_RECALL_SEARCH`].
+pub const TOOL_RECALL_SAVE_FACT: &str = "wm.recall.save_fact";
+
+/// Fleet 1 recall tool router.
+///
+/// Handles `wm.recall.search` (delegates to [`RecallSource::search`]) and
+/// `wm.recall.save_fact` (delegates to [`RecallSource::save_fact`]);
+/// every other tool name forwards to `fallback` (defaults to
+/// [`NoToolsRouter`]). Closes PRD AC7 by routing model-driven recall
+/// reads + writes through the same abstraction the per-turn retrieval
+/// already uses.
+pub struct RecallToolsRouter {
+    recall: Arc<dyn RecallSource>,
+    fallback: Arc<dyn ToolRouter>,
+    default_save_subject: String,
+}
+
+impl RecallToolsRouter {
+    /// Build a router that fronts `recall`. Defaults the
+    /// save-fact subject to [`PROFILE_SUBJECT`] and the fallback to
+    /// [`NoToolsRouter`].
+    #[must_use]
+    pub fn new(recall: Arc<dyn RecallSource>) -> Self {
+        Self {
+            recall,
+            fallback: Arc::new(NoToolsRouter),
+            default_save_subject: PROFILE_SUBJECT.to_string(),
+        }
+    }
+
+    /// Swap the fallback router used for non-recall tool names.
+    #[must_use]
+    pub fn with_fallback(mut self, fallback: Arc<dyn ToolRouter>) -> Self {
+        self.fallback = fallback;
+        self
+    }
+
+    /// Override the default subject for [`TOOL_RECALL_SAVE_FACT`] when
+    /// the caller omits `subject` from the tool args.
+    #[must_use]
+    pub fn with_default_save_subject(mut self, subject: impl Into<String>) -> Self {
+        self.default_save_subject = subject.into();
+        self
+    }
+}
+
+#[async_trait::async_trait]
+impl ToolRouter for RecallToolsRouter {
+    async fn dispatch(&self, name: &str, args: &Value) -> ToolResultBody {
+        match name {
+            TOOL_RECALL_SEARCH => dispatch_recall_search(self.recall.as_ref(), args).await,
+            TOOL_RECALL_SAVE_FACT => {
+                dispatch_recall_save_fact(self.recall.as_ref(), &self.default_save_subject, args)
+                    .await
+            }
+            _ => self.fallback.dispatch(name, args).await,
+        }
+    }
+}
+
+/// Render one [`QueryHit`] into the wire body the brain returns for
+/// `wm.recall.search`. Trimmed to the fields a downstream tool consumer
+/// is likely to want; recall internals (`bm25`, `vector_sim`, `recall_count`)
+/// stay out of the tool surface.
+fn render_hit(hit: &QueryHit) -> Value {
+    json!({
+        "id": hit.id,
+        "kind": hit.kind,
+        "subject": hit.subject,
+        "snippet": hit.snippet,
+        "score": hit.score,
+        "confidence": hit.confidence,
+    })
+}
+
+fn bad_args(tool: &str, reason: &str) -> ToolResultBody {
+    ToolResultBody {
+        ok: false,
+        body: json!({
+            "error": "bad_args",
+            "tool": tool,
+            "message": reason,
+        }),
+    }
+}
+
+fn recall_error(tool: &str, err: &RecallSourceError) -> ToolResultBody {
+    ToolResultBody {
+        ok: false,
+        body: json!({
+            "error": "recall_error",
+            "tool": tool,
+            "message": err.to_string(),
+        }),
+    }
+}
+
+async fn dispatch_recall_search(recall: &dyn RecallSource, args: &Value) -> ToolResultBody {
+    let Some(obj) = args.as_object() else {
+        return bad_args(TOOL_RECALL_SEARCH, "args must be a JSON object");
+    };
+    let Some(text) = obj.get("text").and_then(Value::as_str) else {
+        return bad_args(TOOL_RECALL_SEARCH, "args.text (string) is required");
+    };
+    if text.trim().is_empty() {
+        return bad_args(TOOL_RECALL_SEARCH, "args.text must not be blank");
+    }
+    let subject = obj.get("subject").and_then(Value::as_str);
+    let limit = match obj.get("limit") {
+        None | Some(Value::Null) => None,
+        Some(Value::Number(n)) => {
+            let Some(u) = n.as_u64() else {
+                return bad_args(TOOL_RECALL_SEARCH, "args.limit must be a non-negative integer");
+            };
+            let Ok(small) = usize::try_from(u) else {
+                return bad_args(TOOL_RECALL_SEARCH, "args.limit exceeds usize::MAX");
+            };
+            Some(small)
+        }
+        Some(_) => {
+            return bad_args(TOOL_RECALL_SEARCH, "args.limit must be a number");
+        }
+    };
+    match recall.search(text, subject, limit).await {
+        Ok(hits) => {
+            let body = json!({
+                "hits": hits.iter().map(render_hit).collect::<Vec<_>>(),
+                "count": hits.len(),
+            });
+            ToolResultBody { ok: true, body }
+        }
+        Err(err) => recall_error(TOOL_RECALL_SEARCH, &err),
+    }
+}
+
+async fn dispatch_recall_save_fact(
+    recall: &dyn RecallSource,
+    default_subject: &str,
+    args: &Value,
+) -> ToolResultBody {
+    let Some(obj) = args.as_object() else {
+        return bad_args(TOOL_RECALL_SAVE_FACT, "args must be a JSON object");
+    };
+    let Some(body_text) = obj.get("body").and_then(Value::as_str) else {
+        return bad_args(TOOL_RECALL_SAVE_FACT, "args.body (string) is required");
+    };
+    if body_text.trim().is_empty() {
+        return bad_args(TOOL_RECALL_SAVE_FACT, "args.body must not be blank");
+    }
+    let subject_owned;
+    let subject = match obj.get("subject") {
+        None | Some(Value::Null) => default_subject,
+        Some(Value::String(s)) if !s.trim().is_empty() => {
+            subject_owned = s.clone();
+            subject_owned.as_str()
+        }
+        Some(_) => {
+            return bad_args(TOOL_RECALL_SAVE_FACT, "args.subject must be a non-empty string");
+        }
+    };
+    match recall.save_fact(subject, body_text).await {
+        Ok(id) => ToolResultBody {
+            ok: true,
+            body: json!({
+                "id": id,
+                "subject": subject,
+            }),
+        },
+        Err(err) => recall_error(TOOL_RECALL_SAVE_FACT, &err),
     }
 }
 
@@ -943,8 +1286,17 @@ pub async fn run(cfg: BrainConfig, config_path: Option<PathBuf>) -> Result<()> {
         socket = %cfg.recall_sock.display(),
         "wm-brain: recall source attached (live, connects per turn)"
     );
+    let tool_router: Arc<dyn ToolRouter> =
+        Arc::new(RecallToolsRouter::new(Arc::clone(&recall)));
+    info!(
+        tools = TOOL_RECALL_SEARCH,
+        tools_extra = TOOL_RECALL_SAVE_FACT,
+        "wm-brain: tool router wired with recall surface"
+    );
     let state = Arc::new({
-        let mut base = DaemonState::new(cfg).with_recall(recall);
+        let mut base = DaemonState::new(cfg)
+            .with_recall(recall)
+            .with_tool_router(tool_router);
         if let Some(p) = config_path {
             base = base.with_config_path(p);
         }
@@ -1000,6 +1352,11 @@ pub async fn run(cfg: BrainConfig, config_path: Option<PathBuf>) -> Result<()> {
     clippy::indexing_slicing,
     clippy::significant_drop_tightening,
     clippy::await_holding_lock,
+    clippy::as_conversions,
+    clippy::items_after_statements,
+    clippy::type_complexity,
+    clippy::mutex_integer,
+    clippy::doc_markdown,
     reason = "tests"
 )]
 mod tests {
@@ -1347,6 +1704,9 @@ mod tests {
     struct FakeRecall {
         hits: Vec<QueryHit>,
         touched: Arc<StdMutex<Vec<Vec<String>>>>,
+        searches: Arc<StdMutex<Vec<(String, Option<String>, Option<usize>)>>>,
+        saved: Arc<StdMutex<Vec<(String, String)>>>,
+        next_save_id: Arc<StdMutex<u64>>,
     }
 
     impl FakeRecall {
@@ -1354,11 +1714,22 @@ mod tests {
             Self {
                 hits,
                 touched: Arc::new(StdMutex::new(Vec::new())),
+                searches: Arc::new(StdMutex::new(Vec::new())),
+                saved: Arc::new(StdMutex::new(Vec::new())),
+                next_save_id: Arc::new(StdMutex::new(1)),
             }
         }
 
         fn touched_calls(&self) -> Vec<Vec<String>> {
             self.touched.lock().expect("touched poisoned").clone()
+        }
+
+        fn searches_recorded(&self) -> Vec<(String, Option<String>, Option<usize>)> {
+            self.searches.lock().expect("searches poisoned").clone()
+        }
+
+        fn saved_recorded(&self) -> Vec<(String, String)> {
+            self.saved.lock().expect("saved poisoned").clone()
         }
     }
 
@@ -1377,6 +1748,52 @@ mod tests {
                 .expect("touched poisoned")
                 .push(ids.iter().map(|s| (*s).to_string()).collect());
             Ok(())
+        }
+
+        async fn search(
+            &self,
+            text: &str,
+            subject: Option<&str>,
+            limit: Option<usize>,
+        ) -> std::result::Result<Vec<QueryHit>, RecallSourceError> {
+            self.searches.lock().expect("searches poisoned").push((
+                text.to_string(),
+                subject.map(str::to_string),
+                limit,
+            ));
+            Ok(self.hits.clone())
+        }
+
+        async fn save_fact(
+            &self,
+            subject: &str,
+            body: &str,
+        ) -> std::result::Result<String, RecallSourceError> {
+            self.saved
+                .lock()
+                .expect("saved poisoned")
+                .push((subject.to_string(), body.to_string()));
+            let mut next = self.next_save_id.lock().expect("next_save_id poisoned");
+            let id = format!("m-fake-{next}");
+            *next = next.saturating_add(1);
+            Ok(id)
+        }
+    }
+
+    /// Recall source whose every `save_fact` call fails with the
+    /// canonical default `Unsupported`. Useful to verify
+    /// [`RecallToolsRouter`] surfaces non-`Write` errors through the
+    /// recall_error path.
+    #[derive(Clone, Default)]
+    struct ReadOnlyRecall;
+
+    #[async_trait::async_trait]
+    impl RecallSource for ReadOnlyRecall {
+        async fn fetch(
+            &self,
+            _transcript: &str,
+        ) -> std::result::Result<Vec<QueryHit>, RecallSourceError> {
+            Ok(Vec::new())
         }
     }
 
@@ -1523,6 +1940,152 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recall_tools_router_search_renders_hits_and_records_invocation() {
+        let recall = Arc::new(FakeRecall::new(vec![
+            fake_hit("m-1", "She prefers chamomile tea.", 0.91),
+            fake_hit("m-2", "Likes her tea hot.", 0.74),
+        ]));
+        let router = RecallToolsRouter::new(Arc::clone(&recall) as Arc<dyn RecallSource>);
+        let body = router
+            .dispatch(
+                TOOL_RECALL_SEARCH,
+                &json!({"text": "tea", "subject": "wintermute-profile", "limit": 5}),
+            )
+            .await;
+        assert!(body.ok);
+        let hits = body.body["hits"].as_array().expect("hits array");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0]["id"], "m-1");
+        assert_eq!(hits[0]["snippet"], "She prefers chamomile tea.");
+        assert_eq!(hits[0]["subject"], "wintermute-profile");
+        assert_eq!(body.body["count"], 2);
+        let searches = recall.searches_recorded();
+        assert_eq!(searches.len(), 1);
+        assert_eq!(searches[0].0, "tea");
+        assert_eq!(searches[0].1.as_deref(), Some("wintermute-profile"));
+        assert_eq!(searches[0].2, Some(5));
+    }
+
+    #[tokio::test]
+    async fn recall_tools_router_search_rejects_missing_or_blank_text() {
+        let recall = Arc::new(FakeRecall::new(Vec::new()));
+        let router = RecallToolsRouter::new(Arc::clone(&recall) as Arc<dyn RecallSource>);
+        let body = router.dispatch(TOOL_RECALL_SEARCH, &json!({})).await;
+        assert!(!body.ok);
+        assert_eq!(body.body["error"], "bad_args");
+        assert_eq!(body.body["tool"], TOOL_RECALL_SEARCH);
+        let blank = router
+            .dispatch(TOOL_RECALL_SEARCH, &json!({"text": "   "}))
+            .await;
+        assert!(!blank.ok);
+        assert_eq!(blank.body["error"], "bad_args");
+        assert!(recall.searches_recorded().is_empty());
+    }
+
+    #[tokio::test]
+    async fn recall_tools_router_search_rejects_non_object_args() {
+        let recall = Arc::new(FakeRecall::new(Vec::new()));
+        let router = RecallToolsRouter::new(Arc::clone(&recall) as Arc<dyn RecallSource>);
+        let body = router.dispatch(TOOL_RECALL_SEARCH, &json!(["tea"])).await;
+        assert!(!body.ok);
+        assert_eq!(body.body["error"], "bad_args");
+        let limit_wrong = router
+            .dispatch(TOOL_RECALL_SEARCH, &json!({"text": "tea", "limit": "five"}))
+            .await;
+        assert!(!limit_wrong.ok);
+        assert_eq!(limit_wrong.body["error"], "bad_args");
+    }
+
+    #[tokio::test]
+    async fn recall_tools_router_save_fact_happy_uses_default_subject() {
+        let recall = Arc::new(FakeRecall::new(Vec::new()));
+        let router = RecallToolsRouter::new(Arc::clone(&recall) as Arc<dyn RecallSource>);
+        let body = router
+            .dispatch(
+                TOOL_RECALL_SAVE_FACT,
+                &json!({"body": "prefers chamomile tea"}),
+            )
+            .await;
+        assert!(body.ok);
+        assert_eq!(body.body["id"], "m-fake-1");
+        assert_eq!(body.body["subject"], PROFILE_SUBJECT);
+        let saved = recall.saved_recorded();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].0, PROFILE_SUBJECT);
+        assert_eq!(saved[0].1, "prefers chamomile tea");
+    }
+
+    #[tokio::test]
+    async fn recall_tools_router_save_fact_honours_explicit_subject() {
+        let recall = Arc::new(FakeRecall::new(Vec::new()));
+        let router = RecallToolsRouter::new(Arc::clone(&recall) as Arc<dyn RecallSource>);
+        let body = router
+            .dispatch(
+                TOOL_RECALL_SAVE_FACT,
+                &json!({
+                    "body": "daughter's name is Sara",
+                    "subject": "wintermute-people",
+                }),
+            )
+            .await;
+        assert!(body.ok);
+        assert_eq!(body.body["subject"], "wintermute-people");
+        let saved = recall.saved_recorded();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].0, "wintermute-people");
+    }
+
+    #[tokio::test]
+    async fn recall_tools_router_save_fact_rejects_blank_or_missing_body() {
+        let recall = Arc::new(FakeRecall::new(Vec::new()));
+        let router = RecallToolsRouter::new(Arc::clone(&recall) as Arc<dyn RecallSource>);
+        let missing = router
+            .dispatch(TOOL_RECALL_SAVE_FACT, &json!({"subject": "x"}))
+            .await;
+        assert!(!missing.ok);
+        assert_eq!(missing.body["error"], "bad_args");
+        let blank = router
+            .dispatch(TOOL_RECALL_SAVE_FACT, &json!({"body": "   "}))
+            .await;
+        assert!(!blank.ok);
+        assert_eq!(blank.body["error"], "bad_args");
+        let bad_subject = router
+            .dispatch(
+                TOOL_RECALL_SAVE_FACT,
+                &json!({"body": "x", "subject": ""}),
+            )
+            .await;
+        assert!(!bad_subject.ok);
+        assert_eq!(bad_subject.body["error"], "bad_args");
+        assert!(recall.saved_recorded().is_empty());
+    }
+
+    #[tokio::test]
+    async fn recall_tools_router_save_fact_surfaces_unsupported_error() {
+        let router = RecallToolsRouter::new(Arc::new(ReadOnlyRecall) as Arc<dyn RecallSource>);
+        let body = router
+            .dispatch(TOOL_RECALL_SAVE_FACT, &json!({"body": "x"}))
+            .await;
+        assert!(!body.ok);
+        assert_eq!(body.body["error"], "recall_error");
+        assert_eq!(body.body["tool"], TOOL_RECALL_SAVE_FACT);
+        let msg = body.body["message"].as_str().expect("message");
+        assert!(msg.contains("save_fact"), "msg={msg}");
+    }
+
+    #[tokio::test]
+    async fn recall_tools_router_unknown_tool_falls_through_to_fallback() {
+        let recall = Arc::new(FakeRecall::new(Vec::new()));
+        let router = RecallToolsRouter::new(Arc::clone(&recall) as Arc<dyn RecallSource>);
+        let body = router.dispatch("wm.weather.today", &json!({})).await;
+        assert!(!body.ok);
+        assert_eq!(body.body["error"], "no-tools-registered");
+        assert_eq!(body.body["tool"], "wm.weather.today");
+        assert!(recall.saved_recorded().is_empty());
+        assert!(recall.searches_recorded().is_empty());
+    }
+
+    #[tokio::test]
     async fn dispatch_turn_user_splices_recall_context_into_system_prompt() {
         let captured = Arc::new(StdMutex::new(Vec::new()));
         let llm = CapturingLlm {
@@ -1632,11 +2195,89 @@ mod tests {
         let src = LiveRecallSource::new(PathBuf::from("/tmp/x.sock"));
         assert_eq!(src.profile_subject, PROFILE_SUBJECT);
         assert_eq!(src.limit, DEFAULT_RECALL_LIMIT);
+        assert!(src.data_root.is_none());
+        assert_eq!(src.recall_bin, PathBuf::from(DEFAULT_RECALL_BIN));
+        assert_eq!(src.save_kind, DEFAULT_SAVE_KIND);
         let custom = LiveRecallSource::new(PathBuf::from("/tmp/y.sock"))
             .with_profile_subject("subj-x")
-            .with_limit(3);
+            .with_limit(3)
+            .with_data_root(PathBuf::from("/tmp/recall-root"))
+            .with_recall_bin(PathBuf::from("/usr/local/bin/recall"))
+            .with_save_kind("reflective");
         assert_eq!(custom.profile_subject, "subj-x");
         assert_eq!(custom.limit, 3);
+        assert_eq!(custom.data_root.as_deref(), Some(std::path::Path::new("/tmp/recall-root")));
+        assert_eq!(custom.recall_bin, PathBuf::from("/usr/local/bin/recall"));
+        assert_eq!(custom.save_kind, "reflective");
+    }
+
+    #[tokio::test]
+    async fn live_recall_source_save_fact_surfaces_spawn_failure() {
+        let src = LiveRecallSource::new(PathBuf::from("/tmp/wm-brain-iter14-unused.sock"))
+            .with_recall_bin(PathBuf::from(
+                "/tmp/wm-brain-iter14-nonexistent-binary-xyz",
+            ));
+        let err = src
+            .save_fact("wintermute-profile", "x")
+            .await
+            .expect_err("spawn should fail");
+        match err {
+            RecallSourceError::Write { code, message } => {
+                assert_eq!(code, -1);
+                assert!(message.contains("spawn"), "msg={message}");
+            }
+            other => panic!("expected Write, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn live_recall_source_save_fact_against_stub_binary_returns_stdout_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stub = dir.path().join("recall-stub.sh");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\necho m-stub-42\n",
+        )
+        .expect("write stub");
+        let mut perms = std::fs::metadata(&stub).expect("meta").permissions();
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&stub, perms).expect("chmod");
+        let src = LiveRecallSource::new(PathBuf::from("/tmp/wm-brain-iter14-unused-2.sock"))
+            .with_recall_bin(stub);
+        let id = src
+            .save_fact("wintermute-profile", "stub body")
+            .await
+            .expect("stub should succeed");
+        assert_eq!(id, "m-stub-42");
+    }
+
+    #[tokio::test]
+    async fn live_recall_source_save_fact_propagates_nonzero_exit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stub = dir.path().join("recall-fail.sh");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\necho 'bad subject' 1>&2\nexit 2\n",
+        )
+        .expect("write stub");
+        let mut perms = std::fs::metadata(&stub).expect("meta").permissions();
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&stub, perms).expect("chmod");
+        let src = LiveRecallSource::new(PathBuf::from("/tmp/wm-brain-iter14-unused-3.sock"))
+            .with_recall_bin(stub);
+        let err = src
+            .save_fact("wintermute-profile", "stub body")
+            .await
+            .expect_err("nonzero exit should surface");
+        match err {
+            RecallSourceError::Write { code, message } => {
+                assert_eq!(code, 2);
+                assert!(message.contains("bad subject"), "msg={message}");
+            }
+            other => panic!("expected Write, got {other:?}"),
+        }
     }
 
     #[tokio::test]
