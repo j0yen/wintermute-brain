@@ -15,8 +15,10 @@
 //! Recall retrieval, tool routing, destructive-intent gating, and turn
 //! memorisation remain iter-9+ work.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
@@ -25,7 +27,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::anthropic::{AnthropicClient, ClientError, Message, MessageRequest, Role, StreamEvent};
 use crate::bus::{
-    self, DecodeError, Emit, ErrorEvent, ReplyEvent, Request, TurnUserEvent, decode_request,
+    self, ConfirmDeniedEvent, ConfirmGrantedEvent, DecodeError, Emit, ErrorEvent, ReplyEvent,
+    ReplyDestructiveEvent, Request, ToolCallEvent, ToolResultEvent, TurnUserEvent, decode_request,
     now_unix_ms, outgoing,
 };
 use crate::recall_client::{self, QueryArgs, QueryHit, RecallClient};
@@ -38,14 +41,32 @@ use crate::{BrainConfig, PROFILE_SUBJECT, canonical_model};
 /// iter-10 destructive-intent JSON trailer.
 pub const DEFAULT_MAX_TOKENS: u32 = 1024;
 
-/// System prompt iter-8 shipped. iter-9 leaves this base verbatim and
-/// layers child-lock + recall-context blocks via [`compose_persona`];
-/// iter-10 adds the destructive-intent gating clause.
+/// System prompt iter-8 shipped. iter-9 layered child-lock + recall
+/// context via [`compose_persona`]. iter-10 appends the destructive
+/// gate via [`DESTRUCTIVE_GATE_GUARD`] inside [`compose_persona`].
 pub const DEFAULT_PERSONA: &str = "You are wintermute, a voice-first companion daemon. \
 The user hears you spoken aloud, never reads you on a screen. \
 Speak naturally and warmly in plain prose. Keep replies to one short \
 paragraph per turn unless the user asks for more. Do not use markdown, \
 bullet lists, code fences, or emoji — they do not speak well.";
+
+/// Destructive-intent gating clause appended to every system prompt by
+/// [`compose_persona`]. PRD §2.4.
+///
+/// The model is instructed to never act destructively in-line; instead
+/// it ends a reply with a final fenced JSON block carrying the action,
+/// a short summary, and a confirm keyword. [`parse_destructive_intent`]
+/// recovers the block and the spoken text; the brain stores the pending
+/// intent and waits for `wm.dialog.confirm.granted` before invoking the
+/// tool router.
+pub const DESTRUCTIVE_GATE_GUARD: &str = "If you intend to take any action that deletes data, \
+sends a message, makes a purchase, or otherwise changes anything outside this conversation, do \
+not perform the action. Instead, finish your reply with a single fenced JSON block on its own \
+line. The block must contain exactly these three fields: `intent` (the tool name you would \
+invoke), `summary` (one short sentence describing the change), and `confirm_keyword` (a single \
+short keyword the user must say to confirm). You may optionally include an `args` object with \
+tool-specific arguments. Everything before the fence is what the user will hear; the system \
+will ask for spoken confirmation before any action is taken.";
 
 /// Child-lock guard appended to the system prompt when
 /// [`BrainConfig::child_lock`] is true.
@@ -109,8 +130,9 @@ pub fn compose_request(model: &str, persona: &str, transcript: &str) -> MessageR
 /// Assemble the effective system prompt the Anthropic call receives.
 ///
 /// Layers in this order: `base` (persona), child-lock guard when set,
-/// then a recall-context block when non-empty. Each layer is separated
-/// by a blank line so the model parses them as distinct paragraphs.
+/// the destructive-intent gate (always — PRD §2.4), then a
+/// recall-context block when non-empty. Each layer is separated by a
+/// blank line so the model parses them as distinct paragraphs.
 #[must_use]
 pub fn compose_persona(base: &str, child_lock: bool, recall_context: Option<&str>) -> String {
     let mut out = base.to_string();
@@ -118,6 +140,8 @@ pub fn compose_persona(base: &str, child_lock: bool, recall_context: Option<&str
         out.push_str("\n\n");
         out.push_str(CHILD_LOCK_GUARD);
     }
+    out.push_str("\n\n");
+    out.push_str(DESTRUCTIVE_GATE_GUARD);
     if let Some(ctx) = recall_context {
         if !ctx.is_empty() {
             out.push_str("\n\n");
@@ -286,6 +310,89 @@ impl ToolRouter for NoToolsRouter {
     }
 }
 
+/// Parsed shape of the model's final-fenced JSON block (PRD §2.4).
+///
+/// `intent` is the tool name the brain will dispatch on
+/// `wm.dialog.confirm.granted`; `args` carries optional tool-specific
+/// arguments. `summary` and `confirm_keyword` are echoed verbatim into
+/// the [`ReplyDestructiveEvent`] for `wm-dialog`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DestructiveIntent {
+    /// Tool name the model wants to invoke (e.g. `wm.fs.rm`).
+    pub intent: String,
+    /// One short sentence describing what the action will do.
+    pub summary: String,
+    /// Single short keyword the user must speak to confirm.
+    pub confirm_keyword: String,
+    /// Optional tool arguments — passed straight to the router on grant.
+    pub args: Option<Value>,
+}
+
+/// Extract a destructive intent from the assistant's final fenced JSON.
+///
+/// Returns `None` when the text has no trailing fence, the fence
+/// payload is not parseable JSON, or any required field is missing.
+///
+/// On `Some`, the second tuple element is the *spoken* text — everything
+/// up to (but not including) the opening fence, with trailing whitespace
+/// trimmed. Callers publish that as `wm.brain.reply.destructive.text`
+/// for `wm-dialog` to hand to `wm-tts`.
+#[must_use]
+pub fn parse_destructive_intent(text: &str) -> Option<(DestructiveIntent, String)> {
+    const FENCE: &str = "```";
+    let close_idx = text.rfind(FENCE)?;
+    let before_close = text.get(..close_idx)?;
+    let open_idx = before_close.rfind(FENCE)?;
+    let inside_start = open_idx.checked_add(FENCE.len())?;
+    let inside = text.get(inside_start..close_idx)?;
+    // Strip an optional language label (e.g. ```json\n…).
+    let json_str = match inside.split_once('\n') {
+        Some((label, rest))
+            if !label.is_empty()
+                && label
+                    .trim()
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') =>
+        {
+            rest
+        }
+        _ => inside,
+    };
+    let v: Value = serde_json::from_str(json_str.trim()).ok()?;
+    let intent = v.get("intent")?.as_str()?.to_string();
+    let summary = v.get("summary")?.as_str()?.to_string();
+    let confirm_keyword = v.get("confirm_keyword")?.as_str()?.to_string();
+    if intent.is_empty() || summary.is_empty() || confirm_keyword.is_empty() {
+        return None;
+    }
+    let args = v.get("args").cloned();
+    let spoken = text.get(..open_idx)?.trim_end().to_string();
+    Some((
+        DestructiveIntent {
+            intent,
+            summary,
+            confirm_keyword,
+            args,
+        },
+        spoken,
+    ))
+}
+
+/// In-flight destructive intent awaiting `wm.dialog.confirm.granted` or
+/// `wm.dialog.confirm.denied`. Stored on [`DaemonState`] keyed by
+/// `intent_id`; removed by either confirm path.
+#[derive(Debug, Clone)]
+pub struct PendingIntent {
+    /// Original parsed intent.
+    pub intent: DestructiveIntent,
+    /// Unix milliseconds when the destructive reply was published.
+    pub published_ts: u64,
+}
+
+/// Short cancellation reply the brain emits on
+/// `wm.dialog.confirm.denied` for a pending intent.
+pub const DESTRUCTIVE_CANCELLATION_REPLY: &str = "Okay, I won't do that.";
+
 /// Concatenate every `text_delta` chunk into a single assistant reply.
 ///
 /// Pure function. Non-text events (`ping`, `message_start`,
@@ -338,10 +445,8 @@ impl EventSink for AgoraSink {
 
 /// Live daemon state.
 ///
-/// iter-8 grows this with the optional [`LlmClient`] handle used for
-/// per-turn Anthropic Messages calls and the persona text spliced into
-/// every request as a system prompt. iter-9+ adds the recall client +
-/// per-turn conversation buffer once retrieval and memorisation land.
+/// iter-10 adds the destructive-intent pending registry + per-process
+/// counter used by [`DaemonState::mint_intent_id`].
 pub struct DaemonState {
     /// Resolved runtime config (model defaults, recall socket, …).
     pub config: Mutex<BrainConfig>,
@@ -359,6 +464,11 @@ pub struct DaemonState {
     /// System-prompt persona spliced into every request. Defaults to
     /// [`DEFAULT_PERSONA`].
     pub persona: String,
+    /// Destructive intents awaiting `wm.dialog.confirm.granted` /
+    /// `wm.dialog.confirm.denied`, keyed by `intent_id`.
+    pub pending: Mutex<HashMap<String, PendingIntent>>,
+    /// Monotonic per-process counter spliced into minted `intent_id`s.
+    pub intent_counter: AtomicU64,
 }
 
 impl DaemonState {
@@ -374,7 +484,18 @@ impl DaemonState {
             recall: Arc::new(NullRecall),
             tool_router: Arc::new(NoToolsRouter),
             persona: DEFAULT_PERSONA.to_string(),
+            pending: Mutex::new(HashMap::new()),
+            intent_counter: AtomicU64::new(0),
         }
+    }
+
+    /// Mint a stable id for a destructive intent. Combines the
+    /// publish-time millisecond stamp with a per-process counter so two
+    /// intents minted in the same millisecond never collide.
+    #[must_use]
+    pub fn mint_intent_id(&self, now_ms: u64) -> String {
+        let seq = self.intent_counter.fetch_add(1, Ordering::SeqCst);
+        format!("int-{now_ms}-{seq}")
     }
 
     /// Attach an LLM client to a freshly-built state.
@@ -439,12 +560,14 @@ pub fn emit_to_value(emit: &Emit) -> Result<Value> {
 
 /// Dispatch one decoded request.
 ///
-/// iter-8 wires the conversation cycle for [`Request::TurnUser`]:
-/// compose an Anthropic request from the persona + transcript, call the
-/// LLM, and publish the assistant text as [`outgoing::REPLY`]. API
-/// failures publish [`outgoing::ERROR`] with `kind=anthropic`.
-/// `confirm.granted` / `confirm.denied` stay as logging stubs until
-/// iter-10 destructive-intent gating lands.
+/// iter-10 wires the destructive-intent gate end-to-end:
+/// [`Request::TurnUser`] runs the conversation cycle and may stash a
+/// [`PendingIntent`]; [`Request::ConfirmGranted`] redeems a pending
+/// intent (dispatch via the tool router and publish
+/// [`outgoing::TOOL_CALL`] + [`outgoing::TOOL_RESULT`]);
+/// [`Request::ConfirmDenied`] drops a pending intent and publishes a
+/// short cancellation reply. Unknown confirm ids publish
+/// [`outgoing::ERROR`] with `kind=confirm`.
 ///
 /// # Errors
 /// Returns the first publish failure encountered. LLM-side errors are
@@ -465,19 +588,10 @@ pub async fn dispatch(
             handle_turn_user(state, publish, &model, child_lock, &t, now_ms).await?;
         }
         Request::ConfirmGranted(c) => {
-            info!(
-                intent_id = %c.intent_id,
-                ts = c.ts,
-                "wm-brain: confirm.granted received (destructive dispatch deferred to iter-10)"
-            );
+            handle_confirm_granted(state, publish, &c, now_ms).await?;
         }
         Request::ConfirmDenied(c) => {
-            info!(
-                intent_id = %c.intent_id,
-                reason = %c.reason,
-                ts = c.ts,
-                "wm-brain: confirm.denied received"
-            );
+            handle_confirm_denied(state, publish, &c, now_ms).await?;
         }
     }
     Ok(())
@@ -527,11 +641,15 @@ async fn handle_turn_user(
                 publish_error_at(publish, "anthropic", "no text in response", now_ms).await?;
                 return Ok(());
             }
-            let reply = ReplyEvent { text, ts: now_ms };
-            publish
-                .publish(outgoing::REPLY, serde_json::to_value(&reply)?)
-                .await
-                .context("publish reply")?;
+            if let Some((intent, spoken)) = parse_destructive_intent(&text) {
+                publish_destructive(state, publish, intent, spoken, now_ms).await?;
+            } else {
+                let reply = ReplyEvent { text, ts: now_ms };
+                publish
+                    .publish(outgoing::REPLY, serde_json::to_value(&reply)?)
+                    .await
+                    .context("publish reply")?;
+            }
         }
         Err(err) => {
             error!(err = %err, model = %model, "wm-brain: anthropic call failed");
@@ -539,6 +657,125 @@ async fn handle_turn_user(
         }
     }
     Ok(())
+}
+
+/// Mint an `intent_id`, stash the [`PendingIntent`] under it, and
+/// publish [`outgoing::REPLY_DESTRUCTIVE`]. The spoken text is whatever
+/// the model emitted before the fenced JSON block; if the model
+/// volunteered only the JSON, the summary doubles as the spoken text
+/// so `wm-dialog` always has something for `wm-tts` to voice.
+async fn publish_destructive(
+    state: &DaemonState,
+    publish: &mut dyn EventSink,
+    intent: DestructiveIntent,
+    spoken: String,
+    now_ms: u64,
+) -> Result<()> {
+    let intent_id = state.mint_intent_id(now_ms);
+    let action = json!({
+        "tool": intent.intent.clone(),
+        "args": intent.args.clone().unwrap_or_else(|| json!({})),
+    });
+    let text = if spoken.trim().is_empty() {
+        intent.summary.clone()
+    } else {
+        spoken
+    };
+    let summary = intent.summary.clone();
+    let confirm_keyword = intent.confirm_keyword.clone();
+    {
+        let mut pending = state.pending.lock().await;
+        pending.insert(
+            intent_id.clone(),
+            PendingIntent {
+                intent,
+                published_ts: now_ms,
+            },
+        );
+    }
+    let event = ReplyDestructiveEvent {
+        text,
+        intent_id,
+        summary,
+        confirm_keyword,
+        action,
+        ts: now_ms,
+    };
+    publish
+        .publish(outgoing::REPLY_DESTRUCTIVE, serde_json::to_value(&event)?)
+        .await
+        .context("publish reply.destructive")
+}
+
+async fn handle_confirm_granted(
+    state: &DaemonState,
+    publish: &mut dyn EventSink,
+    c: &ConfirmGrantedEvent,
+    now_ms: u64,
+) -> Result<()> {
+    let pending = {
+        let mut map = state.pending.lock().await;
+        map.remove(&c.intent_id)
+    };
+    let Some(pi) = pending else {
+        warn!(intent_id = %c.intent_id, "wm-brain: confirm.granted for unknown intent_id");
+        publish_error_at(
+            publish,
+            "confirm",
+            &format!("unknown intent_id: {}", c.intent_id),
+            now_ms,
+        )
+        .await?;
+        return Ok(());
+    };
+    let tool = pi.intent.intent;
+    let args = pi.intent.args.unwrap_or_else(|| json!({}));
+    let call = ToolCallEvent {
+        tool: tool.clone(),
+        args: args.clone(),
+        ts: now_ms,
+    };
+    publish
+        .publish(outgoing::TOOL_CALL, serde_json::to_value(&call)?)
+        .await
+        .context("publish tool.call")?;
+    let result = state.tool_router.dispatch(&tool, &args).await;
+    let result_event = ToolResultEvent {
+        tool,
+        ok: result.ok,
+        body: result.body,
+        ts: now_ms,
+    };
+    publish
+        .publish(outgoing::TOOL_RESULT, serde_json::to_value(&result_event)?)
+        .await
+        .context("publish tool.result")?;
+    Ok(())
+}
+
+async fn handle_confirm_denied(
+    state: &DaemonState,
+    publish: &mut dyn EventSink,
+    c: &ConfirmDeniedEvent,
+    now_ms: u64,
+) -> Result<()> {
+    let removed = {
+        let mut map = state.pending.lock().await;
+        map.remove(&c.intent_id)
+    };
+    if removed.is_none() {
+        debug!(intent_id = %c.intent_id, "wm-brain: confirm.denied for unknown intent_id; dropping");
+        return Ok(());
+    }
+    debug!(intent_id = %c.intent_id, reason = %c.reason, "wm-brain: confirm.denied dropped pending intent");
+    let reply = ReplyEvent {
+        text: DESTRUCTIVE_CANCELLATION_REPLY.to_string(),
+        ts: now_ms,
+    };
+    publish
+        .publish(outgoing::REPLY, serde_json::to_value(&reply)?)
+        .await
+        .context("publish cancellation reply")
 }
 
 async fn publish_error_at(
@@ -672,6 +909,7 @@ pub async fn run(cfg: BrainConfig) -> Result<()> {
     clippy::float_cmp,
     clippy::indexing_slicing,
     clippy::significant_drop_tightening,
+    clippy::await_holding_lock,
     reason = "tests"
 )]
 mod tests {
@@ -757,21 +995,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_confirm_granted_is_silent() {
+    async fn dispatch_confirm_granted_unknown_id_publishes_error() {
         let state = fresh_state();
         let mut sink = MemSink::default();
         let req = Request::ConfirmGranted(ConfirmGrantedEvent {
             intent_id: "abc".to_string(),
             ts: 1,
         });
-        dispatch(state.as_ref(), &mut sink, req, 1)
+        dispatch(state.as_ref(), &mut sink, req, 1234)
             .await
             .expect("dispatch ok");
-        assert!(sink.events.lock().unwrap().is_empty());
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, outgoing::ERROR);
+        assert_eq!(events[0].1["kind"], "confirm");
+        assert!(
+            events[0].1["message"].as_str().unwrap().contains("abc"),
+            "error should name the unknown intent_id"
+        );
+        assert_eq!(events[0].1["ts"], 1234);
     }
 
     #[tokio::test]
-    async fn dispatch_confirm_denied_is_silent() {
+    async fn dispatch_confirm_denied_unknown_id_is_silent() {
         let state = fresh_state();
         let mut sink = MemSink::default();
         let req = Request::ConfirmDenied(ConfirmDeniedEvent {
@@ -1051,30 +1297,49 @@ mod tests {
     }
 
     #[test]
-    fn compose_persona_without_lock_or_context_returns_base() {
-        assert_eq!(compose_persona("base persona", false, None), "base persona");
+    fn compose_persona_without_lock_or_context_appends_destructive_guard() {
+        let out = compose_persona("base persona", false, None);
+        assert!(out.starts_with("base persona"));
+        assert!(out.contains(DESTRUCTIVE_GATE_GUARD));
+        assert!(
+            !out.contains(CHILD_LOCK_GUARD),
+            "child-lock off in this case"
+        );
     }
 
     #[test]
-    fn compose_persona_with_child_lock_appends_guard() {
+    fn compose_persona_with_child_lock_appends_guard_before_destructive() {
         let out = compose_persona("base", true, None);
         assert!(out.starts_with("base"));
-        assert!(out.contains(CHILD_LOCK_GUARD));
+        let lock_idx = out.find(CHILD_LOCK_GUARD).expect("lock guard present");
+        let dest_idx = out
+            .find(DESTRUCTIVE_GATE_GUARD)
+            .expect("destructive guard present");
+        assert!(dest_idx > lock_idx, "destructive guard follows lock guard");
         assert!(out.contains("\n\n"), "blocks separated by blank line");
     }
 
     #[test]
-    fn compose_persona_with_empty_context_does_not_add_block() {
+    fn compose_persona_with_empty_context_still_includes_destructive_guard() {
         let out = compose_persona("base", false, Some(""));
-        assert_eq!(out, "base");
+        assert!(out.starts_with("base"));
+        assert!(out.contains(DESTRUCTIVE_GATE_GUARD));
+        assert!(
+            !out.contains("ctx"),
+            "empty context block must not be appended"
+        );
     }
 
     #[test]
-    fn compose_persona_with_context_appends_block_after_lock() {
+    fn compose_persona_with_context_appends_block_after_destructive_guard() {
         let out = compose_persona("base", true, Some("ctx block"));
-        let lock_idx = out.find(CHILD_LOCK_GUARD).expect("guard present");
+        let lock_idx = out.find(CHILD_LOCK_GUARD).expect("lock guard present");
+        let dest_idx = out
+            .find(DESTRUCTIVE_GATE_GUARD)
+            .expect("destructive guard present");
         let ctx_idx = out.find("ctx block").expect("context present");
-        assert!(ctx_idx > lock_idx, "context appended after lock guard");
+        assert!(dest_idx > lock_idx, "destructive guard follows lock guard");
+        assert!(ctx_idx > dest_idx, "context follows destructive guard");
     }
 
     #[test]
@@ -1210,7 +1475,18 @@ mod tests {
         assert_eq!(events[0].1["text"], "fallback reply");
         let calls = captured.lock().unwrap();
         let system = calls[0].system.as_deref().expect("system");
-        assert_eq!(system, DEFAULT_PERSONA, "no context spliced on recall error");
+        assert!(
+            system.starts_with(DEFAULT_PERSONA),
+            "persona base preserved on recall error"
+        );
+        assert!(
+            system.contains(DESTRUCTIVE_GATE_GUARD),
+            "destructive gate guard always present"
+        );
+        assert!(
+            !system.contains("She prefers"),
+            "no recall context spliced on recall error"
+        );
     }
 
     #[test]
@@ -1245,5 +1521,273 @@ mod tests {
         assert_eq!(events[0].0, outgoing::ERROR);
         assert_eq!(events[0].1["kind"], "bus");
         assert_eq!(events[0].1["message"], "decode failed");
+    }
+
+    // -- iter-10: destructive-intent gate ------------------------------
+
+    #[test]
+    fn parse_destructive_intent_happy_with_json_label() {
+        let text = "Sure — about to delete the file.\n```json\n{\"intent\": \"wm.fs.rm\", \"summary\": \"delete /tmp/x\", \"confirm_keyword\": \"delete\"}\n```";
+        let (intent, spoken) = parse_destructive_intent(text).expect("parses");
+        assert_eq!(intent.intent, "wm.fs.rm");
+        assert_eq!(intent.summary, "delete /tmp/x");
+        assert_eq!(intent.confirm_keyword, "delete");
+        assert!(intent.args.is_none());
+        assert_eq!(spoken, "Sure — about to delete the file.");
+    }
+
+    #[test]
+    fn parse_destructive_intent_happy_without_language_label() {
+        let text = "About to send.\n```\n{\"intent\":\"wm.mail.send\",\"summary\":\"send to mom\",\"confirm_keyword\":\"send\"}\n```";
+        let (intent, _spoken) = parse_destructive_intent(text).expect("parses");
+        assert_eq!(intent.intent, "wm.mail.send");
+    }
+
+    #[test]
+    fn parse_destructive_intent_carries_optional_args() {
+        let text = "```json\n{\"intent\":\"wm.fs.rm\",\"summary\":\"s\",\"confirm_keyword\":\"k\",\"args\":{\"path\":\"/tmp/x\"}}\n```";
+        let (intent, _spoken) = parse_destructive_intent(text).expect("parses");
+        let args = intent.args.expect("args carried through");
+        assert_eq!(args["path"], "/tmp/x");
+    }
+
+    #[test]
+    fn parse_destructive_intent_returns_none_without_fence() {
+        let text = "Just chatting, no JSON.";
+        assert!(parse_destructive_intent(text).is_none());
+    }
+
+    #[test]
+    fn parse_destructive_intent_returns_none_on_malformed_json() {
+        let text = "```json\n{not valid json}\n```";
+        assert!(parse_destructive_intent(text).is_none());
+    }
+
+    #[test]
+    fn parse_destructive_intent_returns_none_on_missing_required_field() {
+        // intent + summary but no confirm_keyword
+        let text = "```json\n{\"intent\":\"x\",\"summary\":\"s\"}\n```";
+        assert!(parse_destructive_intent(text).is_none());
+    }
+
+    #[test]
+    fn parse_destructive_intent_returns_none_on_empty_required_field() {
+        let text = "```json\n{\"intent\":\"\",\"summary\":\"s\",\"confirm_keyword\":\"k\"}\n```";
+        assert!(parse_destructive_intent(text).is_none());
+    }
+
+    #[test]
+    fn parse_destructive_intent_uses_final_block_when_multiple_present() {
+        let text = "First block:\n```json\n{\"intent\":\"first\",\"summary\":\"s\",\"confirm_keyword\":\"k\"}\n```\nNow the real one:\n```json\n{\"intent\":\"wm.last\",\"summary\":\"final\",\"confirm_keyword\":\"go\"}\n```";
+        let (intent, spoken) = parse_destructive_intent(text).expect("parses");
+        assert_eq!(intent.intent, "wm.last");
+        assert!(spoken.contains("First block"));
+        assert!(spoken.contains("Now the real one:"));
+    }
+
+    #[test]
+    fn mint_intent_id_is_unique_per_call() {
+        let cfg = BrainConfig::default();
+        let state = DaemonState::new(cfg);
+        let a = state.mint_intent_id(1000);
+        let b = state.mint_intent_id(1000);
+        let c = state.mint_intent_id(2000);
+        assert_ne!(a, b, "two ids minted same ms must differ");
+        assert!(a.starts_with("int-1000-"));
+        assert!(c.starts_with("int-2000-"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_turn_user_publishes_destructive_when_block_present() {
+        let llm = FakeLlm {
+            response: Ok(vec![text_delta(
+                "About to delete /tmp/x.\n```json\n{\"intent\":\"wm.fs.rm\",\"summary\":\"delete /tmp/x\",\"confirm_keyword\":\"delete\",\"args\":{\"path\":\"/tmp/x\"}}\n```",
+            )]),
+        };
+        let state = state_with_llm(llm);
+        let mut sink = MemSink::default();
+        let req = Request::TurnUser(TurnUserEvent {
+            transcript: "remove /tmp/x".to_string(),
+            confidence: 1.0,
+            ts: 1,
+        });
+        dispatch(state.as_ref(), &mut sink, req, 5555)
+            .await
+            .expect("dispatch ok");
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, outgoing::REPLY_DESTRUCTIVE);
+        assert_eq!(events[0].1["text"], "About to delete /tmp/x.");
+        assert_eq!(events[0].1["summary"], "delete /tmp/x");
+        assert_eq!(events[0].1["confirm_keyword"], "delete");
+        assert_eq!(events[0].1["action"]["tool"], "wm.fs.rm");
+        assert_eq!(events[0].1["action"]["args"]["path"], "/tmp/x");
+        assert_eq!(events[0].1["ts"], 5555);
+        let intent_id = events[0].1["intent_id"]
+            .as_str()
+            .expect("intent_id present")
+            .to_string();
+        assert!(intent_id.starts_with("int-5555-"));
+        drop(events);
+        // PendingIntent stashed for later confirm.
+        let pending = state.pending.lock().await;
+        assert!(pending.contains_key(&intent_id));
+    }
+
+    #[tokio::test]
+    async fn dispatch_turn_user_uses_summary_as_spoken_text_when_only_fence() {
+        let llm = FakeLlm {
+            response: Ok(vec![text_delta(
+                "```json\n{\"intent\":\"wm.fs.rm\",\"summary\":\"delete /tmp/x\",\"confirm_keyword\":\"delete\"}\n```",
+            )]),
+        };
+        let state = state_with_llm(llm);
+        let mut sink = MemSink::default();
+        let req = Request::TurnUser(TurnUserEvent {
+            transcript: "rm".to_string(),
+            confidence: 1.0,
+            ts: 1,
+        });
+        dispatch(state.as_ref(), &mut sink, req, 1)
+            .await
+            .expect("dispatch ok");
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, outgoing::REPLY_DESTRUCTIVE);
+        assert_eq!(events[0].1["text"], "delete /tmp/x");
+    }
+
+    #[tokio::test]
+    async fn dispatch_turn_user_passes_through_reply_when_no_block() {
+        let llm = FakeLlm {
+            response: Ok(vec![text_delta("Just a chat reply.")]),
+        };
+        let state = state_with_llm(llm);
+        let mut sink = MemSink::default();
+        let req = Request::TurnUser(TurnUserEvent {
+            transcript: "hi".to_string(),
+            confidence: 1.0,
+            ts: 1,
+        });
+        dispatch(state.as_ref(), &mut sink, req, 9)
+            .await
+            .expect("dispatch ok");
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, outgoing::REPLY);
+        let pending = state.pending.lock().await;
+        assert!(pending.is_empty(), "no destructive intent → no pending entry");
+    }
+
+    #[derive(Default, Clone)]
+    struct RecordingRouter {
+        calls: Arc<StdMutex<Vec<(String, Value)>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolRouter for RecordingRouter {
+        async fn dispatch(&self, name: &str, args: &Value) -> ToolResultBody {
+            self.calls
+                .lock()
+                .expect("router poisoned")
+                .push((name.to_string(), args.clone()));
+            ToolResultBody {
+                ok: true,
+                body: json!({ "executed": name }),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_confirm_granted_redeems_pending_via_tool_router() {
+        let router = RecordingRouter::default();
+        let calls = router.calls.clone();
+        let cfg = BrainConfig::default();
+        let state = Arc::new(DaemonState::new(cfg).with_tool_router(Arc::new(router)));
+        let intent_id = state.mint_intent_id(100);
+        {
+            let mut pending = state.pending.lock().await;
+            pending.insert(
+                intent_id.clone(),
+                PendingIntent {
+                    intent: DestructiveIntent {
+                        intent: "wm.fs.rm".to_string(),
+                        summary: "delete /tmp/x".to_string(),
+                        confirm_keyword: "delete".to_string(),
+                        args: Some(json!({ "path": "/tmp/x" })),
+                    },
+                    published_ts: 100,
+                },
+            );
+        }
+        let mut sink = MemSink::default();
+        let req = Request::ConfirmGranted(ConfirmGrantedEvent {
+            intent_id: intent_id.clone(),
+            ts: 200,
+        });
+        dispatch(state.as_ref(), &mut sink, req, 333)
+            .await
+            .expect("dispatch ok");
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 2, "tool.call + tool.result");
+        assert_eq!(events[0].0, outgoing::TOOL_CALL);
+        assert_eq!(events[0].1["tool"], "wm.fs.rm");
+        assert_eq!(events[0].1["args"]["path"], "/tmp/x");
+        assert_eq!(events[0].1["ts"], 333);
+        assert_eq!(events[1].0, outgoing::TOOL_RESULT);
+        assert_eq!(events[1].1["tool"], "wm.fs.rm");
+        assert_eq!(events[1].1["ok"], true);
+        assert_eq!(events[1].1["body"]["executed"], "wm.fs.rm");
+        drop(events);
+        let router_calls = calls.lock().unwrap();
+        assert_eq!(router_calls.len(), 1);
+        assert_eq!(router_calls[0].0, "wm.fs.rm");
+        let pending = state.pending.lock().await;
+        assert!(
+            !pending.contains_key(&intent_id),
+            "pending intent removed on grant"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_confirm_denied_with_pending_publishes_cancellation_and_drops() {
+        let cfg = BrainConfig::default();
+        let state = Arc::new(DaemonState::new(cfg));
+        let intent_id = state.mint_intent_id(100);
+        {
+            let mut pending = state.pending.lock().await;
+            pending.insert(
+                intent_id.clone(),
+                PendingIntent {
+                    intent: DestructiveIntent {
+                        intent: "wm.fs.rm".to_string(),
+                        summary: "s".to_string(),
+                        confirm_keyword: "k".to_string(),
+                        args: None,
+                    },
+                    published_ts: 100,
+                },
+            );
+        }
+        let mut sink = MemSink::default();
+        let req = Request::ConfirmDenied(ConfirmDeniedEvent {
+            intent_id: intent_id.clone(),
+            reason: "negative_keyword".to_string(),
+            ts: 200,
+        });
+        dispatch(state.as_ref(), &mut sink, req, 444)
+            .await
+            .expect("dispatch ok");
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, outgoing::REPLY);
+        assert_eq!(events[0].1["text"], DESTRUCTIVE_CANCELLATION_REPLY);
+        assert_eq!(events[0].1["ts"], 444);
+        drop(events);
+        let pending = state.pending.lock().await;
+        assert!(
+            !pending.contains_key(&intent_id),
+            "pending intent removed on deny"
+        );
     }
 }
