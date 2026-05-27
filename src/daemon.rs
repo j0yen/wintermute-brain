@@ -2075,4 +2075,239 @@ mod tests {
             "pending intent removed on deny"
         );
     }
+
+    // PRD §4 AC5: 10 scripted destructive prompts each produce a
+    // wm.brain.reply.destructive event with valid intent_id +
+    // confirm_keyword; none execute via the tool router until a
+    // wm.dialog.confirm.granted message arrives.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines, reason = "table-driven AC5 verification fans the assertion set across 10 prompts inline")]
+    async fn ac5_ten_scripted_destructive_prompts() {
+        let scripts: [(&str, &str, &str, &str, &str); 10] = [
+            (
+                "remove /tmp/x",
+                "wm.fs.rm",
+                "delete /tmp/x",
+                "delete",
+                "About to delete /tmp/x.",
+            ),
+            (
+                "rename Cargo.toml to Cargo.toml.bak",
+                "wm.fs.mv",
+                "rename Cargo.toml",
+                "rename",
+                "About to rename Cargo.toml.",
+            ),
+            (
+                "send mom an email saying I'm late",
+                "wm.mail.send",
+                "email mom that I'm late",
+                "send",
+                "Drafting an email to mom.",
+            ),
+            (
+                "delete the message from Bob",
+                "wm.mail.delete",
+                "remove Bob's note",
+                "remove",
+                "Removing Bob's message.",
+            ),
+            (
+                "cancel my dentist appointment",
+                "wm.cal.cancel",
+                "cancel dentist event",
+                "cancel",
+                "About to cancel the dentist event.",
+            ),
+            (
+                "order another bag of coffee",
+                "wm.purchase.place_order",
+                "buy 12oz beans",
+                "order",
+                "Placing the coffee order.",
+            ),
+            (
+                "forget that I prefer green tea",
+                "wm.recall.delete",
+                "drop tea preference",
+                "forget",
+                "About to remove that memory.",
+            ),
+            (
+                "submit the registration form",
+                "wm.browser.nav.destructive",
+                "submit registration form",
+                "submit",
+                "Submitting the form now.",
+            ),
+            (
+                "skip the next three songs in the queue",
+                "wm.music.skip",
+                "skip 3 in queue",
+                "skip",
+                "Skipping the next three.",
+            ),
+            (
+                "shut everything down",
+                "wm.fleet2.shell",
+                "shutdown laptop",
+                "yes",
+                "About to shut down.",
+            ),
+        ];
+
+        let mut minted_ids: Vec<String> = Vec::new();
+        for (i, (utterance, tool, summary, keyword, pretext)) in scripts.iter().enumerate() {
+            let idx = u64::try_from(i).expect("script index fits in u64");
+            // Half deny, half grant — neither path is allowed to invoke
+            // the tool router before the dialog confirmation arrives.
+            let grant = i % 2 == 0;
+            let body = format!(
+                "{pretext}\n```json\n{{\"intent\":\"{tool}\",\"summary\":\"{summary}\",\"confirm_keyword\":\"{keyword}\"}}\n```"
+            );
+            let llm = FakeLlm {
+                response: Ok(vec![text_delta(&body)]),
+            };
+            let router = RecordingRouter::default();
+            let router_calls = router.calls.clone();
+            let cfg = BrainConfig::default();
+            let state = Arc::new(
+                DaemonState::new(cfg)
+                    .with_llm(into_dyn_llm(llm))
+                    .with_tool_router(Arc::new(router)),
+            );
+            let mut sink = MemSink::default();
+            let turn_now = 5_000_u64 + idx;
+            dispatch(
+                state.as_ref(),
+                &mut sink,
+                Request::TurnUser(TurnUserEvent {
+                    transcript: (*utterance).to_string(),
+                    confidence: 1.0,
+                    ts: 1_000 + idx,
+                }),
+                turn_now,
+            )
+            .await
+            .expect("turn-user dispatch ok");
+
+            let intent_id = {
+                let events = sink.events.lock().unwrap();
+                assert_eq!(events.len(), 1, "{utterance}: exactly one destructive event");
+                assert_eq!(
+                    events[0].0,
+                    outgoing::REPLY_DESTRUCTIVE,
+                    "{utterance}: must publish destructive topic"
+                );
+                assert_eq!(
+                    events[0].1["confirm_keyword"], *keyword,
+                    "{utterance}: confirm_keyword echoed"
+                );
+                assert_eq!(
+                    events[0].1["summary"], *summary,
+                    "{utterance}: summary echoed"
+                );
+                assert_eq!(
+                    events[0].1["action"]["tool"], *tool,
+                    "{utterance}: action tool routed"
+                );
+                let id = events[0].1["intent_id"]
+                    .as_str()
+                    .expect("intent_id present")
+                    .to_string();
+                assert!(
+                    id.starts_with(&format!("int-{turn_now}-")),
+                    "{utterance}: intent_id should embed dispatch ts"
+                );
+                id
+            };
+            assert!(
+                !minted_ids.contains(&intent_id),
+                "{utterance}: intent_id must be unique across scripts"
+            );
+            minted_ids.push(intent_id.clone());
+
+            // AC5 invariant: nothing executed yet.
+            {
+                let calls = router_calls.lock().unwrap();
+                assert!(
+                    calls.is_empty(),
+                    "{utterance}: tool router must NOT execute pre-confirmation"
+                );
+            }
+            // PendingIntent stashed under the minted id.
+            {
+                let pending = state.pending.lock().await;
+                assert!(
+                    pending.contains_key(&intent_id),
+                    "{utterance}: pending intent stashed under minted id"
+                );
+            }
+
+            // Isolate the confirm-step events from the destructive event.
+            sink.events.lock().unwrap().clear();
+            let confirm_now = 9_000_u64 + idx;
+            if grant {
+                dispatch(
+                    state.as_ref(),
+                    &mut sink,
+                    Request::ConfirmGranted(ConfirmGrantedEvent {
+                        intent_id: intent_id.clone(),
+                        ts: 8_000 + idx,
+                    }),
+                    confirm_now,
+                )
+                .await
+                .expect("confirm.granted dispatch ok");
+                let events = sink.events.lock().unwrap();
+                assert_eq!(events.len(), 2, "{utterance}: tool.call + tool.result");
+                assert_eq!(events[0].0, outgoing::TOOL_CALL);
+                assert_eq!(events[0].1["tool"], *tool);
+                assert_eq!(events[1].0, outgoing::TOOL_RESULT);
+                assert_eq!(events[1].1["ok"], true);
+                drop(events);
+                let calls = router_calls.lock().unwrap();
+                assert_eq!(
+                    calls.len(),
+                    1,
+                    "{utterance}: router executed exactly once on grant"
+                );
+                assert_eq!(calls[0].0, *tool);
+            } else {
+                dispatch(
+                    state.as_ref(),
+                    &mut sink,
+                    Request::ConfirmDenied(ConfirmDeniedEvent {
+                        intent_id: intent_id.clone(),
+                        reason: "negative_keyword".to_string(),
+                        ts: 8_000 + idx,
+                    }),
+                    confirm_now,
+                )
+                .await
+                .expect("confirm.denied dispatch ok");
+                let events = sink.events.lock().unwrap();
+                assert_eq!(events.len(), 1, "{utterance}: cancellation reply published");
+                assert_eq!(events[0].0, outgoing::REPLY);
+                assert_eq!(events[0].1["text"], DESTRUCTIVE_CANCELLATION_REPLY);
+                drop(events);
+                let calls = router_calls.lock().unwrap();
+                assert!(
+                    calls.is_empty(),
+                    "{utterance}: router never invoked when confirmation denied"
+                );
+            }
+            // After either confirm path, pending is cleared.
+            let pending = state.pending.lock().await;
+            assert!(
+                !pending.contains_key(&intent_id),
+                "{utterance}: pending cleared on confirm"
+            );
+        }
+        assert_eq!(
+            minted_ids.len(),
+            10,
+            "all 10 scripts produced a destructive event"
+        );
+    }
 }
