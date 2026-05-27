@@ -3,11 +3,11 @@
 //! Speaks the length-prefixed framing protocol that recall v0.5.x
 //! exposes on `$XDG_RUNTIME_DIR/recall.sock` (PRD-recall-daemon §2). Per
 //! PRD-wintermute-brain §2.1 / §2.7, the brain pulls persistent profile
-//! facts and per-thread context through this client. iter-7 only
-//! implements what the conversation loop needs in Fleet 1: `ping` for
-//! liveness probes and `query` for retrieval. `embed` and `touch` are
-//! intentionally omitted — they land when the brain starts writing
-//! memories back, which is a separate iter.
+//! facts and per-thread context through this client. Fleet 1 wires
+//! `ping` (liveness), `query` (retrieval), and `touch` (per-turn
+//! recall-count bump so recall's outcome-feedback subsystem sees real
+//! usage signal). `embed` remains intentionally omitted — it lands when
+//! the brain starts writing memories back, which is a separate iter.
 
 use std::path::{Path, PathBuf};
 
@@ -119,6 +119,24 @@ pub struct QueryResponse {
     pub limit: usize,
 }
 
+/// Arguments for the `touch` op. Mirrors recall's `TouchArgs`: a
+/// non-empty `id` selecting the memory whose `recall_count` should be
+/// bumped. The daemon rejects whitespace-only ids with `bad_request`.
+#[derive(Debug, Clone, Serialize)]
+pub struct TouchArgs {
+    /// Stable memory id to mark as recalled-this-turn.
+    pub id: String,
+}
+
+/// Decoded `touch` response. The daemon reports the new
+/// `recall_count` after the bump; the brain doesn't branch on it in
+/// Fleet 1 but exposes it for tracing.
+#[derive(Debug, Deserialize, Clone)]
+pub struct TouchResponse {
+    /// `recall_count` after the increment.
+    pub recall_count: u32,
+}
+
 /// Decoded `ping` response.
 #[derive(Debug, Deserialize, Clone)]
 pub struct PingResponse {
@@ -187,6 +205,18 @@ impl RecallClient {
     /// error body (e.g. malformed args).
     pub async fn query(&mut self, args: &QueryArgs) -> Result<QueryResponse, ClientError> {
         self.roundtrip("query", args).await
+    }
+
+    /// Bump a memory's `recall_count`. Used after a successful turn to
+    /// signal to recall's outcome-feedback subsystem which memories
+    /// actually fed the conversation.
+    ///
+    /// # Errors
+    /// Forwards [`ClientError`] variants from the framing and JSON
+    /// layers, or [`ClientError::Remote`] if the daemon replied with an
+    /// error body (e.g. `bad_request` for a blank id).
+    pub async fn touch(&mut self, args: &TouchArgs) -> Result<TouchResponse, ClientError> {
+        self.roundtrip("touch", args).await
     }
 
     async fn roundtrip<A, R>(&mut self, op: &str, args: &A) -> Result<R, ClientError>
@@ -433,6 +463,43 @@ mod tests {
             ClientError::Remote { code, message } => {
                 assert_eq!(code, "bad_args");
                 assert_eq!(message, "text is empty");
+            }
+            other => panic!("expected Remote, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn touch_args_serialise_with_id() {
+        let args = TouchArgs { id: "m-42".to_string() };
+        let v = serde_json::to_value(&args).expect("serialises");
+        assert_eq!(v, serde_json::json!({ "id": "m-42" }));
+    }
+
+    #[tokio::test]
+    async fn touch_roundtrip_decodes_recall_count() {
+        let path = spawn_oneshot_server(serde_json::json!({
+            "ok": { "recall_count": 7 }
+        }))
+        .await;
+        let mut client = RecallClient::connect(&path).await.expect("connect");
+        let args = TouchArgs { id: "m-42".to_string() };
+        let resp = client.touch(&args).await.expect("touch");
+        assert_eq!(resp.recall_count, 7);
+    }
+
+    #[tokio::test]
+    async fn touch_remote_error_surfaces_as_clienterror_remote() {
+        let path = spawn_oneshot_server(serde_json::json!({
+            "error": { "code": "bad_request", "message": "touch.id must not be empty" }
+        }))
+        .await;
+        let mut client = RecallClient::connect(&path).await.expect("connect");
+        let args = TouchArgs { id: "   ".to_string() };
+        let err = client.touch(&args).await.expect_err("must fail");
+        match err {
+            ClientError::Remote { code, message } => {
+                assert_eq!(code, "bad_request");
+                assert!(message.contains("must not be empty"));
             }
             other => panic!("expected Remote, got {other:?}"),
         }

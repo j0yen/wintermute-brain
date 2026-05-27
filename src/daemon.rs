@@ -31,7 +31,7 @@ use crate::bus::{
     ReplyDestructiveEvent, Request, ToolCallEvent, ToolResultEvent, TurnUserEvent, decode_request,
     now_unix_ms, outgoing,
 };
-use crate::recall_client::{self, QueryArgs, QueryHit, RecallClient};
+use crate::recall_client::{self, QueryArgs, QueryHit, RecallClient, TouchArgs};
 use crate::{BrainConfig, PROFILE_SUBJECT, canonical_model};
 
 /// Default upper bound on tokens the daemon requests per turn.
@@ -189,6 +189,19 @@ pub trait RecallSource: Send + Sync {
     /// [`RecallSourceError`]; the caller logs them and proceeds with an
     /// empty context (recall outages must not break the conversation).
     async fn fetch(&self, transcript: &str) -> Result<Vec<QueryHit>, RecallSourceError>;
+
+    /// Mark a slice of memory ids as recalled-this-turn. Called after a
+    /// successful LLM response so recall's outcome-feedback subsystem
+    /// sees real usage signal. Default impl is a no-op so test sources
+    /// that don't care about touch signal don't need to implement it.
+    ///
+    /// # Errors
+    /// Implementations surface transport / decode failures as
+    /// [`RecallSourceError`]; the caller logs them and proceeds (touch
+    /// failures must not break the conversation).
+    async fn touch(&self, _ids: &[&str]) -> Result<(), RecallSourceError> {
+        Ok(())
+    }
 }
 
 /// Errors surfaced by [`RecallSource::fetch`].
@@ -262,6 +275,18 @@ impl RecallSource for LiveRecallSource {
         };
         let resp = client.query(&args).await?;
         Ok(resp.ranked_hits)
+    }
+
+    async fn touch(&self, ids: &[&str]) -> Result<(), RecallSourceError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let mut client = RecallClient::connect(&self.socket).await?;
+        for id in ids {
+            let args = TouchArgs { id: (*id).to_string() };
+            client.touch(&args).await?;
+        }
+        Ok(())
     }
 }
 
@@ -641,6 +666,7 @@ async fn handle_turn_user(
                 publish_error_at(publish, "anthropic", "no text in response", now_ms).await?;
                 return Ok(());
             }
+            touch_recalled_hits(state.recall.as_ref(), &hits).await;
             if let Some((intent, spoken)) = parse_destructive_intent(&text) {
                 publish_destructive(state, publish, intent, spoken, now_ms).await?;
             } else {
@@ -657,6 +683,20 @@ async fn handle_turn_user(
         }
     }
     Ok(())
+}
+
+/// Fire-and-log [`RecallSource::touch`] for each id in `hits`. Touch
+/// failures must not break the conversation, so transport errors are
+/// logged and swallowed (recall outage degrades to "no usage signal",
+/// not "dropped reply").
+async fn touch_recalled_hits(recall: &dyn RecallSource, hits: &[QueryHit]) {
+    if hits.is_empty() {
+        return;
+    }
+    let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+    if let Err(err) = recall.touch(&ids).await {
+        warn!(err = %err, "wm-brain: recall touch failed; usage signal dropped");
+    }
 }
 
 /// Mint an `intent_id`, stash the [`PendingIntent`] under it, and
@@ -1256,6 +1296,20 @@ mod tests {
     #[derive(Clone)]
     struct FakeRecall {
         hits: Vec<QueryHit>,
+        touched: Arc<StdMutex<Vec<Vec<String>>>>,
+    }
+
+    impl FakeRecall {
+        fn new(hits: Vec<QueryHit>) -> Self {
+            Self {
+                hits,
+                touched: Arc::new(StdMutex::new(Vec::new())),
+            }
+        }
+
+        fn touched_calls(&self) -> Vec<Vec<String>> {
+            self.touched.lock().expect("touched poisoned").clone()
+        }
     }
 
     #[async_trait::async_trait]
@@ -1265,6 +1319,14 @@ mod tests {
             _transcript: &str,
         ) -> std::result::Result<Vec<QueryHit>, RecallSourceError> {
             Ok(self.hits.clone())
+        }
+
+        async fn touch(&self, ids: &[&str]) -> std::result::Result<(), RecallSourceError> {
+            self.touched
+                .lock()
+                .expect("touched poisoned")
+                .push(ids.iter().map(|s| (*s).to_string()).collect());
+            Ok(())
         }
     }
 
@@ -1280,6 +1342,30 @@ mod tests {
             Err(RecallSourceError::Client(recall_client::ClientError::Remote {
                 code: "boom".to_string(),
                 message: "simulated".to_string(),
+            }))
+        }
+    }
+
+    /// Recall source whose `fetch` returns hits but `touch` always
+    /// fails. Used to verify touch-failure tolerance in `handle_turn_user`.
+    #[derive(Clone)]
+    struct TouchFailingRecall {
+        hits: Vec<QueryHit>,
+    }
+
+    #[async_trait::async_trait]
+    impl RecallSource for TouchFailingRecall {
+        async fn fetch(
+            &self,
+            _transcript: &str,
+        ) -> std::result::Result<Vec<QueryHit>, RecallSourceError> {
+            Ok(self.hits.clone())
+        }
+
+        async fn touch(&self, _ids: &[&str]) -> std::result::Result<(), RecallSourceError> {
+            Err(RecallSourceError::Client(recall_client::ClientError::Remote {
+                code: "touch_failed".to_string(),
+                message: "simulated touch boom".to_string(),
             }))
         }
     }
@@ -1397,9 +1483,11 @@ mod tests {
         let state = Arc::new(
             DaemonState::new(cfg)
                 .with_llm(into_dyn_llm(llm))
-                .with_recall(Arc::new(FakeRecall {
-                    hits: vec![fake_hit("a", "She prefers chamomile tea.", 0.9)],
-                })),
+                .with_recall(Arc::new(FakeRecall::new(vec![fake_hit(
+                    "a",
+                    "She prefers chamomile tea.",
+                    0.9,
+                )]))),
         );
         let mut sink = MemSink::default();
         let req = Request::TurnUser(TurnUserEvent {
@@ -1508,6 +1596,203 @@ mod tests {
         let RecallSourceError::Client(recall_client::ClientError::Connect { .. }) = err else {
             panic!("expected Connect error, got {err:?}");
         };
+    }
+
+    #[tokio::test]
+    async fn live_recall_source_touch_empty_ids_is_noop_no_connect() {
+        let src = LiveRecallSource::new(PathBuf::from(
+            "/tmp/wm-brain-iter11-touch-noop-nonexistent.sock",
+        ));
+        src.touch(&[]).await.expect("empty touch must not connect");
+    }
+
+    #[tokio::test]
+    async fn live_recall_source_touch_nonempty_attempts_connect() {
+        let src = LiveRecallSource::new(PathBuf::from(
+            "/tmp/wm-brain-iter11-touch-fail-nonexistent.sock",
+        ));
+        let err = src.touch(&["m-1"]).await.expect_err("connect should fail");
+        let RecallSourceError::Client(recall_client::ClientError::Connect { .. }) = err else {
+            panic!("expected Connect error, got {err:?}");
+        };
+    }
+
+    #[tokio::test]
+    async fn dispatch_turn_user_touches_recalled_ids_on_successful_reply() {
+        let llm = FakeLlm {
+            response: Ok(vec![text_delta("brewing chamomile now")]),
+        };
+        let recall = FakeRecall::new(vec![
+            fake_hit("m-1", "She prefers chamomile tea.", 0.9),
+            fake_hit("m-2", "Loose-leaf only.", 0.8),
+        ]);
+        let recall_handle = recall.clone();
+        let state = Arc::new(
+            DaemonState::new(BrainConfig::default())
+                .with_llm(into_dyn_llm(llm))
+                .with_recall(Arc::new(recall)),
+        );
+        let mut sink = MemSink::default();
+        let req = Request::TurnUser(TurnUserEvent {
+            transcript: "what should I drink?".to_string(),
+            confidence: 1.0,
+            ts: 1,
+        });
+        dispatch(state.as_ref(), &mut sink, req, 7)
+            .await
+            .expect("dispatch ok");
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, outgoing::REPLY);
+        let calls = recall_handle.touched_calls();
+        assert_eq!(calls.len(), 1, "exactly one touch call per successful turn");
+        assert_eq!(calls[0], vec!["m-1".to_string(), "m-2".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn dispatch_turn_user_does_not_touch_when_no_recall_hits() {
+        let llm = FakeLlm {
+            response: Ok(vec![text_delta("ok")]),
+        };
+        let recall = FakeRecall::new(Vec::new());
+        let recall_handle = recall.clone();
+        let state = Arc::new(
+            DaemonState::new(BrainConfig::default())
+                .with_llm(into_dyn_llm(llm))
+                .with_recall(Arc::new(recall)),
+        );
+        let mut sink = MemSink::default();
+        let req = Request::TurnUser(TurnUserEvent {
+            transcript: "hi".to_string(),
+            confidence: 1.0,
+            ts: 1,
+        });
+        dispatch(state.as_ref(), &mut sink, req, 7)
+            .await
+            .expect("dispatch ok");
+        assert!(
+            recall_handle.touched_calls().is_empty(),
+            "no hits means no touch call"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_turn_user_does_not_touch_when_text_empty() {
+        let llm = FakeLlm {
+            response: Ok(vec![
+                StreamEvent::MessageStart,
+                StreamEvent::MessageDelta { stop_reason: None },
+                StreamEvent::MessageStop,
+            ]),
+        };
+        let recall = FakeRecall::new(vec![fake_hit("m-1", "fact", 0.9)]);
+        let recall_handle = recall.clone();
+        let state = Arc::new(
+            DaemonState::new(BrainConfig::default())
+                .with_llm(into_dyn_llm(llm))
+                .with_recall(Arc::new(recall)),
+        );
+        let mut sink = MemSink::default();
+        let req = Request::TurnUser(TurnUserEvent {
+            transcript: "hi".to_string(),
+            confidence: 1.0,
+            ts: 1,
+        });
+        dispatch(state.as_ref(), &mut sink, req, 7)
+            .await
+            .expect("dispatch ok");
+        assert!(
+            recall_handle.touched_calls().is_empty(),
+            "empty-text errors must not touch — recall didn't actually feed a reply"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_turn_user_does_not_touch_when_llm_errors() {
+        let llm = FakeLlm {
+            response: Err("upstream 503"),
+        };
+        let recall = FakeRecall::new(vec![fake_hit("m-1", "fact", 0.9)]);
+        let recall_handle = recall.clone();
+        let state = Arc::new(
+            DaemonState::new(BrainConfig::default())
+                .with_llm(into_dyn_llm(llm))
+                .with_recall(Arc::new(recall)),
+        );
+        let mut sink = MemSink::default();
+        let req = Request::TurnUser(TurnUserEvent {
+            transcript: "hi".to_string(),
+            confidence: 1.0,
+            ts: 1,
+        });
+        dispatch(state.as_ref(), &mut sink, req, 7)
+            .await
+            .expect("dispatch ok");
+        assert!(
+            recall_handle.touched_calls().is_empty(),
+            "llm transport errors must not touch — no successful reply"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_turn_user_touches_on_destructive_intent_reply() {
+        // Destructive intents still represent a successful LLM response
+        // that consumed recall context — they should bump recall_count.
+        let body = "I'll do that.\n```json\n{\"intent\":\"wm.fs.rm\",\
+            \"summary\":\"delete x\",\"confirm_keyword\":\"delete\"}\n```";
+        let llm = FakeLlm {
+            response: Ok(vec![text_delta(body)]),
+        };
+        let recall = FakeRecall::new(vec![fake_hit("m-1", "context", 0.9)]);
+        let recall_handle = recall.clone();
+        let state = Arc::new(
+            DaemonState::new(BrainConfig::default())
+                .with_llm(into_dyn_llm(llm))
+                .with_recall(Arc::new(recall)),
+        );
+        let mut sink = MemSink::default();
+        let req = Request::TurnUser(TurnUserEvent {
+            transcript: "delete that".to_string(),
+            confidence: 1.0,
+            ts: 1,
+        });
+        dispatch(state.as_ref(), &mut sink, req, 7)
+            .await
+            .expect("dispatch ok");
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, outgoing::REPLY_DESTRUCTIVE);
+        let calls = recall_handle.touched_calls();
+        assert_eq!(calls.len(), 1, "destructive reply still touches recall");
+        assert_eq!(calls[0], vec!["m-1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn dispatch_turn_user_swallows_touch_errors() {
+        let llm = FakeLlm {
+            response: Ok(vec![text_delta("brewing")]),
+        };
+        let recall = TouchFailingRecall {
+            hits: vec![fake_hit("m-1", "fact", 0.9)],
+        };
+        let state = Arc::new(
+            DaemonState::new(BrainConfig::default())
+                .with_llm(into_dyn_llm(llm))
+                .with_recall(Arc::new(recall)),
+        );
+        let mut sink = MemSink::default();
+        let req = Request::TurnUser(TurnUserEvent {
+            transcript: "hi".to_string(),
+            confidence: 1.0,
+            ts: 1,
+        });
+        dispatch(state.as_ref(), &mut sink, req, 7)
+            .await
+            .expect("dispatch must succeed even when touch fails");
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 1, "reply still published despite touch failure");
+        assert_eq!(events[0].0, outgoing::REPLY);
+        assert_eq!(events[0].1["text"], "brewing");
     }
 
     #[tokio::test]
