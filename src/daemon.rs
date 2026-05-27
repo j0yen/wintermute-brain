@@ -15,10 +15,11 @@
 //! Recall retrieval, tool routing, destructive-intent gating, and turn
 //! memorisation remain iter-9+ work.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
@@ -27,7 +28,8 @@ use crate::bus::{
     self, DecodeError, Emit, ErrorEvent, ReplyEvent, Request, TurnUserEvent, decode_request,
     now_unix_ms, outgoing,
 };
-use crate::{BrainConfig, canonical_model};
+use crate::recall_client::{self, QueryArgs, QueryHit, RecallClient};
+use crate::{BrainConfig, PROFILE_SUBJECT, canonical_model};
 
 /// Default upper bound on tokens the daemon requests per turn.
 ///
@@ -36,13 +38,30 @@ use crate::{BrainConfig, canonical_model};
 /// iter-10 destructive-intent JSON trailer.
 pub const DEFAULT_MAX_TOKENS: u32 = 1024;
 
-/// System prompt iter-8 ships. iter-9 grows this with child-lock + tool
-/// router instructions; iter-10 adds destructive-intent gating.
+/// System prompt iter-8 shipped. iter-9 leaves this base verbatim and
+/// layers child-lock + recall-context blocks via [`compose_persona`];
+/// iter-10 adds the destructive-intent gating clause.
 pub const DEFAULT_PERSONA: &str = "You are wintermute, a voice-first companion daemon. \
 The user hears you spoken aloud, never reads you on a screen. \
 Speak naturally and warmly in plain prose. Keep replies to one short \
 paragraph per turn unless the user asks for more. Do not use markdown, \
 bullet lists, code fences, or emoji — they do not speak well.";
+
+/// Child-lock guard appended to the system prompt when
+/// [`BrainConfig::child_lock`] is true.
+///
+/// The voice surface should refuse adult / unsafe-action requests
+/// gracefully; the brain does not call out the reason to avoid teaching
+/// a younger user how to bypass it.
+pub const CHILD_LOCK_GUARD: &str = "Child-lock is active. If the user asks for adult content, \
+profanity, instructions for anything dangerous, or any action that would change settings or \
+delete data, decline kindly with a short redirect to something age-appropriate. Do not explain \
+the lock or how to disable it.";
+
+/// Default per-turn limit for recall hits spliced into the system
+/// prompt. Conservative for Fleet 1: keeps the prompt-cache breakpoint
+/// stable and well under Anthropic's per-request input budget.
+pub const DEFAULT_RECALL_LIMIT: usize = 6;
 
 /// Abstraction over the Anthropic Messages API the conversation loop
 /// drives. Production impl is [`AnthropicClient`]; tests inject an
@@ -72,8 +91,8 @@ impl LlmClient for AnthropicClient {
 }
 
 /// Build a buffered streaming request for a single user turn. Pure
-/// function; iter-9 grows this to splice recall hits and tool
-/// definitions onto the prompt.
+/// function; the caller is responsible for splicing recall context and
+/// child-lock guidance into `persona` via [`compose_persona`].
 #[must_use]
 pub fn compose_request(model: &str, persona: &str, transcript: &str) -> MessageRequest {
     MessageRequest::streaming(
@@ -85,6 +104,186 @@ pub fn compose_request(model: &str, persona: &str, transcript: &str) -> MessageR
         }],
     )
     .with_system(persona.to_string())
+}
+
+/// Assemble the effective system prompt the Anthropic call receives.
+///
+/// Layers in this order: `base` (persona), child-lock guard when set,
+/// then a recall-context block when non-empty. Each layer is separated
+/// by a blank line so the model parses them as distinct paragraphs.
+#[must_use]
+pub fn compose_persona(base: &str, child_lock: bool, recall_context: Option<&str>) -> String {
+    let mut out = base.to_string();
+    if child_lock {
+        out.push_str("\n\n");
+        out.push_str(CHILD_LOCK_GUARD);
+    }
+    if let Some(ctx) = recall_context {
+        if !ctx.is_empty() {
+            out.push_str("\n\n");
+            out.push_str(ctx);
+        }
+    }
+    out
+}
+
+/// Render a list of recall hits into the human-readable block we splice
+/// onto the system prompt. Returns `None` when the slice is empty so
+/// callers can skip the block entirely.
+///
+/// The format avoids markdown bullets — the persona instructs the model
+/// not to emit markdown in its replies, and a numbered list parses
+/// cleanly without inviting the model to mirror bullets in output.
+#[must_use]
+pub fn format_recall_context(hits: &[QueryHit]) -> Option<String> {
+    if hits.is_empty() {
+        return None;
+    }
+    let mut out = String::from("What you remember about the user (most relevant first):");
+    for (i, hit) in hits.iter().enumerate() {
+        let snippet = hit.snippet.trim();
+        if snippet.is_empty() {
+            continue;
+        }
+        out.push_str(&format!("\n{}. {}", i + 1, snippet));
+    }
+    Some(out)
+}
+
+/// Abstraction over the per-turn recall query. Production impl is
+/// [`LiveRecallSource`] (opens a fresh [`RecallClient`] per call);
+/// tests inject a canned source.
+#[async_trait::async_trait]
+pub trait RecallSource: Send + Sync {
+    /// Fetch a ranked slice of relevant memories for `transcript`.
+    ///
+    /// Returning an empty `Vec` is the universal no-context signal and
+    /// must not be reported as an error.
+    ///
+    /// # Errors
+    /// Implementations surface transport / decode failures as
+    /// [`RecallSourceError`]; the caller logs them and proceeds with an
+    /// empty context (recall outages must not break the conversation).
+    async fn fetch(&self, transcript: &str) -> Result<Vec<QueryHit>, RecallSourceError>;
+}
+
+/// Errors surfaced by [`RecallSource::fetch`].
+#[derive(Debug, thiserror::Error)]
+pub enum RecallSourceError {
+    /// Underlying recall-daemon client failure.
+    #[error("recall client: {0}")]
+    Client(#[from] recall_client::ClientError),
+}
+
+/// Zero-cost no-op [`RecallSource`]. Returned by [`DaemonState`] when
+/// the operator hasn't attached a real source; keeps the live daemon
+/// runnable without a recall daemon during early bring-up.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NullRecall;
+
+#[async_trait::async_trait]
+impl RecallSource for NullRecall {
+    async fn fetch(&self, _transcript: &str) -> Result<Vec<QueryHit>, RecallSourceError> {
+        Ok(Vec::new())
+    }
+}
+
+/// Production [`RecallSource`]: opens a fresh recall-daemon socket
+/// connection per turn. Fleet 1 trades the per-call connect for
+/// simplicity; pooling and connection reuse are Fleet 2 work.
+#[derive(Debug, Clone)]
+pub struct LiveRecallSource {
+    socket: PathBuf,
+    profile_subject: String,
+    limit: usize,
+}
+
+impl LiveRecallSource {
+    /// Build a live source pointed at `socket`. Defaults the profile
+    /// subject to [`PROFILE_SUBJECT`] and the limit to
+    /// [`DEFAULT_RECALL_LIMIT`].
+    #[must_use]
+    pub fn new(socket: PathBuf) -> Self {
+        Self {
+            socket,
+            profile_subject: PROFILE_SUBJECT.to_string(),
+            limit: DEFAULT_RECALL_LIMIT,
+        }
+    }
+
+    /// Override the recall subject scope for the profile query.
+    #[must_use]
+    pub fn with_profile_subject(mut self, subject: impl Into<String>) -> Self {
+        self.profile_subject = subject.into();
+        self
+    }
+
+    /// Override the per-turn hit cap.
+    #[must_use]
+    pub const fn with_limit(mut self, limit: usize) -> Self {
+        self.limit = limit;
+        self
+    }
+}
+
+#[async_trait::async_trait]
+impl RecallSource for LiveRecallSource {
+    async fn fetch(&self, transcript: &str) -> Result<Vec<QueryHit>, RecallSourceError> {
+        let mut client = RecallClient::connect(&self.socket).await?;
+        let args = QueryArgs {
+            text: transcript.to_string(),
+            limit: Some(self.limit),
+            hybrid: None,
+            project_subject: Some(self.profile_subject.clone()),
+        };
+        let resp = client.query(&args).await?;
+        Ok(resp.ranked_hits)
+    }
+}
+
+/// Abstraction over the brain's tool router. Fleet 1 ships
+/// [`NoToolsRouter`] (always answers "no-tools-registered"); Fleet 2
+/// wires real tools (time, weather, recall, fleet2 stubs) behind the
+/// same trait.
+#[async_trait::async_trait]
+pub trait ToolRouter: Send + Sync {
+    /// Dispatch one tool call and return the wire body the brain will
+    /// publish as `wm.brain.tool.result`.
+    ///
+    /// `ok=false` with a structured `body` is the canonical
+    /// missing-tool response — implementations never panic on unknown
+    /// names.
+    async fn dispatch(&self, name: &str, args: &Value) -> ToolResultBody;
+}
+
+/// Wire body the dispatcher returns; mirrors the `ok` + `body` pair on
+/// [`crate::bus::ToolResultEvent`] so the caller can forward it
+/// straight onto the bus.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolResultBody {
+    /// `true` if the tool returned a value; `false` on error / missing.
+    pub ok: bool,
+    /// Tool-specific payload (success body OR `{error, ...}`).
+    pub body: Value,
+}
+
+/// Fleet 1 default [`ToolRouter`]: rejects every call with a stable
+/// `no-tools-registered` error body so observers can detect when the
+/// model attempts a tool before Fleet 2 wires the real ones.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoToolsRouter;
+
+#[async_trait::async_trait]
+impl ToolRouter for NoToolsRouter {
+    async fn dispatch(&self, name: &str, _args: &Value) -> ToolResultBody {
+        ToolResultBody {
+            ok: false,
+            body: json!({
+                "error": "no-tools-registered",
+                "tool": name,
+            }),
+        }
+    }
 }
 
 /// Concatenate every `text_delta` chunk into a single assistant reply.
@@ -150,6 +349,13 @@ pub struct DaemonState {
     /// without an API key — turn events are logged and dropped without
     /// publishing.
     pub llm: Option<Arc<dyn LlmClient>>,
+    /// Recall retrieval source. Defaults to [`NullRecall`] so the
+    /// daemon is runnable without a live recall daemon; `run()` swaps
+    /// in a [`LiveRecallSource`] when the config carries a socket path.
+    pub recall: Arc<dyn RecallSource>,
+    /// Tool router. Defaults to [`NoToolsRouter`] in Fleet 1; Fleet 2
+    /// swaps in a real router with the wm.* tool surface.
+    pub tool_router: Arc<dyn ToolRouter>,
     /// System-prompt persona spliced into every request. Defaults to
     /// [`DEFAULT_PERSONA`].
     pub persona: String,
@@ -157,13 +363,16 @@ pub struct DaemonState {
 
 impl DaemonState {
     /// Construct a daemon state from an already-validated config. The
-    /// resulting state has no LLM client; attach one via
-    /// [`Self::with_llm`].
+    /// resulting state has no LLM client and uses [`NullRecall`] +
+    /// [`NoToolsRouter`]; attach real implementations via the
+    /// `with_*` builders.
     #[must_use]
     pub fn new(config: BrainConfig) -> Self {
         Self {
             config: Mutex::new(config),
             llm: None,
+            recall: Arc::new(NullRecall),
+            tool_router: Arc::new(NoToolsRouter),
             persona: DEFAULT_PERSONA.to_string(),
         }
     }
@@ -175,8 +384,23 @@ impl DaemonState {
         self
     }
 
-    /// Override the persona system prompt. Useful for tests and for the
-    /// future iter-9 child-lock variant.
+    /// Swap the recall source. Use to inject a live source or a test
+    /// fake.
+    #[must_use]
+    pub fn with_recall(mut self, recall: Arc<dyn RecallSource>) -> Self {
+        self.recall = recall;
+        self
+    }
+
+    /// Swap the tool router. Fleet 2 calls this with a real router.
+    #[must_use]
+    pub fn with_tool_router(mut self, router: Arc<dyn ToolRouter>) -> Self {
+        self.tool_router = router;
+        self
+    }
+
+    /// Override the persona system prompt. Useful for tests and for
+    /// operator-supplied persona overrides.
     #[must_use]
     pub fn with_persona(mut self, persona: impl Into<String>) -> Self {
         self.persona = persona.into();
@@ -232,13 +456,13 @@ pub async fn dispatch(
     req: Request,
     now_ms: u64,
 ) -> Result<()> {
-    let model = {
+    let (model, child_lock) = {
         let cfg = state.config.lock().await;
-        cfg.effective_model().to_string()
+        (cfg.effective_model().to_string(), cfg.child_lock)
     };
     match req {
         Request::TurnUser(t) => {
-            handle_turn_user(state, publish, &model, &t, now_ms).await?;
+            handle_turn_user(state, publish, &model, child_lock, &t, now_ms).await?;
         }
         Request::ConfirmGranted(c) => {
             info!(
@@ -259,10 +483,16 @@ pub async fn dispatch(
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "per-turn handler: state + sink + model + child_lock + turn + ts; refactoring into \
+              a struct would just shuffle the call sites"
+)]
 async fn handle_turn_user(
     state: &DaemonState,
     publish: &mut dyn EventSink,
     model: &str,
+    child_lock: bool,
     turn: &TurnUserEvent,
     now_ms: u64,
 ) -> Result<()> {
@@ -276,7 +506,16 @@ async fn handle_turn_user(
         );
         return Ok(());
     };
-    let req = compose_request(model, &state.persona, &turn.transcript);
+    let hits = match state.recall.fetch(&turn.transcript).await {
+        Ok(h) => h,
+        Err(err) => {
+            warn!(err = %err, "wm-brain: recall fetch failed; proceeding without context");
+            Vec::new()
+        }
+    };
+    let context = format_recall_context(&hits);
+    let persona = compose_persona(&state.persona, child_lock, context.as_deref());
+    let req = compose_request(model, &persona, &turn.transcript);
     match llm.collect_messages(&req).await {
         Ok(events) => {
             let text = extract_assistant_text(&events);
@@ -375,8 +614,13 @@ pub async fn run(cfg: BrainConfig) -> Result<()> {
     cfg.validate().context("wm-brain: config validation failed")?;
 
     let llm = build_llm_from_env(&cfg.api_key_env);
+    let recall: Arc<dyn RecallSource> = Arc::new(LiveRecallSource::new(cfg.recall_sock.clone()));
+    info!(
+        socket = %cfg.recall_sock.display(),
+        "wm-brain: recall source attached (live, connects per turn)"
+    );
     let state = Arc::new({
-        let base = DaemonState::new(cfg);
+        let base = DaemonState::new(cfg).with_recall(recall);
         match llm {
             Some(client) => base.with_llm(client),
             None => base,
@@ -741,6 +985,253 @@ mod tests {
         assert_eq!(v["confirm_keyword"], "delete");
         assert_eq!(v["action"]["tool"], "wm.fs.rm");
         assert_eq!(v["ts"], 7);
+    }
+
+    #[derive(Clone)]
+    struct CapturingLlm {
+        captured: Arc<StdMutex<Vec<MessageRequest>>>,
+        response: Vec<StreamEvent>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for CapturingLlm {
+        async fn collect_messages(
+            &self,
+            req: &MessageRequest,
+        ) -> std::result::Result<Vec<StreamEvent>, ClientError> {
+            self.captured
+                .lock()
+                .expect("capturing llm poisoned")
+                .push(req.clone());
+            Ok(self.response.clone())
+        }
+    }
+
+    #[derive(Clone)]
+    struct FakeRecall {
+        hits: Vec<QueryHit>,
+    }
+
+    #[async_trait::async_trait]
+    impl RecallSource for FakeRecall {
+        async fn fetch(
+            &self,
+            _transcript: &str,
+        ) -> std::result::Result<Vec<QueryHit>, RecallSourceError> {
+            Ok(self.hits.clone())
+        }
+    }
+
+    #[derive(Clone)]
+    struct FailingRecall;
+
+    #[async_trait::async_trait]
+    impl RecallSource for FailingRecall {
+        async fn fetch(
+            &self,
+            _transcript: &str,
+        ) -> std::result::Result<Vec<QueryHit>, RecallSourceError> {
+            Err(RecallSourceError::Client(recall_client::ClientError::Remote {
+                code: "boom".to_string(),
+                message: "simulated".to_string(),
+            }))
+        }
+    }
+
+    fn fake_hit(id: &str, snippet: &str, score: f64) -> QueryHit {
+        QueryHit {
+            id: id.to_string(),
+            kind: "fact".to_string(),
+            subject: "wintermute-profile".to_string(),
+            path: format!("/tmp/{id}.md"),
+            snippet: snippet.to_string(),
+            score,
+            confidence: score,
+        }
+    }
+
+    #[test]
+    fn compose_persona_without_lock_or_context_returns_base() {
+        assert_eq!(compose_persona("base persona", false, None), "base persona");
+    }
+
+    #[test]
+    fn compose_persona_with_child_lock_appends_guard() {
+        let out = compose_persona("base", true, None);
+        assert!(out.starts_with("base"));
+        assert!(out.contains(CHILD_LOCK_GUARD));
+        assert!(out.contains("\n\n"), "blocks separated by blank line");
+    }
+
+    #[test]
+    fn compose_persona_with_empty_context_does_not_add_block() {
+        let out = compose_persona("base", false, Some(""));
+        assert_eq!(out, "base");
+    }
+
+    #[test]
+    fn compose_persona_with_context_appends_block_after_lock() {
+        let out = compose_persona("base", true, Some("ctx block"));
+        let lock_idx = out.find(CHILD_LOCK_GUARD).expect("guard present");
+        let ctx_idx = out.find("ctx block").expect("context present");
+        assert!(ctx_idx > lock_idx, "context appended after lock guard");
+    }
+
+    #[test]
+    fn format_recall_context_empty_returns_none() {
+        assert!(format_recall_context(&[]).is_none());
+    }
+
+    #[test]
+    fn format_recall_context_renders_numbered_snippets() {
+        let hits = vec![
+            fake_hit("a", "She prefers chamomile tea.", 0.9),
+            fake_hit("b", "Daughter is Sara.", 0.8),
+        ];
+        let out = format_recall_context(&hits).expect("non-empty");
+        assert!(out.contains("1. She prefers chamomile tea."));
+        assert!(out.contains("2. Daughter is Sara."));
+        assert!(!out.contains('*'), "no markdown bullets in voice path");
+    }
+
+    #[test]
+    fn format_recall_context_skips_blank_snippets() {
+        let hits = vec![
+            fake_hit("a", "Real one.", 0.9),
+            fake_hit("b", "   ", 0.8),
+        ];
+        let out = format_recall_context(&hits).expect("non-empty");
+        assert!(out.contains("1. Real one."));
+        assert!(!out.contains("2."), "blank snippet skipped");
+    }
+
+    #[tokio::test]
+    async fn null_recall_returns_empty() {
+        let hits = NullRecall.fetch("anything").await.expect("never errors");
+        assert!(hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn no_tools_router_returns_stable_error_body() {
+        let body = NoToolsRouter
+            .dispatch("wm.weather.today", &json!({"loc": "LA"}))
+            .await;
+        assert!(!body.ok);
+        assert_eq!(body.body["error"], "no-tools-registered");
+        assert_eq!(body.body["tool"], "wm.weather.today");
+    }
+
+    #[tokio::test]
+    async fn dispatch_turn_user_splices_recall_context_into_system_prompt() {
+        let captured = Arc::new(StdMutex::new(Vec::new()));
+        let llm = CapturingLlm {
+            captured: captured.clone(),
+            response: vec![text_delta("hi there")],
+        };
+        let cfg = BrainConfig::default();
+        let state = Arc::new(
+            DaemonState::new(cfg)
+                .with_llm(into_dyn_llm(llm))
+                .with_recall(Arc::new(FakeRecall {
+                    hits: vec![fake_hit("a", "She prefers chamomile tea.", 0.9)],
+                })),
+        );
+        let mut sink = MemSink::default();
+        let req = Request::TurnUser(TurnUserEvent {
+            transcript: "what should I drink?".to_string(),
+            confidence: 1.0,
+            ts: 1,
+        });
+        dispatch(state.as_ref(), &mut sink, req, 7)
+            .await
+            .expect("dispatch ok");
+        let calls = captured.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let system = calls[0].system.as_deref().expect("system spliced");
+        assert!(system.contains("She prefers chamomile tea."));
+        assert!(system.starts_with(DEFAULT_PERSONA));
+        assert!(
+            !system.contains(CHILD_LOCK_GUARD),
+            "child-lock off in default config"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_turn_user_appends_child_lock_when_config_sets_it() {
+        let captured = Arc::new(StdMutex::new(Vec::new()));
+        let llm = CapturingLlm {
+            captured: captured.clone(),
+            response: vec![text_delta("ok")],
+        };
+        let cfg = BrainConfig {
+            child_lock: true,
+            ..BrainConfig::default()
+        };
+        let state = Arc::new(DaemonState::new(cfg).with_llm(into_dyn_llm(llm)));
+        let mut sink = MemSink::default();
+        let req = Request::TurnUser(TurnUserEvent {
+            transcript: "tell me a joke".to_string(),
+            confidence: 1.0,
+            ts: 1,
+        });
+        dispatch(state.as_ref(), &mut sink, req, 11)
+            .await
+            .expect("dispatch ok");
+        let calls = captured.lock().unwrap();
+        let system = calls[0].system.as_deref().expect("system spliced");
+        assert!(system.contains(CHILD_LOCK_GUARD));
+    }
+
+    #[tokio::test]
+    async fn dispatch_turn_user_proceeds_when_recall_errors() {
+        let captured = Arc::new(StdMutex::new(Vec::new()));
+        let llm = CapturingLlm {
+            captured: captured.clone(),
+            response: vec![text_delta("fallback reply")],
+        };
+        let cfg = BrainConfig::default();
+        let state = Arc::new(
+            DaemonState::new(cfg)
+                .with_llm(into_dyn_llm(llm))
+                .with_recall(Arc::new(FailingRecall)),
+        );
+        let mut sink = MemSink::default();
+        let req = Request::TurnUser(TurnUserEvent {
+            transcript: "anything".to_string(),
+            confidence: 1.0,
+            ts: 1,
+        });
+        dispatch(state.as_ref(), &mut sink, req, 13)
+            .await
+            .expect("dispatch ok");
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, outgoing::REPLY);
+        assert_eq!(events[0].1["text"], "fallback reply");
+        let calls = captured.lock().unwrap();
+        let system = calls[0].system.as_deref().expect("system");
+        assert_eq!(system, DEFAULT_PERSONA, "no context spliced on recall error");
+    }
+
+    #[test]
+    fn live_recall_source_builder_defaults() {
+        let src = LiveRecallSource::new(PathBuf::from("/tmp/x.sock"));
+        assert_eq!(src.profile_subject, PROFILE_SUBJECT);
+        assert_eq!(src.limit, DEFAULT_RECALL_LIMIT);
+        let custom = LiveRecallSource::new(PathBuf::from("/tmp/y.sock"))
+            .with_profile_subject("subj-x")
+            .with_limit(3);
+        assert_eq!(custom.profile_subject, "subj-x");
+        assert_eq!(custom.limit, 3);
+    }
+
+    #[tokio::test]
+    async fn live_recall_source_connect_failure_surfaces_client_error() {
+        let src = LiveRecallSource::new(PathBuf::from("/tmp/wm-brain-iter9-nonexistent.sock"));
+        let err = src.fetch("hi").await.expect_err("connect should fail");
+        let RecallSourceError::Client(recall_client::ClientError::Connect { .. }) = err else {
+            panic!("expected Connect error, got {err:?}");
+        };
     }
 
     #[tokio::test]
