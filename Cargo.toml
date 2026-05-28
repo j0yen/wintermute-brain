@@ -57,7 +57,7 @@ name = "wmd"
 path = "src/main.rs"
 
 [dependencies]
-agorabus = { path = "../agorabus" }
+agorabus = { path = "../agorabus", version = "0.1" }
 anyhow = "1"
 async-trait = "0.1"
 bytes = "1"
