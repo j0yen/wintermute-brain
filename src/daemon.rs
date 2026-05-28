@@ -1311,13 +1311,29 @@ pub async fn run(cfg: BrainConfig, config_path: Option<PathBuf>) -> Result<()> {
         warn!(socket = %sock.display(), "wm-brain: agorabus not reachable; exiting");
         return Ok(());
     };
+    sub_client
+        .announce(
+            &format!("wm-brain-{}-sub", std::process::id()),
+            std::process::id(),
+            "",
+            "wm-brain dialog subscribe",
+        )
+        .await?;
     sub_client.subscribe(bus::DIALOG_TOPIC_PREFIX).await?;
     info!(
         dialog_prefix = bus::DIALOG_TOPIC_PREFIX,
         "wm-brain: subscribed"
     );
 
-    let pub_client = agorabus::Client::connect(&sock).await?;
+    let mut pub_client = agorabus::Client::connect(&sock).await?;
+    pub_client
+        .announce(
+            &format!("wm-brain-{}", std::process::id()),
+            std::process::id(),
+            "",
+            "wm-brain publish path",
+        )
+        .await?;
     let mut sink = AgoraSink { inner: pub_client };
 
     while let Some(ev) = sub_client.next_event().await? {
