@@ -1,8 +1,8 @@
 [package]
 name = "wintermute-brain"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 publish = false
 
@@ -57,7 +57,7 @@ name = "wmd"
 path = "src/main.rs"
 
 [dependencies]
-agorabus = { path = "../agorabus", version = "0.3" }
+agorabus = { path = "../agorabus", version = "0.4" }
 anyhow = "1"
 async-trait = "0.1"
 bytes = "1"
