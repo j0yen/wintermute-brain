@@ -61,10 +61,15 @@ impl BrainConfig {
     pub fn load_from_file(path: &Path) -> Result<Self, BrainError> {
         match fs::read_to_string(path) {
             Ok(raw) => {
-                let cfg: Self = toml::from_str(&raw).map_err(|e| BrainError::InvalidConfig {
+                let mut cfg: Self = toml::from_str(&raw).map_err(|e| BrainError::InvalidConfig {
                     path: path.to_path_buf(),
                     reason: e.to_string(),
                 })?;
+                // Back-compat: a pre-ladder file may carry only
+                // `default_model`; migrate it to the matching tier when the
+                // file has no explicit `default_tier` key.
+                let had_default_tier_key = raw_has_top_level_key(&raw, "default_tier");
+                cfg.apply_legacy_tier_backcompat(had_default_tier_key);
                 cfg.validate()?;
                 Ok(cfg)
             }
@@ -129,6 +134,17 @@ impl BrainConfig {
         })?;
         Ok(())
     }
+}
+
+/// Does the raw TOML carry a top-level `key`? Used to distinguish a value
+/// the operator actually wrote from one serde filled with a `#[serde(default)]`.
+/// A parse failure here is non-fatal: the caller has already deserialized
+/// the config successfully, so we conservatively report `false`.
+fn raw_has_top_level_key(raw: &str, key: &str) -> bool {
+    toml::from_str::<toml::Value>(raw)
+        .ok()
+        .and_then(|v| v.as_table().map(|t| t.contains_key(key)))
+        .unwrap_or(false)
 }
 
 fn tmp_path_for(path: &Path) -> PathBuf {
@@ -205,9 +221,9 @@ mod tests {
     fn load_rejects_unknown_model_in_file() {
         let dir = TempDir::new().expect("tempdir");
         let path = dir.path().join("brain.toml");
-        fs::write(&path, "default_model = \"haiku\"\n").expect("write");
+        fs::write(&path, "default_model = \"gpt-4o\"\n").expect("write");
         let err = BrainConfig::load_from_file(&path).expect_err("must error");
-        assert!(matches!(err, BrainError::UnknownModel { ref name, .. } if name == "haiku"));
+        assert!(matches!(err, BrainError::UnknownModel { ref name, .. } if name == "gpt-4o"));
     }
 
     #[test]
@@ -215,7 +231,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let path = dir.path().join("brain.toml");
         let bad = BrainConfig {
-            default_model: "haiku".to_string(),
+            default_model: "gpt-4o".to_string(),
             ..BrainConfig::default()
         };
         let err = bad.save_to_file(&path).expect_err("must error");
@@ -236,6 +252,31 @@ mod tests {
             let back = BrainConfig::load_from_file(&path).expect("load");
             assert_eq!(back.default_model, *name);
         }
+    }
+
+    #[test]
+    fn legacy_default_model_file_migrates_to_tier_on_load() {
+        // AC1 back-compat: a pre-ladder file with only `default_model = "sonnet"`
+        // (no default_tier key) loads with default_tier migrated to "sonnet".
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("brain.toml");
+        fs::write(&path, "default_model = \"sonnet\"\n").expect("write");
+        let cfg = BrainConfig::load_from_file(&path).expect("load legacy");
+        assert_eq!(cfg.resolved_default_tier(), "sonnet");
+    }
+
+    #[test]
+    fn explicit_default_tier_in_file_wins_over_default_model() {
+        // A file that sets BOTH keys keeps its explicit default_tier.
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("brain.toml");
+        fs::write(
+            &path,
+            "default_model = \"sonnet\"\ndefault_tier = \"local-3b\"\n",
+        )
+        .expect("write");
+        let cfg = BrainConfig::load_from_file(&path).expect("load");
+        assert_eq!(cfg.resolved_default_tier(), "local-3b");
     }
 
     #[test]

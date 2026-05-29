@@ -26,8 +26,12 @@ pub use persist::default_config_path;
 pub const SHORT_MODEL_SONNET: &str = "sonnet";
 
 /// Short model name resolved by [`canonical_model`] to the
-/// Opus 4.7 model id. PRD §1.2 / §2.6.
+/// Opus 4.8 model id. PRD §1.2 / §2.6.
 pub const SHORT_MODEL_OPUS: &str = "opus";
+
+/// Short model name resolved by [`canonical_model`] to the
+/// Haiku 4.5 model id. PRD-brain-backend-ladder §2.1 (cheap-cloud floor).
+pub const SHORT_MODEL_HAIKU: &str = "haiku";
 
 /// Default chat model when `WM_BRAIN_DEFAULT_MODEL` is unset. PRD §1.2.
 pub const DEFAULT_MODEL_NAME: &str = SHORT_MODEL_SONNET;
@@ -51,13 +55,103 @@ pub const THREAD_SUBJECT_PREFIX: &str = "wintermute-thread-";
 pub const DEFAULT_CONFIG_BASENAME: &str = "wintermute/brain.toml";
 
 /// Short and canonical model names the daemon accepts on the CLI and
-/// in config files. PRD §2.6 promises both Sonnet 4.6 and Opus 4.7.
+/// in config files. PRD §2.6 promises Sonnet/Opus; the backend-ladder
+/// PRD adds the Haiku rung and the local tier names.
 pub const ALLOWED_MODEL_NAMES: &[&str] = &[
+    SHORT_MODEL_HAIKU,
     SHORT_MODEL_SONNET,
     SHORT_MODEL_OPUS,
+    "claude-haiku-4-5",
     "claude-sonnet-4-6",
-    "claude-opus-4-7",
+    "claude-opus-4-8",
+    // Tier names accepted by the ladder switches (swap-model/default-model).
+    TIER_LOCAL_3B,
+    TIER_LOCAL_8B,
 ];
+
+/// Built-in tier names, lowest→highest rung. PRD-brain-backend-ladder §2.1.
+/// (The cloud rungs `haiku`/`sonnet`/`opus` share their names with the
+/// short model ids above, so they are not duplicated here.)
+pub const TIER_LOCAL_3B: &str = "local-3b";
+/// The 8B local tier name. PRD-brain-backend-ladder §2.1.
+pub const TIER_LOCAL_8B: &str = "local-8b";
+
+/// Default ollama model id for the `local-3b` tier. Config-overridable.
+pub const DEFAULT_LOCAL_3B_MODEL: &str = "qwen2.5:3b";
+/// Default ollama model id for the `local-8b` tier. Config-overridable.
+pub const DEFAULT_LOCAL_8B_MODEL: &str = "qwen3:8b";
+
+/// Default OpenAI-compatible endpoint for the local backend (ollama on
+/// loopback). PRD-brain-backend-ladder §2.1.
+pub const DEFAULT_LOCAL_ENDPOINT: &str = "http://127.0.0.1:11434/v1";
+
+/// Default starting tier name. PRD-brain-backend-ladder §2.1 / AC1.
+pub const DEFAULT_TIER_NAME: &str = TIER_LOCAL_3B;
+
+/// Which backend serves a [`Tier`]. PRD-brain-backend-ladder §2.1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Backend {
+    /// A local OpenAI-compatible model (ollama via `wm-local-llm`).
+    Local,
+    /// An Anthropic cloud model (via the existing `AnthropicClient`).
+    Anthropic,
+}
+
+/// One rung of the brain's tier ladder: a name, the backend that serves
+/// it, and the backend-specific model id. PRD-brain-backend-ladder §2.1.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tier {
+    /// The tier's stable name (e.g. `local-3b`, `haiku`, `sonnet`).
+    pub name: String,
+    /// Which backend serves this tier.
+    pub backend: Backend,
+    /// Backend-specific model id: an ollama id (`qwen2.5:3b`) for
+    /// [`Backend::Local`], or a short/canonical Anthropic id for
+    /// [`Backend::Anthropic`].
+    pub model: String,
+}
+
+impl Tier {
+    /// Construct a tier.
+    #[must_use]
+    pub fn new(name: impl Into<String>, backend: Backend, model: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            backend,
+            model: model.into(),
+        }
+    }
+}
+
+/// Build the default tier ladder (lowest→highest rung).
+///
+/// Order: `local-3b → local-8b → haiku → sonnet → opus`
+/// (PRD-brain-backend-ladder §2.1). The local rungs' endpoints come from
+/// `local_endpoint`; the cloud rungs carry short model ids resolved by
+/// [`canonical_model`] at request time.
+#[must_use]
+pub fn default_ladder() -> Vec<Tier> {
+    vec![
+        Tier::new(TIER_LOCAL_3B, Backend::Local, DEFAULT_LOCAL_3B_MODEL),
+        Tier::new(TIER_LOCAL_8B, Backend::Local, DEFAULT_LOCAL_8B_MODEL),
+        Tier::new(SHORT_MODEL_HAIKU, Backend::Anthropic, SHORT_MODEL_HAIKU),
+        Tier::new(SHORT_MODEL_SONNET, Backend::Anthropic, SHORT_MODEL_SONNET),
+        Tier::new(SHORT_MODEL_OPUS, Backend::Anthropic, SHORT_MODEL_OPUS),
+    ]
+}
+
+/// The lowest *cloud* (Anthropic) tier name in the default ladder.
+///
+/// Used as the recall-down safe floor for `Ordinary` turns: when recall is
+/// unreachable the router's high-stakes detection is blind, so an ordinary
+/// turn cannot safely start local. PRD-brain-backend-ladder §2.2.
+pub const SAFE_FLOOR_TIER_NAME: &str = SHORT_MODEL_HAIKU;
+
+/// The trusted cloud tier a high-stakes turn starts at (skipping local).
+///
+/// PRD-brain-backend-ladder §2.2 / `AC3b`.
+pub const TRUSTED_CLOUD_TIER_NAME: &str = SHORT_MODEL_SONNET;
 
 /// Runtime configuration for `wmd`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -87,6 +181,21 @@ pub struct BrainConfig {
     /// `recall.search` tool calls — the "child lock" PRD §2.2 mentions.
     #[serde(default)]
     pub child_lock: bool,
+    /// Persistent starting tier for the ladder (lowest rung an ordinary
+    /// turn begins at). Defaults to [`DEFAULT_TIER_NAME`] (`local-3b`).
+    /// PRD-brain-backend-ladder §2.1 / AC1.
+    #[serde(default = "default_tier")]
+    pub default_tier: String,
+    /// Per-turn tier override, consumed once after `wmd swap-model`
+    /// sets it — mirrors [`Self::pending_model`] but for tiers.
+    /// PRD-brain-backend-ladder §2.3 / AC4.
+    #[serde(default)]
+    pub pending_tier: Option<String>,
+    /// OpenAI-compatible endpoint for the local backend (ollama).
+    /// Defaults to [`DEFAULT_LOCAL_ENDPOINT`].
+    /// PRD-brain-backend-ladder §2.1.
+    #[serde(default = "default_local_endpoint")]
+    pub local_endpoint: String,
 }
 
 impl Default for BrainConfig {
@@ -99,12 +208,23 @@ impl Default for BrainConfig {
             user_name: None,
             timezone: None,
             child_lock: false,
+            default_tier: default_tier(),
+            pending_tier: None,
+            local_endpoint: default_local_endpoint(),
         }
     }
 }
 
 fn default_model() -> String {
     DEFAULT_MODEL_NAME.to_string()
+}
+
+fn default_tier() -> String {
+    DEFAULT_TIER_NAME.to_string()
+}
+
+fn default_local_endpoint() -> String {
+    DEFAULT_LOCAL_ENDPOINT.to_string()
 }
 
 fn default_api_key_env() -> String {
@@ -199,9 +319,26 @@ pub fn validate_model_name(name: &str) -> Result<(), BrainError> {
 #[must_use]
 pub fn canonical_model(name: &str) -> &'static str {
     match name {
-        SHORT_MODEL_SONNET | "claude-sonnet-4-6" => "claude-sonnet-4-6",
-        SHORT_MODEL_OPUS | "claude-opus-4-7" => "claude-opus-4-7",
+        SHORT_MODEL_HAIKU | "claude-haiku-4-5" => "claude-haiku-4-5",
+        SHORT_MODEL_OPUS | "claude-opus-4-8" => "claude-opus-4-8",
+        // Sonnet is the conservative fallback for any unknown / local name
+        // (and the explicit sonnet ids): canonical_model only ever feeds an
+        // Anthropic request, so a stray string must resolve to a safe cloud
+        // id rather than panic.
         _ => "claude-sonnet-4-6",
+    }
+}
+
+/// Map a legacy `default_model` value to the ladder tier name it should
+/// resolve to (back-compat for configs predating the tier ladder).
+/// Returns `None` for values that don't name a cloud tier.
+#[must_use]
+fn legacy_model_to_tier(model: &str) -> Option<&'static str> {
+    match model {
+        SHORT_MODEL_HAIKU | "claude-haiku-4-5" => Some(SHORT_MODEL_HAIKU),
+        SHORT_MODEL_SONNET | "claude-sonnet-4-6" => Some(SHORT_MODEL_SONNET),
+        SHORT_MODEL_OPUS | "claude-opus-4-8" => Some(SHORT_MODEL_OPUS),
+        _ => None,
     }
 }
 
@@ -238,6 +375,10 @@ impl BrainConfig {
             None => false,
         };
 
+        let default_tier = env_string("WM_BRAIN_DEFAULT_TIER").unwrap_or_else(default_tier);
+        let local_endpoint =
+            env_string("WM_BRAIN_LOCAL_ENDPOINT").unwrap_or_else(default_local_endpoint);
+
         Ok(Self {
             default_model,
             pending_model: None,
@@ -246,6 +387,9 @@ impl BrainConfig {
             user_name,
             timezone,
             child_lock,
+            default_tier,
+            pending_tier: None,
+            local_endpoint,
         })
     }
 
@@ -259,6 +403,10 @@ impl BrainConfig {
         validate_model_name(&self.default_model)?;
         if let Some(p) = &self.pending_model {
             validate_model_name(p)?;
+        }
+        validate_model_name(&self.default_tier)?;
+        if let Some(t) = &self.pending_tier {
+            validate_model_name(t)?;
         }
         Ok(())
     }
@@ -280,6 +428,51 @@ impl BrainConfig {
     /// Clear the per-turn override after a successful API call.
     pub fn consume_pending(&mut self) {
         self.pending_model = None;
+    }
+
+    /// Resolve the *persistent* starting-tier name.
+    ///
+    /// This is simply `default_tier`; back-compat for legacy configs that
+    /// only ever set `default_model` (and carry no `default_tier` key) is
+    /// applied at file-load time by [`Self::apply_legacy_tier_backcompat`].
+    /// PRD-brain-backend-ladder AC1.
+    #[must_use]
+    pub fn resolved_default_tier(&self) -> String {
+        self.default_tier.clone()
+    }
+
+    /// Back-compat shim for configs written before the tier ladder: when a
+    /// loaded file carried a `default_model` naming a cloud tier but had no
+    /// `default_tier` key (so serde filled it with the built-in default),
+    /// migrate `default_tier` to the matching cloud tier so the upgraded
+    /// brain keeps starting where it used to. `had_default_tier_key` is
+    /// true when the raw TOML contained an explicit `default_tier`.
+    /// PRD-brain-backend-ladder AC1.
+    fn apply_legacy_tier_backcompat(&mut self, had_default_tier_key: bool) {
+        if had_default_tier_key {
+            return;
+        }
+        if self.default_tier != DEFAULT_TIER_NAME {
+            return;
+        }
+        if let Some(tier) = legacy_model_to_tier(&self.default_model) {
+            self.default_tier = tier.to_string();
+        }
+    }
+
+    /// Resolve the effective starting-tier name for the next turn, applying
+    /// `pending_tier` (one-shot) over [`Self::resolved_default_tier`].
+    /// PRD-brain-backend-ladder §2.3.
+    #[must_use]
+    pub fn effective_tier(&self) -> String {
+        self.pending_tier
+            .clone()
+            .unwrap_or_else(|| self.resolved_default_tier())
+    }
+
+    /// Clear the per-turn tier override after a turn consumes it.
+    pub fn consume_pending_tier(&mut self) {
+        self.pending_tier = None;
     }
 
     /// Resolve the today's-thread recall subject for an ISO-formatted
@@ -336,24 +529,103 @@ mod tests {
 
     #[test]
     fn validate_model_name_rejects_unknown() {
-        let err = validate_model_name("haiku").unwrap_err();
-        assert!(matches!(err, BrainError::UnknownModel { ref name, .. } if name == "haiku"));
+        // `haiku` is now an ACCEPTED tier (PRD-brain-backend-ladder §2.2);
+        // a genuinely unknown name still rejects.
+        let err = validate_model_name("gpt-4o").unwrap_err();
+        assert!(matches!(err, BrainError::UnknownModel { ref name, .. } if name == "gpt-4o"));
+    }
+
+    #[test]
+    fn validate_model_name_accepts_haiku_and_tier_names() {
+        // PRD-brain-backend-ladder §2.2: haiku must be accepted, as must the
+        // local tier names used by swap-model/default-model.
+        for name in [SHORT_MODEL_HAIKU, TIER_LOCAL_3B, TIER_LOCAL_8B, "claude-haiku-4-5"] {
+            validate_model_name(name).expect("tier name validates");
+        }
     }
 
     #[test]
     fn canonical_model_maps_short_to_long() {
         assert_eq!(canonical_model("sonnet"), "claude-sonnet-4-6");
-        assert_eq!(canonical_model("opus"), "claude-opus-4-7");
+        // PRD-brain-backend-ladder §2.2: current Opus is 4.8, not 4.7.
+        assert_eq!(canonical_model("opus"), "claude-opus-4-8");
+        assert_eq!(canonical_model("haiku"), "claude-haiku-4-5");
         assert_eq!(canonical_model("claude-sonnet-4-6"), "claude-sonnet-4-6");
-        assert_eq!(canonical_model("claude-opus-4-7"), "claude-opus-4-7");
+        assert_eq!(canonical_model("claude-opus-4-8"), "claude-opus-4-8");
+        assert_eq!(canonical_model("claude-haiku-4-5"), "claude-haiku-4-5");
     }
 
     #[test]
     fn canonical_model_falls_back_to_sonnet_for_unknown() {
-        // Defense in depth — validate_model_name should reject these
-        // upstream, but the resolver must not panic on stray strings.
-        assert_eq!(canonical_model("haiku"), "claude-sonnet-4-6");
+        // Defense in depth — local tier names are never fed to an Anthropic
+        // request, but the resolver must not panic on stray strings.
+        assert_eq!(canonical_model("local-3b"), "claude-sonnet-4-6");
         assert_eq!(canonical_model(""), "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn default_tier_is_local_3b() {
+        // AC1: default starting tier is local-3b even though default_model
+        // still defaults to sonnet (the cloud rung used when a turn lands
+        // on Anthropic). Back-compat for legacy files is tested in persist.
+        let cfg = BrainConfig::default();
+        assert_eq!(cfg.resolved_default_tier(), TIER_LOCAL_3B);
+        assert_eq!(cfg.effective_tier(), TIER_LOCAL_3B);
+    }
+
+    #[test]
+    fn legacy_tier_backcompat_maps_default_model() {
+        // AC1 back-compat: a file carrying only default_model = sonnet (no
+        // default_tier key) migrates to the sonnet tier; a file with an
+        // explicit default_tier keeps it.
+        let mut legacy = BrainConfig {
+            default_model: SHORT_MODEL_SONNET.to_string(),
+            default_tier: DEFAULT_TIER_NAME.to_string(),
+            ..BrainConfig::default()
+        };
+        legacy.apply_legacy_tier_backcompat(false);
+        assert_eq!(legacy.default_tier, SHORT_MODEL_SONNET);
+
+        let mut explicit = BrainConfig {
+            default_model: SHORT_MODEL_SONNET.to_string(),
+            default_tier: TIER_LOCAL_8B.to_string(),
+            ..BrainConfig::default()
+        };
+        explicit.apply_legacy_tier_backcompat(true);
+        assert_eq!(explicit.default_tier, TIER_LOCAL_8B);
+    }
+
+    #[test]
+    fn pending_tier_overrides_default_then_consumed() {
+        // AC4: swap-model sets a one-shot tier override.
+        let mut cfg = BrainConfig {
+            pending_tier: Some(TIER_LOCAL_8B.to_string()),
+            ..BrainConfig::default()
+        };
+        assert_eq!(cfg.effective_tier(), TIER_LOCAL_8B);
+        cfg.consume_pending_tier();
+        assert!(cfg.pending_tier.is_none());
+        assert_eq!(cfg.effective_tier(), TIER_LOCAL_3B);
+    }
+
+    #[test]
+    fn default_ladder_is_five_rungs_lowest_to_highest() {
+        // AC1: built-in ladder local-3b -> local-8b -> haiku -> sonnet -> opus.
+        let ladder = default_ladder();
+        let summary: Vec<(&str, Backend, &str)> = ladder
+            .iter()
+            .map(|t| (t.name.as_str(), t.backend, t.model.as_str()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (TIER_LOCAL_3B, Backend::Local, DEFAULT_LOCAL_3B_MODEL),
+                (TIER_LOCAL_8B, Backend::Local, DEFAULT_LOCAL_8B_MODEL),
+                ("haiku", Backend::Anthropic, "haiku"),
+                ("sonnet", Backend::Anthropic, "sonnet"),
+                ("opus", Backend::Anthropic, "opus"),
+            ]
+        );
     }
 
     #[test]
@@ -391,7 +663,7 @@ mod tests {
     #[test]
     fn validate_rejects_invalid_pending_model() {
         let cfg = BrainConfig {
-            pending_model: Some("haiku".to_string()),
+            pending_model: Some("gpt-4o".to_string()),
             ..BrainConfig::default()
         };
         assert!(matches!(
