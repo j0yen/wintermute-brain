@@ -852,6 +852,12 @@ pub struct DaemonState {
     pub pending: Mutex<HashMap<String, PendingIntent>>,
     /// Monotonic per-process counter spliced into minted `intent_id`s.
     pub intent_counter: AtomicU64,
+    /// The tier-ladder orchestrator. When `Some`, [`Request::TurnUser`]
+    /// dispatches through the local-first ladder instead of the single
+    /// Anthropic client. PRD-brain-backend-ladder.
+    pub ladder: Option<Arc<crate::ladder::LadderClient>>,
+    /// Per-session tier floor for conversational stickiness (AC10).
+    pub session_floor: crate::ladder::SessionFloor,
 }
 
 impl DaemonState {
@@ -870,6 +876,8 @@ impl DaemonState {
             persona: DEFAULT_PERSONA.to_string(),
             pending: Mutex::new(HashMap::new()),
             intent_counter: AtomicU64::new(0),
+            ladder: None,
+            session_floor: crate::ladder::SessionFloor::new(),
         }
     }
 
@@ -895,6 +903,14 @@ impl DaemonState {
     #[must_use]
     pub fn with_llm(mut self, llm: Arc<dyn LlmClient>) -> Self {
         self.llm = Some(llm);
+        self
+    }
+
+    /// Attach the tier-ladder orchestrator. When set, `TurnUser` dispatch
+    /// goes through the ladder rather than the single Anthropic client.
+    #[must_use]
+    pub fn with_ladder(mut self, ladder: Arc<crate::ladder::LadderClient>) -> Self {
+        self.ladder = Some(ladder);
         self
     }
 
@@ -980,16 +996,20 @@ pub async fn dispatch(
             // Persistence happens after the turn handler returns so a
             // crash during dispatch doesn't strand an empty pending on
             // disk.
-            let (model, child_lock, consumed_pending) = {
+            let (model, tier, child_lock, consumed_pending) = {
                 let mut cfg = state.config.lock().await;
                 let model = cfg.effective_model().to_string();
-                let had_pending = cfg.pending_model.is_some();
-                if had_pending {
+                let tier = cfg.effective_tier();
+                let had_pending = cfg.pending_model.is_some() || cfg.pending_tier.is_some();
+                if cfg.pending_model.is_some() {
                     cfg.consume_pending();
                 }
-                (model, cfg.child_lock, had_pending)
+                if cfg.pending_tier.is_some() {
+                    cfg.consume_pending_tier();
+                }
+                (model, tier, cfg.child_lock, had_pending)
             };
-            handle_turn_user(state, publish, &model, child_lock, &t, now_ms).await?;
+            handle_turn_user(state, publish, &model, &tier, child_lock, &t, now_ms).await?;
             if consumed_pending {
                 persist_after_pending_consume(state).await;
             }
@@ -1027,14 +1047,25 @@ async fn persist_after_pending_consume(state: &DaemonState) {
     reason = "per-turn handler: state + sink + model + child_lock + turn + ts; refactoring into \
               a struct would just shuffle the call sites"
 )]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::cognitive_complexity,
+    reason = "turn dispatch shell: ladder vs single-client branch, each linear"
+)]
 async fn handle_turn_user(
     state: &DaemonState,
     publish: &mut dyn EventSink,
     model: &str,
+    tier: &str,
     child_lock: bool,
     turn: &TurnUserEvent,
     now_ms: u64,
 ) -> Result<()> {
+    // When a ladder is configured it owns dispatch (local-first + climb);
+    // otherwise fall back to the single Anthropic client path.
+    if state.ladder.is_some() {
+        return handle_turn_user_ladder(state, publish, model, tier, child_lock, turn, now_ms).await;
+    }
     let Some(llm) = state.llm.as_ref() else {
         info!(
             transcript = %turn.transcript,
@@ -1080,6 +1111,80 @@ async fn handle_turn_user(
         Err(err) => {
             error!(err = %err, model = %model, "wm-brain: anthropic call failed");
             publish_error_at(publish, "anthropic", &format!("{err}"), now_ms).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Dispatch a turn through the tier ladder. Recall context + persona are
+/// composed exactly as the single-client path; the ladder picks the tier
+/// and climbs as needed. Filler backchannels are published as interim
+/// replies before the final answer (AC9). A terminal degrade publishes a
+/// typed error rather than going silent (AC5).
+#[allow(
+    clippy::too_many_arguments,
+    clippy::cognitive_complexity,
+    reason = "turn outcome shell: publish fillers, then answer/degrade, each linear"
+)]
+async fn handle_turn_user_ladder(
+    state: &DaemonState,
+    publish: &mut dyn EventSink,
+    model: &str,
+    tier: &str,
+    child_lock: bool,
+    turn: &TurnUserEvent,
+    now_ms: u64,
+) -> Result<()> {
+    let Some(ladder) = state.ladder.as_ref() else {
+        return Ok(());
+    };
+    let hits = match state.recall.fetch(&turn.transcript).await {
+        Ok(h) => h,
+        Err(err) => {
+            warn!(err = %err, "wm-brain: recall fetch failed; proceeding without context");
+            Vec::new()
+        }
+    };
+    let context = format_recall_context(&hits);
+    let persona = compose_persona(&state.persona, child_lock, context.as_deref());
+    let req = compose_request(model, &persona, &turn.transcript);
+
+    let sink = crate::ladder::BufferingSink::default();
+    let outcome = ladder
+        .run_turn_sticky(&turn.transcript, &req, tier, &sink, &state.session_floor)
+        .await;
+
+    // Publish any filler backchannels first (AC9), then the answer.
+    for filler in sink.take_fillers() {
+        let reply = ReplyEvent { text: filler, ts: now_ms };
+        publish
+            .publish(outgoing::REPLY, serde_json::to_value(&reply)?)
+            .await
+            .context("publish ladder filler")?;
+    }
+
+    match outcome {
+        crate::ladder::LadderOutcome::Answer { text, tier: served } => {
+            if text.is_empty() {
+                warn!(tier = %served, "wm-brain ladder: empty answer; emitting error");
+                publish_error_at(publish, "ladder", "no text in response", now_ms).await?;
+                return Ok(());
+            }
+            info!(tier = %served, "wm-brain ladder: turn served");
+            touch_recalled_hits(state.recall.as_ref(), &hits).await;
+            if let Some((intent, spoken)) = parse_destructive_intent(&text) {
+                publish_destructive(state, publish, intent, spoken, now_ms).await?;
+            } else {
+                let reply = ReplyEvent { text, ts: now_ms };
+                publish
+                    .publish(outgoing::REPLY, serde_json::to_value(&reply)?)
+                    .await
+                    .context("publish ladder reply")?;
+            }
+        }
+        crate::ladder::LadderOutcome::Degraded { reason } => {
+            error!(reason = %reason, "wm-brain ladder: turn degraded (no tier could serve)");
+            publish_error_at(publish, "ladder", &reason, now_ms).await?;
         }
     }
     Ok(())
@@ -1245,6 +1350,32 @@ fn into_dyn_llm<T: LlmClient + 'static>(client: T) -> Arc<dyn LlmClient> {
     Arc::new(client)
 }
 
+/// Build the tier-ladder orchestrator (PRD-brain-backend-ladder).
+///
+/// Local tiers serve from `cfg.local_endpoint`; cloud tiers use the
+/// (optional) Anthropic client. The brain stays up even with no API key —
+/// local tiers serve, cloud tiers degrade. Stakes come from a keyword+rules
+/// router; recall liveness drives the recall-down safe posture.
+fn build_ladder(
+    cfg: &BrainConfig,
+    llm: Option<&Arc<dyn LlmClient>>,
+) -> Arc<crate::ladder::LadderClient> {
+    let ladder = Arc::new(crate::ladder::LadderClient::new(
+        crate::default_ladder(),
+        Arc::new(crate::ladder::LiveLocalBackend::new(cfg.local_endpoint.clone())),
+        llm.cloned(),
+        Arc::new(crate::ladder::RouterStakes::new()),
+        Arc::new(crate::ladder::SocketRecallLiveness::new(cfg.recall_sock.clone())),
+    ));
+    info!(
+        default_tier = %cfg.resolved_default_tier(),
+        local_endpoint = %cfg.local_endpoint,
+        has_api_key = llm.is_some(),
+        "wm-brain: tier ladder wired (local-first; cloud tiers gated on api key)"
+    );
+    ladder
+}
+
 /// Build an [`AnthropicClient`] from the env var named by `api_key_env`.
 ///
 /// Returns `None` (with a `warn!`) if the var is unset, empty, or if
@@ -1303,10 +1434,14 @@ pub async fn run(cfg: BrainConfig, config_path: Option<PathBuf>) -> Result<()> {
         tools_extra = TOOL_RECALL_SAVE_FACT,
         "wm-brain: tool router wired with recall surface"
     );
+
+    let ladder_client = build_ladder(&cfg, llm.as_ref());
+
     let state = Arc::new({
         let mut base = DaemonState::new(cfg)
             .with_recall(recall)
-            .with_tool_router(tool_router);
+            .with_tool_router(tool_router)
+            .with_ladder(ladder_client);
         if let Some(p) = config_path {
             base = base.with_config_path(p);
         }
@@ -3258,5 +3393,72 @@ mod tests {
         assert_eq!(reqs.len(), 2, "two turns dispatched");
         assert_eq!(reqs[0].model, canonical_model(crate::SHORT_MODEL_OPUS));
         assert_eq!(reqs[1].model, canonical_model(crate::DEFAULT_MODEL_NAME));
+    }
+
+    // --- ladder integration through dispatch() ----------------------------
+
+    struct AlwaysAnswersLocal(String);
+
+    #[async_trait::async_trait]
+    impl crate::ladder::LocalBackend for AlwaysAnswersLocal {
+        async fn generate(
+            &self,
+            _model: &str,
+            _prompt: &wm_local_llm::Prompt,
+            _sink: &dyn wm_local_llm::DeltaSink,
+        ) -> wm_local_llm::LocalOutcome {
+            wm_local_llm::LocalOutcome::Answer { text: self.0.clone() }
+        }
+    }
+
+    struct FixedStakes(wm_router::Stakes);
+    impl crate::ladder::StakesProvider for FixedStakes {
+        fn stakes(&self, _t: &str) -> wm_router::Stakes {
+            self.0
+        }
+    }
+
+    struct RecallUp(bool);
+    #[async_trait::async_trait]
+    impl crate::ladder::RecallLiveness for RecallUp {
+        async fn recall_up(&self) -> bool {
+            self.0
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_turn_user_through_ladder_publishes_local_reply() {
+        // A configured ladder owns dispatch; an ordinary turn served locally
+        // publishes a wm.brain.reply and never touches the Anthropic client.
+        let ladder = Arc::new(crate::ladder::LadderClient::new(
+            crate::default_ladder(),
+            Arc::new(AlwaysAnswersLocal(
+                "It's a calm, pleasant afternoon here.".to_string(),
+            )),
+            None, // no API key path
+            Arc::new(FixedStakes(wm_router::Stakes::Ordinary)),
+            Arc::new(RecallUp(true)),
+        ));
+        let state = Arc::new(DaemonState::new(BrainConfig::default()).with_ladder(ladder));
+        let mut sink = MemSink::default();
+        dispatch(
+            state.as_ref(),
+            &mut sink,
+            Request::TurnUser(TurnUserEvent {
+                transcript: "tell me about your afternoon".to_string(),
+                confidence: 1.0,
+                ts: 7,
+            }),
+            7,
+        )
+        .await
+        .expect("dispatch ok");
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 1, "exactly one reply published");
+        assert_eq!(events[0].0, outgoing::REPLY);
+        assert_eq!(
+            events[0].1["text"],
+            "It's a calm, pleasant afternoon here."
+        );
     }
 }

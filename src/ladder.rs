@@ -563,6 +563,53 @@ fn with_model(request: &MessageRequest, model: &str) -> MessageRequest {
     req
 }
 
+/// A [`LadderSink`] that buffers fillers and deltas in memory.
+///
+/// An async caller (the daemon) can publish them to the bus after the
+/// (sync-sink) ladder run completes. Fillers are returned in emit order so
+/// the caller can publish them as interim replies before the final answer
+/// (AC9).
+#[derive(Debug, Default)]
+pub struct BufferingSink {
+    fillers: std::sync::Mutex<Vec<String>>,
+    deltas: std::sync::Mutex<Vec<String>>,
+}
+
+impl BufferingSink {
+    /// Drain and return the buffered filler phrases, in emit order.
+    #[must_use]
+    pub fn take_fillers(&self) -> Vec<String> {
+        drain(&self.fillers)
+    }
+
+    /// Drain and return the buffered answer deltas, in arrival order.
+    #[must_use]
+    pub fn take_deltas(&self) -> Vec<String> {
+        drain(&self.deltas)
+    }
+}
+
+/// Drain a mutex-guarded `Vec`, returning its contents (empty on poison).
+fn drain(m: &std::sync::Mutex<Vec<String>>) -> Vec<String> {
+    m.lock().map(|mut v| std::mem::take(&mut *v)).unwrap_or_default()
+}
+
+impl DeltaSink for BufferingSink {
+    fn on_delta(&self, delta: &str) {
+        if let Ok(mut v) = self.deltas.lock() {
+            v.push(delta.to_string());
+        }
+    }
+}
+
+impl LadderSink for BufferingSink {
+    fn emit_filler(&self, phrase: &str) {
+        if let Ok(mut v) = self.fillers.lock() {
+            v.push(phrase.to_string());
+        }
+    }
+}
+
 /// Production [`LocalBackend`]: builds a `wm-local-llm` client per call
 /// from the configured endpoint + the tier's ollama model id.
 pub struct LiveLocalBackend {
@@ -618,6 +665,34 @@ impl StakesProvider for RouterStakes {
             // A skill/cache deflection reaching the brain is treated as an
             // ordinary brain turn (the brain doesn't run skills/cache).
             wm_router::Route::Skill(_) | wm_router::Route::CacheLookup => Stakes::Ordinary,
+        }
+    }
+}
+
+/// Production [`RecallLiveness`]: a cheap recall reachability probe.
+///
+/// Probes the recall daemon via a connect + `ping` over its Unix socket. A
+/// failure to connect/ping means recall (and thus the router's semantic
+/// safety stage) is unreachable, so the ladder applies its recall-down safe
+/// posture.
+pub struct SocketRecallLiveness {
+    socket: std::path::PathBuf,
+}
+
+impl SocketRecallLiveness {
+    /// Construct a probe bound to the recall socket `path`.
+    #[must_use]
+    pub const fn new(path: std::path::PathBuf) -> Self {
+        Self { socket: path }
+    }
+}
+
+#[async_trait::async_trait]
+impl RecallLiveness for SocketRecallLiveness {
+    async fn recall_up(&self) -> bool {
+        match crate::recall_client::RecallClient::connect(&self.socket).await {
+            Ok(mut client) => client.ping().await.is_ok(),
+            Err(_) => false,
         }
     }
 }

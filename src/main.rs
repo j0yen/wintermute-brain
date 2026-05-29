@@ -50,14 +50,18 @@ enum Command {
     /// Start the daemon (long-running). iter-3 wires the Anthropic
     /// streaming client + agorabus subscribe loop.
     Start,
-    /// Use a different model for the next turn only. PRD §2.6.
+    /// Use a different tier/model for the next turn only. PRD §2.6 +
+    /// brain-backend-ladder §2.3.
     SwapModel {
-        /// One of: `sonnet`, `opus`, `claude-sonnet-4-6`, `claude-opus-4-7`.
+        /// A tier name (`local-3b`, `local-8b`, `haiku`, `sonnet`, `opus`)
+        /// or a legacy model id (`claude-sonnet-4-6`, `claude-opus-4-8`, …).
         name: String,
     },
-    /// Change the persistent default model. PRD §2.6.
+    /// Change the persistent default tier/model. PRD §2.6 +
+    /// brain-backend-ladder §2.3.
     DefaultModel {
-        /// One of: `sonnet`, `opus`, `claude-sonnet-4-6`, `claude-opus-4-7`.
+        /// A tier name (`local-3b`, `local-8b`, `haiku`, `sonnet`, `opus`)
+        /// or a legacy model id (`claude-sonnet-4-6`, `claude-opus-4-8`, …).
         name: String,
     },
     /// Print the resolved configuration as JSON and exit. Useful for
@@ -186,12 +190,17 @@ fn run_swap_model(path: &std::path::Path, name: &str) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    // Set both the legacy per-turn model override and the ladder's per-turn
+    // tier override to the same name. The ladder consumes pending_tier; the
+    // legacy single-client path consumes pending_model. Tier names and model
+    // short names both validate, so one CLI serves both. PRD AC4.
+    cfg.pending_tier = Some(name.to_string());
     cfg.pending_model = Some(name.to_string());
     if let Err(err) = cfg.save_to_file(path) {
         error!(error = %err, "wmd swap-model: save failed");
         return ExitCode::from(1);
     }
-    info!(model = %name, path = %path.display(), "wmd swap-model: pending_model set");
+    info!(tier = %name, path = %path.display(), "wmd swap-model: pending tier/model set");
     ExitCode::SUCCESS
 }
 
@@ -208,12 +217,15 @@ fn run_default_model(path: &std::path::Path, name: &str) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    // Persist both the ladder default tier and (for the legacy single-client
+    // path) the default model. PRD AC4.
+    cfg.default_tier = name.to_string();
     cfg.default_model = name.to_string();
     if let Err(err) = cfg.save_to_file(path) {
         error!(error = %err, "wmd default-model: save failed");
         return ExitCode::from(1);
     }
-    info!(model = %name, path = %path.display(), "wmd default-model: persisted");
+    info!(tier = %name, path = %path.display(), "wmd default-model: persisted");
     ExitCode::SUCCESS
 }
 
@@ -227,5 +239,67 @@ fn run_status(cfg: &BrainConfig, path: &std::path::Path) -> ExitCode {
             error!(error = %err, "wmd status: failed to serialise config");
             ExitCode::from(1)
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "tests"
+)]
+mod tests {
+    use super::*;
+    use wintermute_brain::{SHORT_MODEL_SONNET, TIER_LOCAL_8B};
+
+    fn is_success(code: ExitCode) -> bool {
+        // ExitCode has no Eq; format it (Debug renders SUCCESS vs the int).
+        format!("{code:?}") == format!("{:?}", ExitCode::SUCCESS)
+    }
+
+    #[test]
+    fn swap_model_accepts_tier_name_and_sets_pending_tier() {
+        // AC4: swap-model local-8b sets the next-turn tier.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("brain.toml");
+        BrainConfig::default().save_to_file(&path).unwrap();
+        let code = run_swap_model(&path, TIER_LOCAL_8B);
+        assert!(is_success(code), "swap-model local-8b should succeed");
+        let cfg = BrainConfig::load_from_file(&path).unwrap();
+        assert_eq!(cfg.pending_tier.as_deref(), Some(TIER_LOCAL_8B));
+        assert_eq!(cfg.effective_tier(), TIER_LOCAL_8B);
+    }
+
+    #[test]
+    fn swap_model_legacy_short_name_still_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("brain.toml");
+        BrainConfig::default().save_to_file(&path).unwrap();
+        let code = run_swap_model(&path, SHORT_MODEL_SONNET);
+        assert!(is_success(code));
+        let cfg = BrainConfig::load_from_file(&path).unwrap();
+        assert_eq!(cfg.effective_tier(), SHORT_MODEL_SONNET);
+    }
+
+    #[test]
+    fn default_model_accepts_tier_and_persists() {
+        // AC4: default-model opus sets the persistent tier.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("brain.toml");
+        BrainConfig::default().save_to_file(&path).unwrap();
+        let code = run_default_model(&path, "opus");
+        assert!(is_success(code));
+        let cfg = BrainConfig::load_from_file(&path).unwrap();
+        assert_eq!(cfg.resolved_default_tier(), "opus");
+    }
+
+    #[test]
+    fn swap_model_unknown_tier_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("brain.toml");
+        BrainConfig::default().save_to_file(&path).unwrap();
+        let code = run_swap_model(&path, "gpt-4o");
+        assert!(!is_success(code), "unknown tier must error");
     }
 }
