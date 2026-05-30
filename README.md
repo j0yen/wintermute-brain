@@ -115,6 +115,14 @@ Subscribed: `wm.dialog.{turn.user, confirm.granted, confirm.denied}`.
 
 Published: `wm.brain.{reply, reply.destructive, tool.call, tool.result, error}`.
 
+## Recent
+
+- **v0.3.0** — bounded in-memory turn-history ring: the brain now chains
+  conversation turns. `compose_request` prepends the last N `(user, assistant)`
+  pairs (default `history_turns = 6`) so "say that again" / "what did you mean"
+  work. Ring bound, failure exclusion, token-budget trim, and kill-switch
+  (`history_turns = 0`) all ship. 176 lib tests pass.
+
 ## License
 
 Dual-licensed MIT or Apache-2.0 at your option.
