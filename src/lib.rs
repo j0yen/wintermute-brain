@@ -23,6 +23,7 @@ pub mod history;
 pub mod ladder;
 pub mod persist;
 pub mod recall_client;
+pub mod writeback;
 pub use persist::default_config_path;
 
 /// Short model name resolved by [`canonical_model`] to the
@@ -163,7 +164,9 @@ pub const SAFE_FLOOR_TIER_NAME: &str = SHORT_MODEL_HAIKU;
 pub const TRUSTED_CLOUD_TIER_NAME: &str = SHORT_MODEL_SONNET;
 
 /// Runtime configuration for `wmd`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// `PartialEq` is derived; `Eq` is not (f64 fields prevent it).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BrainConfig {
     /// Default model id used when no per-turn override is in effect.
     /// Must be in [`ALLOWED_MODEL_NAMES`].
@@ -218,6 +221,27 @@ pub struct BrainConfig {
     /// not want live almanac audio.
     #[serde(default = "default_almanac_speak")]
     pub almanac_speak: bool,
+    /// When `true`, extracted facts are committed directly to recall
+    /// instead of going through the proposal/triage queue.
+    /// Defaults to `false` (proposals-by-default — PRD-wmd-memory-writeback §2.3).
+    #[serde(default)]
+    pub writeback_auto_commit: bool,
+    /// Short model name used for the per-session fact-extraction call.
+    /// Defaults to `"haiku"` — cheap and sufficient for extraction.
+    /// PRD-wmd-memory-writeback §5.
+    #[serde(default = "default_writeback_model")]
+    pub writeback_model: String,
+    /// Minimum confidence a FACT line must carry to be written back.
+    /// Lines below this floor are silently dropped.
+    /// Defaults to `0.5`. PRD-wmd-memory-writeback §5.
+    #[serde(default = "default_writeback_confidence_floor")]
+    pub writeback_confidence_floor: f64,
+    /// Idle gap in milliseconds after which a new `turn.user` starts a
+    /// fresh session and fires writeback on the old one.
+    /// Defaults to `300_000` ms (5 minutes).
+    /// PRD-wmd-session-boundary §2.1 / PRD-wmd-memory-writeback §2.2.
+    #[serde(default = "default_idle_gap_ms")]
+    pub idle_gap_ms: u64,
 }
 
 impl Default for BrainConfig {
@@ -235,6 +259,10 @@ impl Default for BrainConfig {
             local_endpoint: default_local_endpoint(),
             history_turns: default_history_turns(),
             almanac_speak: default_almanac_speak(),
+            writeback_auto_commit: false,
+            writeback_model: default_writeback_model(),
+            writeback_confidence_floor: default_writeback_confidence_floor(),
+            idle_gap_ms: default_idle_gap_ms(),
         }
     }
 }
@@ -257,6 +285,18 @@ fn default_history_turns() -> usize {
 
 const fn default_almanac_speak() -> bool {
     true
+}
+
+fn default_writeback_model() -> String {
+    SHORT_MODEL_HAIKU.to_string()
+}
+
+const fn default_writeback_confidence_floor() -> f64 {
+    0.5
+}
+
+const fn default_idle_gap_ms() -> u64 {
+    300_000
 }
 
 fn default_api_key_env() -> String {
@@ -417,6 +457,30 @@ impl BrainConfig {
         let local_endpoint =
             env_string("WM_BRAIN_LOCAL_ENDPOINT").unwrap_or_else(default_local_endpoint);
 
+        let writeback_auto_commit = match env_string("WM_BRAIN_WRITEBACK_AUTO_COMMIT") {
+            Some(raw) => parse_bool_env("WM_BRAIN_WRITEBACK_AUTO_COMMIT", &raw)?,
+            None => false,
+        };
+        let writeback_model =
+            env_string("WM_BRAIN_WRITEBACK_MODEL").unwrap_or_else(default_writeback_model);
+        let writeback_confidence_floor =
+            match env_string("WM_BRAIN_WRITEBACK_CONFIDENCE_FLOOR") {
+                Some(raw) => raw.trim().parse::<f64>().map_err(|e| BrainError::InvalidEnv {
+                    var: "WM_BRAIN_WRITEBACK_CONFIDENCE_FLOOR",
+                    value: raw.clone(),
+                    reason: e.to_string(),
+                })?,
+                None => default_writeback_confidence_floor(),
+            };
+        let idle_gap_ms = match env_string("WM_BRAIN_IDLE_GAP_MS") {
+            Some(raw) => raw.trim().parse::<u64>().map_err(|e| BrainError::InvalidEnv {
+                var: "WM_BRAIN_IDLE_GAP_MS",
+                value: raw.clone(),
+                reason: e.to_string(),
+            })?,
+            None => default_idle_gap_ms(),
+        };
+
         Ok(Self {
             default_model,
             pending_model: None,
@@ -430,6 +494,10 @@ impl BrainConfig {
             pending_tier: None,
             local_endpoint,
             history_turns: default_history_turns(),
+            writeback_auto_commit,
+            writeback_model,
+            writeback_confidence_floor,
+            idle_gap_ms,
         })
     }
 
