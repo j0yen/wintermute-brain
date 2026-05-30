@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.7.0 — 2026-05-30
+
+wmd-memory-writeback: end-of-session recall writeback pipeline.
+New: src/writeback.rs (ExtractorClient, WritebackGuard, FACT parsing, trigger_writeback).
+BrainConfig: writeback_auto_commit/model/confidence_floor/idle_gap_ms.
+DaemonState: session tracking + extractor; fires on idle-gap expiry.
+AnthropicExtractor wired in run(). 249 tests (+26). cargo deny clean.
+
 ## v0.6.0 — 2026-05-30
 
 feat(degrade): graceful-degradation phrase bank, aggregator, and health snapshot
