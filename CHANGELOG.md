@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.3.0 — 2026-05-30
+
+Add bounded in-memory turn-history ring so the brain chains conversation turns.
+
+`wmd` was provably stateless — each turn built a single-message request with no
+prior context. This extends `DaemonState` with a `History` ring (capacity from
+`BrainConfig.history_turns`, default 6) fed into `compose_request` as a flat
+`[user, assistant, …, current_user]` prefix. Failed / empty-reply turns are not
+pushed (AC3). Destructive-intent turns store the spoken prefix, not the JSON fence
+(AC5). A token-budget guard trims the oldest pairs first (AC6). `history_turns = 0`
+restores the single-message invariant (AC4). Verified: 176 lib tests pass, AC1–AC4
+covered by integration tests in `daemon::tests`.
+
 ## v0.1.1 — 2026-05-28
 
 Fix post-announce bus-startup defect (PRD-wintermute-fleet-bus-startup-defect).
