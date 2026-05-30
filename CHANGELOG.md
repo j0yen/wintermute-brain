@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.4.0 — 2026-05-29
+
+Add almanac acknowledgment FSM — close the reminder loop with spoken reply classification.
+
+After `wm.almanac.due` fires a spoken prompt, the brain now sets a `PendingAck` on
+`DaemonState` and classifies the next `wm.stt.final` transcript within earshot's patience
+window: "took it" / "okay" / "done" → `wm.almanac.ack {state:"done"}`; "later" / "in a
+minute" → `{state:"snoozed"}` + `wm.almanac.snooze {resume_ts}`; unrelated transcript →
+pending left open. On timeout the daemon emits `{state:"missed"}` and speaks one gentle
+re-ask; a second timeout finalises missed with no further re-ask. Classification is
+deterministic keyword tiers (no network/LLM call). 204 lib tests pass.
+
 ## v0.3.0 — 2026-05-30
 
 Add bounded in-memory turn-history ring so the brain chains conversation turns.
