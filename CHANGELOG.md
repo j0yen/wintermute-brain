@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.8.0 — 2026-05-30
+
+PRD-wmd-turn-history gave the brain a rolling last-N buffer, but without session
+boundaries context bleeds across unrelated conversations. This increment adds
+conversation session tracking: wmd infers sessions from idle gaps (default 5 min)
+and explicit close phrases ("goodbye", "go to sleep", etc.), emits
+wm.brain.session.start/end events, and clears the history ring on each boundary.
+
 ## v0.7.0 — 2026-05-30
 
 wmd-memory-writeback: end-of-session recall writeback pipeline.
