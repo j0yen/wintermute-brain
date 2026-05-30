@@ -168,6 +168,11 @@ pub const TRUSTED_CLOUD_TIER_NAME: &str = SHORT_MODEL_SONNET;
 ///
 /// `PartialEq` is derived; `Eq` is not (f64 fields prevent it).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "BrainConfig fields are independent feature gates that map naturally to bools; \
+              grouping them into bitfields or enums would obscure their meaning and serde shape"
+)]
 pub struct BrainConfig {
     /// Default model id used when no per-turn override is in effect.
     /// Must be in [`ALLOWED_MODEL_NAMES`].
@@ -249,6 +254,17 @@ pub struct BrainConfig {
     /// PRD-wmd-session-boundary §2.2.
     #[serde(default = "default_session_end_phrases")]
     pub session_end_phrases: Vec<String>,
+    /// Upper bound on thread memories injected at session start.
+    /// Most-recent first. `0` disables recap injection entirely.
+    /// PRD-wmd-session-recap §2.1.
+    #[serde(default = "default_recap_max_memories")]
+    pub recap_max_memories: usize,
+    /// When `true`, wmd publishes a proactive `wm.brain.reply` before
+    /// the user's first turn, opening with a continuity greeting drawn
+    /// from the recap context. Default `false` (conservative; see PRD §2.3).
+    /// PRD-wmd-session-recap §2.3.
+    #[serde(default)]
+    pub recap_opener: bool,
 }
 
 impl Default for BrainConfig {
@@ -271,6 +287,8 @@ impl Default for BrainConfig {
             writeback_confidence_floor: default_writeback_confidence_floor(),
             idle_gap_ms: default_idle_gap_ms(),
             session_end_phrases: default_session_end_phrases(),
+            recap_max_memories: default_recap_max_memories(),
+            recap_opener: false,
         }
     }
 }
@@ -312,6 +330,15 @@ fn default_session_end_phrases() -> Vec<String> {
         .iter()
         .map(|s| (*s).to_string())
         .collect()
+}
+
+/// Default upper bound on thread memories injected at session start.
+///
+/// PRD-wmd-session-recap §2.1: 5 is conservative for prompt-cache stability.
+pub const DEFAULT_RECAP_MAX_MEMORIES: usize = 5;
+
+const fn default_recap_max_memories() -> usize {
+    DEFAULT_RECAP_MAX_MEMORIES
 }
 
 fn default_api_key_env() -> String {
@@ -496,6 +523,19 @@ impl BrainConfig {
             None => default_idle_gap_ms(),
         };
 
+        let recap_max_memories = match env_string("WM_BRAIN_RECAP_MAX_MEMORIES") {
+            Some(raw) => raw.trim().parse::<usize>().map_err(|e| BrainError::InvalidEnv {
+                var: "WM_BRAIN_RECAP_MAX_MEMORIES",
+                value: raw.clone(),
+                reason: e.to_string(),
+            })?,
+            None => default_recap_max_memories(),
+        };
+        let recap_opener = match env_string("WM_BRAIN_RECAP_OPENER") {
+            Some(raw) => parse_bool_env("WM_BRAIN_RECAP_OPENER", &raw)?,
+            None => false,
+        };
+
         Ok(Self {
             default_model,
             pending_model: None,
@@ -514,6 +554,8 @@ impl BrainConfig {
             writeback_confidence_floor,
             idle_gap_ms,
             session_end_phrases: default_session_end_phrases(),
+            recap_max_memories,
+            recap_opener,
         })
     }
 

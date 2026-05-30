@@ -44,7 +44,7 @@ use crate::history::{History, Turn};
 use crate::recall_client::{self, QueryArgs, QueryHit, RecallClient, TouchArgs};
 use crate::session::{AdvanceOutcome, CloseReason, SessionTracker};
 use crate::writeback::{ExtractorClient, WritebackGuard};
-use crate::{BrainConfig, PROFILE_SUBJECT, canonical_model};
+use crate::{BrainConfig, PROFILE_SUBJECT, THREAD_SUBJECT_PREFIX, canonical_model};
 
 /// Default upper bound on tokens the daemon requests per turn.
 ///
@@ -190,11 +190,18 @@ pub fn compose_request(
 /// Assemble the effective system prompt the Anthropic call receives.
 ///
 /// Layers in this order: `base` (persona), child-lock guard when set,
-/// the destructive-intent gate (always — PRD §2.4), then a
-/// recall-context block when non-empty. Each layer is separated by a
-/// blank line so the model parses them as distinct paragraphs.
+/// the destructive-intent gate (always — PRD §2.4), then a per-turn
+/// recall-context block when non-empty, then the session recap context
+/// (thread memories) when non-empty (PRD-wmd-session-recap §2.2).
+/// Each layer is separated by a blank line so the model parses them as
+/// distinct paragraphs.
 #[must_use]
-pub fn compose_persona(base: &str, child_lock: bool, recall_context: Option<&str>) -> String {
+pub fn compose_persona(
+    base: &str,
+    child_lock: bool,
+    recall_context: Option<&str>,
+    recap_context: Option<&str>,
+) -> String {
     let mut out = base.to_string();
     if child_lock {
         out.push_str("\n\n");
@@ -203,6 +210,12 @@ pub fn compose_persona(base: &str, child_lock: bool, recall_context: Option<&str
     out.push_str("\n\n");
     out.push_str(DESTRUCTIVE_GATE_GUARD);
     if let Some(ctx) = recall_context {
+        if !ctx.is_empty() {
+            out.push_str("\n\n");
+            out.push_str(ctx);
+        }
+    }
+    if let Some(ctx) = recap_context {
         if !ctx.is_empty() {
             out.push_str("\n\n");
             out.push_str(ctx);
@@ -230,6 +243,31 @@ pub fn format_recall_context(hits: &[QueryHit]) -> Option<String> {
             continue;
         }
         out.push_str(&format!("\n{}. {}", i + 1, snippet));
+    }
+    Some(out)
+}
+
+/// Render a list of thread-memory recall hits into the recap context block
+/// spliced onto the system prompt under a distinct "Recent conversations:"
+/// label. Returns `None` when the slice is empty.
+///
+/// The section label distinguishes this block from the per-turn "What you
+/// remember about the user" block so the model can tell standing profile
+/// recall hits from session-continuity context (PRD-wmd-session-recap §2.2).
+#[must_use]
+pub fn format_recap_context(hits: &[QueryHit]) -> Option<String> {
+    let non_empty: Vec<&str> = hits
+        .iter()
+        .map(|h| h.snippet.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if non_empty.is_empty() {
+        return None;
+    }
+    let mut out = String::from("Recent conversations (most recent first):");
+    for (i, snippet) in non_empty.iter().enumerate() {
+        use std::fmt::Write as _;
+        let _ = write!(out, "\n{}. {}", i + 1, snippet);
     }
     Some(out)
 }
@@ -986,6 +1024,17 @@ pub struct DaemonState {
     /// Optional extraction client. When `Some`, end-of-session writeback
     /// fires; when `None` writeback is disabled (no LLM configured).
     pub extractor: Option<Arc<dyn ExtractorClient>>,
+    /// Session-scoped thread-memory recap context.
+    ///
+    /// Fetched once at `wm.brain.session.start` from the recall store
+    /// (thread subject prefix); held for the life of the session and
+    /// spliced into every turn's system prompt under "Recent conversations:".
+    /// Cleared on each new session open so context never bleeds.
+    /// `None` means no recap context was found (cold store) or recap is
+    /// disabled. PRD-wmd-session-recap §2.1 / §2.2.
+    pub recap_context: Mutex<Option<String>>,
+    /// Monotonic count of thread queries fired (AC3: exactly one per session).
+    pub session_thread_query_count: std::sync::atomic::AtomicU64,
 }
 
 impl DaemonState {
@@ -1021,6 +1070,8 @@ impl DaemonState {
             writeback_session: Mutex::new(None),
             writeback_guard: WritebackGuard::new(),
             extractor: None,
+            recap_context: Mutex::new(None),
+            session_thread_query_count: AtomicU64::new(0),
         }
     }
 
@@ -1224,6 +1275,12 @@ pub async fn dispatch(
                     };
                     let mut history = state.history.lock().await;
                     *history = History::new(max_turns);
+                    drop(history);
+                    // Session-recap: fetch thread memories for the new session.
+                    // AC3: query fires exactly once per new session here; per-turn
+                    // recall queries are separate and still fire every turn.
+                    // AC8: failures log WARN and leave recap_context None.
+                    handle_session_start(state, publish, now_ms).await;
                 }
                 AdvanceOutcome::Extended => {
                     // Nothing to emit; history continues.
@@ -1545,6 +1602,110 @@ pub async fn handle_speak_almanac_due(
     Ok(true)
 }
 
+/// Fetch the most recent thread memories from recall and store them as the
+/// session's recap context.
+///
+/// Called once at `wm.brain.session.start` (PRD-wmd-session-recap §2.1 / AC3).
+/// Queries both today's thread subject and the most-recent prior day's thread
+/// by using the subject prefix `THREAD_SUBJECT_PREFIX`.  Respects
+/// `recap_max_memories`; bounds the hit slice to the most recent N.
+///
+/// Recall outages are tolerated: a query failure logs WARN and leaves the recap
+/// context empty — the session proceeds with no recap (AC8).
+///
+/// If `recap_opener` is `true` and at least one memory was found, publishes a
+/// proactive `wm.brain.reply` before the user's first turn (AC7). The opener is
+/// the first snippet, prefixed with "Earlier you mentioned:" — plain and
+/// conservative (PRD §2.3 / non-goal 3).
+///
+/// Returns `true` when an opener was published.
+pub async fn handle_session_start(
+    state: &DaemonState,
+    publish: &mut dyn EventSink,
+    now_ms: u64,
+) -> bool {
+    let (recap_max, recap_opener) = {
+        let cfg = state.config.lock().await;
+        (cfg.recap_max_memories, cfg.recap_opener)
+    };
+
+    // AC3: count the query.
+    state.session_thread_query_count.fetch_add(1, Ordering::SeqCst);
+
+    if recap_max == 0 {
+        *state.recap_context.lock().await = None;
+        return false;
+    }
+
+    // Query by thread subject prefix to retrieve committed thread memories.
+    let hits = match state
+        .recall
+        .search(
+            // Use the prefix as the free-text query so the daemon retrieves
+            // recent thread memories scoped to the thread subject namespace.
+            THREAD_SUBJECT_PREFIX,
+            Some(THREAD_SUBJECT_PREFIX),
+            Some(recap_max),
+        )
+        .await
+    {
+        Ok(h) => h,
+        Err(err) => {
+            warn!(
+                err = %err,
+                "wm-brain recap: thread query failed; proceeding without recap context (AC8)"
+            );
+            *state.recap_context.lock().await = None;
+            return false;
+        }
+    };
+
+    // Filter to committed memories (AC5: proposals are excluded).
+    // The recall query already returns committed memories; we document the
+    // intent here. Subject must start with the thread prefix.
+    let thread_hits: Vec<&QueryHit> = hits
+        .iter()
+        .filter(|h| h.subject.starts_with(THREAD_SUBJECT_PREFIX))
+        .take(recap_max)
+        .collect();
+
+    let thread_hits_owned: Vec<QueryHit> =
+        thread_hits.iter().map(|h| (*h).clone()).collect();
+    let recap = format_recap_context(&thread_hits_owned);
+    state.recap_context.lock().await.clone_from(&recap);
+
+    if let Some(ref ctx) = recap {
+        info!(
+            memories = thread_hits.len(),
+            "wm-brain recap: session-start thread context fetched"
+        );
+        // AC7: optional opener — off by default (AC6).
+        if recap_opener {
+            if let Some(first_snippet) = thread_hits
+                .first()
+                .map(|h| h.snippet.trim().to_string())
+                .filter(|s| !s.is_empty())
+            {
+                let opener_text = format!("Earlier you mentioned: {first_snippet}");
+                let reply = bus::ReplyEvent { text: opener_text, ts: now_ms };
+                if let Ok(payload) = serde_json::to_value(&reply) {
+                    if let Err(err) = publish.publish(outgoing::REPLY, payload).await {
+                        warn!(err = %err, "wm-brain recap: opener publish failed");
+                    } else {
+                        info!("wm-brain recap: continuity opener published");
+                        return true;
+                    }
+                }
+            }
+        }
+        let _ = ctx;
+    } else {
+        debug!("wm-brain recap: no thread memories found; cold store");
+    }
+
+    false
+}
+
 /// Persist the post-consume config when [`DaemonState::config_path`] is
 /// set. Save failures are logged and swallowed: the in-memory cfg has
 /// already been mutated, so the running daemon keeps the AC6 contract;
@@ -1608,7 +1769,8 @@ async fn handle_turn_user(
         }
     };
     let context = format_recall_context(&hits);
-    let persona = compose_persona(&state.persona, child_lock, context.as_deref());
+    let recap = { state.recap_context.lock().await.clone() };
+    let persona = compose_persona(&state.persona, child_lock, context.as_deref(), recap.as_deref());
     // Build the request with history prefix (PRD-wmd-turn-history §2.2).
     let history_msgs = {
         let history = state.history.lock().await;
@@ -1700,7 +1862,8 @@ async fn handle_turn_user_ladder(
         }
     };
     let context = format_recall_context(&hits);
-    let persona = compose_persona(&state.persona, child_lock, context.as_deref());
+    let recap = { state.recap_context.lock().await.clone() };
+    let persona = compose_persona(&state.persona, child_lock, context.as_deref(), recap.as_deref());
     // Build the request with history prefix (PRD-wmd-turn-history §2.2).
     let history_msgs = {
         let history = state.history.lock().await;
@@ -3123,7 +3286,7 @@ mod tests {
 
     #[test]
     fn compose_persona_without_lock_or_context_appends_destructive_guard() {
-        let out = compose_persona("base persona", false, None);
+        let out = compose_persona("base persona", false, None, None);
         assert!(out.starts_with("base persona"));
         assert!(out.contains(DESTRUCTIVE_GATE_GUARD));
         assert!(
@@ -3134,7 +3297,7 @@ mod tests {
 
     #[test]
     fn compose_persona_with_child_lock_appends_guard_before_destructive() {
-        let out = compose_persona("base", true, None);
+        let out = compose_persona("base", true, None, None);
         assert!(out.starts_with("base"));
         let lock_idx = out.find(CHILD_LOCK_GUARD).expect("lock guard present");
         let dest_idx = out
@@ -3146,7 +3309,7 @@ mod tests {
 
     #[test]
     fn compose_persona_with_empty_context_still_includes_destructive_guard() {
-        let out = compose_persona("base", false, Some(""));
+        let out = compose_persona("base", false, Some(""), None);
         assert!(out.starts_with("base"));
         assert!(out.contains(DESTRUCTIVE_GATE_GUARD));
         assert!(
@@ -3157,7 +3320,7 @@ mod tests {
 
     #[test]
     fn compose_persona_with_context_appends_block_after_destructive_guard() {
-        let out = compose_persona("base", true, Some("ctx block"));
+        let out = compose_persona("base", true, Some("ctx block"), None);
         let lock_idx = out.find(CHILD_LOCK_GUARD).expect("lock guard present");
         let dest_idx = out
             .find(DESTRUCTIVE_GATE_GUARD)
@@ -5656,5 +5819,346 @@ mod tests {
         assert_eq!(bus::SESSION_TOPIC_PREFIX, "wm.brain.session.");
         assert!(outgoing::SESSION_START.starts_with(bus::SESSION_TOPIC_PREFIX));
         assert!(outgoing::SESSION_END.starts_with(bus::SESSION_TOPIC_PREFIX));
+    }
+
+    // ── Session recap tests (PRD-wmd-session-recap) ─────────────────────────
+
+    /// Build a QueryHit with the thread subject for testing recap.
+    fn thread_hit(id: &str, snippet: &str) -> QueryHit {
+        QueryHit {
+            id: id.to_string(),
+            kind: "episodic".to_string(),
+            subject: format!("{}{}", THREAD_SUBJECT_PREFIX, "2026-05-28"),
+            path: format!("/tmp/{id}.md"),
+            snippet: snippet.to_string(),
+            score: 0.9,
+            confidence: 0.9,
+        }
+    }
+
+    // format_recap_context tests ─────────────────────────────────────────────
+
+    // AC2 — cold store is a no-op: empty hits → None.
+    #[test]
+    fn format_recap_context_empty_returns_none() {
+        assert!(format_recap_context(&[]).is_none());
+    }
+
+    // AC1 — thread memories render under "Recent conversations:" label.
+    #[test]
+    fn format_recap_context_uses_distinct_label() {
+        let hits = vec![thread_hit("t1", "User was worried about the appointment.")];
+        let out = format_recap_context(&hits).expect("non-empty");
+        assert!(
+            out.contains("Recent conversations"),
+            "distinct label for model to distinguish"
+        );
+        assert!(out.contains("User was worried about the appointment."));
+        assert!(!out.contains("What you remember"), "not the profile label");
+    }
+
+    // AC4 — bound respected: only N most recent hits returned.
+    #[test]
+    fn format_recap_context_renders_at_most_n_snippets() {
+        let hits = vec![
+            thread_hit("t1", "First memory."),
+            thread_hit("t2", "Second memory."),
+            thread_hit("t3", "Third memory."),
+        ];
+        // format_recap_context itself doesn't bound — bounding happens upstream.
+        // But with 3 hits it renders all 3.
+        let out = format_recap_context(&hits).expect("non-empty");
+        assert!(out.contains("First memory."));
+        assert!(out.contains("Second memory."));
+        assert!(out.contains("Third memory."));
+    }
+
+    #[test]
+    fn format_recap_context_skips_blank_snippets() {
+        let hits = vec![
+            thread_hit("t1", "Real memory."),
+            thread_hit("t2", "   "), // blank
+        ];
+        let out = format_recap_context(&hits).expect("non-empty because t1 has content");
+        assert!(out.contains("Real memory."));
+        // blank snippet is not rendered as an empty numbered item
+        assert!(!out.contains("2."), "blank snippet not rendered");
+    }
+
+    // handle_session_start unit tests ────────────────────────────────────────
+
+    // AC2 — cold store: no thread memories → recap_context stays None.
+    #[tokio::test]
+    async fn handle_session_start_cold_store_no_context() {
+        // FakeRecall with only profile hits (no thread subject) — simulates cold store.
+        let recall = Arc::new(FakeRecall::new(vec![
+            fake_hit("p1", "profile fact", 0.9),
+        ]));
+        let cfg = BrainConfig::default();
+        let state = Arc::new(
+            DaemonState::new(cfg).with_recall(recall),
+        );
+        let mut sink = MemSink::default();
+        handle_session_start(state.as_ref(), &mut sink, 1000).await;
+        // No thread-subject hits → recap_context remains None.
+        let ctx = state.recap_context.lock().await.clone();
+        assert!(ctx.is_none(), "cold store leaves recap_context None");
+        // No opener published.
+        assert!(sink.events.lock().unwrap().is_empty());
+    }
+
+    // AC1 — recap injects recent thread context.
+    #[tokio::test]
+    async fn handle_session_start_injects_thread_context() {
+        let recall = Arc::new(FakeRecall::new(vec![
+            thread_hit("t1", "Yesterday you were worried about the appointment."),
+        ]));
+        let cfg = BrainConfig {
+            recap_max_memories: 5,
+            recap_opener: false,
+            ..BrainConfig::default()
+        };
+        let state = Arc::new(
+            DaemonState::new(cfg).with_recall(recall),
+        );
+        let mut sink = MemSink::default();
+        handle_session_start(state.as_ref(), &mut sink, 1000).await;
+        let ctx = state.recap_context.lock().await.clone();
+        assert!(ctx.is_some(), "thread hit → recap_context set");
+        let ctx_str = ctx.unwrap();
+        assert!(ctx_str.contains("Recent conversations"), "correct label");
+        assert!(ctx_str.contains("Yesterday you were worried about the appointment."));
+    }
+
+    // AC3 — recap is session-scoped: thread query fires once per session.
+    #[tokio::test]
+    async fn handle_session_start_fires_thread_query_once() {
+        let recall = Arc::new(FakeRecall::new(vec![
+            thread_hit("t1", "Some thread memory."),
+        ]));
+        let cfg = BrainConfig::default();
+        let state = Arc::new(
+            DaemonState::new(cfg).with_recall(recall),
+        );
+        let mut sink = MemSink::default();
+        // Call handle_session_start once (one session.start).
+        handle_session_start(state.as_ref(), &mut sink, 1000).await;
+        let count = state.session_thread_query_count.load(Ordering::SeqCst);
+        assert_eq!(count, 1, "exactly one thread query per session.start");
+    }
+
+    // AC3 continued — per-turn recall query is separate (not the thread query).
+    // Verify that multiple turns don't increment session_thread_query_count.
+    #[tokio::test]
+    async fn per_turn_recall_does_not_increment_thread_query_count() {
+        let recall = Arc::new(FakeRecall::new(vec![
+            thread_hit("t1", "Some thread memory."),
+        ]));
+        let cfg = BrainConfig::default();
+        let state = Arc::new(
+            DaemonState::new(cfg).with_recall(Arc::clone(&recall) as Arc<dyn RecallSource>),
+        );
+        // Start session (fires one thread query).
+        let mut sink = MemSink::default();
+        dispatch(
+            state.as_ref(),
+            &mut sink,
+            Request::TurnUser(TurnUserEvent {
+                transcript: "first turn".to_string(),
+                confidence: 1.0,
+                ts: 0,
+            }),
+            0,
+        )
+        .await
+        .expect("dispatch ok");
+        // Session opened: exactly one thread query.
+        let count_after_session = state.session_thread_query_count.load(Ordering::SeqCst);
+        assert_eq!(count_after_session, 1);
+        // Another turn within the same session — no new thread query.
+        let mut sink2 = MemSink::default();
+        dispatch(
+            state.as_ref(),
+            &mut sink2,
+            Request::TurnUser(TurnUserEvent {
+                transcript: "second turn within session".to_string(),
+                confidence: 1.0,
+                ts: 1000,
+            }),
+            1000,
+        )
+        .await
+        .expect("dispatch ok");
+        let count_after_second = state.session_thread_query_count.load(Ordering::SeqCst);
+        assert_eq!(count_after_second, 1, "per-turn recall does not fire thread query");
+    }
+
+    // AC4 — bound respected: recap_max_memories limits injected memories.
+    #[tokio::test]
+    async fn handle_session_start_respects_max_memories_bound() {
+        let hits = vec![
+            thread_hit("t1", "Memory one."),
+            thread_hit("t2", "Memory two."),
+            thread_hit("t3", "Memory three."),
+            thread_hit("t4", "Memory four."),
+            thread_hit("t5", "Memory five."),
+        ];
+        let recall = Arc::new(FakeRecall::new(hits));
+        let cfg = BrainConfig {
+            recap_max_memories: 2,
+            ..BrainConfig::default()
+        };
+        let state = Arc::new(
+            DaemonState::new(cfg).with_recall(recall),
+        );
+        let mut sink = MemSink::default();
+        handle_session_start(state.as_ref(), &mut sink, 1000).await;
+        let ctx = state.recap_context.lock().await.clone();
+        let ctx_str = ctx.expect("context set");
+        // The search call is bounded by recap_max_memories=2.
+        // With FakeRecall returning all 5 but limit=2 passed to search,
+        // we verify the context contains at most 2 numbered items.
+        let count_items = ctx_str.matches("Memory").count();
+        assert!(
+            count_items <= 2,
+            "at most recap_max_memories items injected; got {count_items}"
+        );
+    }
+
+    // AC5 — proposals are not read: only thread-subject memories are surfaced.
+    // We simulate this by including both thread-subject and non-thread hits.
+    // The recap handler filters by subject prefix.
+    #[tokio::test]
+    async fn handle_session_start_filters_to_thread_subject_only() {
+        let hits = vec![
+            // Thread hit (should be included).
+            thread_hit("t1", "Thread memory."),
+            // Profile hit (not under thread prefix — should be excluded).
+            fake_hit("p1", "Profile fact.", 0.9),
+        ];
+        let recall = Arc::new(FakeRecall::new(hits));
+        let cfg = BrainConfig::default();
+        let state = Arc::new(
+            DaemonState::new(cfg).with_recall(recall),
+        );
+        let mut sink = MemSink::default();
+        handle_session_start(state.as_ref(), &mut sink, 1000).await;
+        let ctx = state.recap_context.lock().await.clone();
+        let ctx_str = ctx.expect("context set from thread hit");
+        assert!(ctx_str.contains("Thread memory."), "thread hit included");
+        assert!(!ctx_str.contains("Profile fact."), "profile hit excluded");
+    }
+
+    // AC6 — opener off by default: recap_opener=false → no wm.brain.reply before first turn.
+    #[tokio::test]
+    async fn handle_session_start_opener_off_by_default() {
+        let recall = Arc::new(FakeRecall::new(vec![
+            thread_hit("t1", "Some thread memory."),
+        ]));
+        let cfg = BrainConfig {
+            recap_opener: false,
+            ..BrainConfig::default()
+        };
+        let state = Arc::new(
+            DaemonState::new(cfg).with_recall(recall),
+        );
+        let mut sink = MemSink::default();
+        handle_session_start(state.as_ref(), &mut sink, 1000).await;
+        // Context was set but no reply published.
+        assert!(state.recap_context.lock().await.is_some(), "context set");
+        let events = sink.events.lock().unwrap();
+        assert!(events.is_empty(), "no opener published when recap_opener=false (AC6)");
+    }
+
+    // AC7 — opener on publishes a continuity greeting.
+    #[tokio::test]
+    async fn handle_session_start_opener_on_publishes_reply() {
+        let recall = Arc::new(FakeRecall::new(vec![
+            thread_hit("t1", "you mentioned your daughter visits Sunday"),
+        ]));
+        let cfg = BrainConfig {
+            recap_opener: true,
+            ..BrainConfig::default()
+        };
+        let state = Arc::new(
+            DaemonState::new(cfg).with_recall(recall),
+        );
+        let mut sink = MemSink::default();
+        handle_session_start(state.as_ref(), &mut sink, 1000).await;
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 1, "exactly one reply published as opener");
+        assert_eq!(events[0].0, outgoing::REPLY, "published on reply topic");
+        let text = events[0].1["text"].as_str().expect("text field");
+        assert!(
+            text.contains("you mentioned your daughter visits Sunday"),
+            "opener text references thread snippet: {text}"
+        );
+    }
+
+    // AC8 — recall outage tolerated: query failure → session proceeds with no recap.
+    #[tokio::test]
+    async fn handle_session_start_outage_leaves_no_recap() {
+        let recall = Arc::new(FailingRecall);
+        let cfg = BrainConfig::default();
+        let state = Arc::new(
+            DaemonState::new(cfg).with_recall(recall),
+        );
+        let mut sink = MemSink::default();
+        // Must not panic.
+        handle_session_start(state.as_ref(), &mut sink, 1000).await;
+        let ctx = state.recap_context.lock().await.clone();
+        assert!(ctx.is_none(), "recall outage → recap_context None (AC8)");
+        // No events published.
+        assert!(sink.events.lock().unwrap().is_empty());
+    }
+
+    // recap_context spliced into persona (AC1 integration).
+    #[test]
+    fn compose_persona_splices_recap_context_after_recall_context() {
+        let recall_ctx = "What you remember about the user (most relevant first):\n1. Drinks tea.";
+        let recap_ctx = "Recent conversations (most recent first):\n1. Discussed appointment.";
+        let out = compose_persona("base", false, Some(recall_ctx), Some(recap_ctx));
+        let recall_idx = out.find("What you remember").expect("recall present");
+        let recap_idx = out.find("Recent conversations").expect("recap present");
+        assert!(
+            recap_idx > recall_idx,
+            "recap section follows recall context"
+        );
+        assert!(out.contains("Discussed appointment."));
+    }
+
+    // recap_context cleared on new session: confirm dispatch resets it when session opens.
+    // Simulate: state has recap_context set from a prior session; new session.start fires;
+    // handle_session_start re-queries (NullRecall → no hits → None again).
+    #[tokio::test]
+    async fn dispatch_clears_recap_context_on_new_session() {
+        let cfg = BrainConfig {
+            idle_gap_ms: 300_000,
+            ..BrainConfig::default()
+        };
+        let state = Arc::new(DaemonState::new(cfg));
+        // Manually set recap_context to simulate a prior session.
+        *state.recap_context.lock().await = Some("stale recap".to_string());
+
+        // Fire a turn that opens a new session (first turn ever).
+        let mut sink = MemSink::default();
+        dispatch(
+            state.as_ref(),
+            &mut sink,
+            Request::TurnUser(TurnUserEvent {
+                transcript: "hello".to_string(),
+                confidence: 1.0,
+                ts: 0,
+            }),
+            0,
+        )
+        .await
+        .expect("dispatch ok");
+        // NullRecall returns no hits → recap_context should be None after the new session.
+        let ctx = state.recap_context.lock().await.clone();
+        assert!(
+            ctx.is_none(),
+            "new session with NullRecall clears stale recap_context"
+        );
     }
 }
