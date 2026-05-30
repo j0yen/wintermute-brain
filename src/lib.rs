@@ -18,6 +18,7 @@ pub mod almanac;
 pub mod anthropic;
 pub mod bus;
 pub mod daemon;
+pub mod degrade;
 pub mod history;
 pub mod ladder;
 pub mod persist;
