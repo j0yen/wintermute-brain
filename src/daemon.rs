@@ -35,6 +35,11 @@ use crate::bus::{
     ReplyDestructiveEvent, Request, ToolCallEvent, ToolResultEvent, TurnUserEvent, decode_request,
     now_unix_ms, outgoing,
 };
+use crate::degrade::{
+    HealthState, RateLimitState, HEALTH_SNAPSHOT_INTERVAL_MS, HEALTH_SNAPSHOT_TOPIC,
+    component_for_error_topic, process_error_envelope, snapshot_payload, speak_payload,
+    TTS_SPEAK_TOPIC,
+};
 use crate::history::{History, Turn};
 use crate::recall_client::{self, QueryArgs, QueryHit, RecallClient, TouchArgs};
 use crate::{BrainConfig, PROFILE_SUBJECT, canonical_model};
@@ -901,6 +906,12 @@ pub struct DaemonState {
     /// almanac ack handler uses this value — it never hard-codes a
     /// literal deadline (PRD AC5).
     pub almanac_patience_ms: u64,
+    /// Per-kind rate-limit state for the graceful-degradation aggregator
+    /// (PRD-wintermute-companion-degrade §2.3).
+    pub degrade_rate: Arc<RateLimitState>,
+    /// Per-component health state, updated by the degradation aggregator
+    /// and snapshotted every 60 s (PRD-wintermute-companion-degrade §2.4).
+    pub degrade_health: Arc<HealthState>,
 }
 
 impl DaemonState {
@@ -911,6 +922,7 @@ impl DaemonState {
     #[must_use]
     pub fn new(config: BrainConfig) -> Self {
         let history_turns = config.history_turns;
+        let now = crate::bus::now_unix_ms();
         Self {
             config: Mutex::new(config),
             config_path: None,
@@ -925,6 +937,8 @@ impl DaemonState {
             history: Mutex::new(History::new(history_turns)),
             pending_ack: Mutex::new(None),
             almanac_patience_ms: DEFAULT_ALMANAC_PATIENCE_MS,
+            degrade_rate: Arc::new(RateLimitState::new()),
+            degrade_health: Arc::new(HealthState::new(now)),
         }
     }
 
@@ -1862,6 +1876,16 @@ pub async fn run(cfg: BrainConfig, config_path: Option<PathBuf>) -> Result<()> {
     sub_client
         .subscribe(crate::almanac::ALMANAC_TOPIC_PREFIX)
         .await?;
+    // Subscribe to component error topics for the graceful-degradation
+    // aggregator (PRD-wintermute-companion-degrade §2.2).
+    for error_topic in [
+        crate::degrade::STT_ERROR_TOPIC,
+        crate::degrade::TTS_ERROR_TOPIC,
+        crate::degrade::AUDIO_ERROR_TOPIC,
+        crate::degrade::BRAIN_ERROR_TOPIC,
+    ] {
+        sub_client.subscribe(error_topic).await?;
+    }
     info!(
         dialog_prefix = bus::DIALOG_TOPIC_PREFIX,
         stt_prefix = crate::almanac::STT_TOPIC_PREFIX,
@@ -1919,6 +1943,34 @@ pub async fn run(cfg: BrainConfig, config_path: Option<PathBuf>) -> Result<()> {
             if let Err(e) = agorabus::client::send_heartbeat(&mut sub_write, "wm-brain").await {
                 warn!(error = %e, "wm-brain: sub heartbeat failed; bus likely gone");
                 return;
+            }
+        }
+    });
+
+    // Health snapshot ticker — emits `wm.health.snapshot` every 60 s
+    // (PRD-wintermute-companion-degrade §2.4).
+    let health_pub_arc = Arc::clone(&pub_arc);
+    let health_arc = Arc::clone(&state.degrade_health);
+    let _health_ticker_task = tokio::spawn(async move {
+        let interval = std::time::Duration::from_millis(HEALTH_SNAPSHOT_INTERVAL_MS);
+        let mut ticker = tokio::time::interval(interval);
+        ticker.tick().await; // skip immediate first tick
+        loop {
+            ticker.tick().await;
+            let now = now_unix_ms();
+            let snap = health_arc.snapshot(now);
+            match snapshot_payload(&snap) {
+                Ok(payload) => {
+                    let mut client = health_pub_arc.lock().await;
+                    if let Err(e) = client.publish(HEALTH_SNAPSHOT_TOPIC, payload).await {
+                        warn!(error = %e, "wm-brain degrade: health snapshot publish failed");
+                    } else {
+                        debug!("wm-brain degrade: health snapshot published");
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "wm-brain degrade: health snapshot serialise failed");
+                }
             }
         }
     });
@@ -2020,6 +2072,30 @@ pub async fn run(cfg: BrainConfig, config_path: Option<PathBuf>) -> Result<()> {
         {
             debug!(topic = %ev.topic, "wm-brain: ignoring non-due almanac topic");
             continue;
+        }
+
+        // Route component error topics to the graceful-degradation aggregator
+        // (PRD-wintermute-companion-degrade §2.2). If a phrase should be
+        // spoken, publish `wm.tts.speak` with priority "system".
+        if component_for_error_topic(&ev.topic).is_some() {
+            let now = now_unix_ms();
+            if let Some(phrase) = process_error_envelope(
+                &ev.topic,
+                &ev.data,
+                &state.degrade_rate,
+                &state.degrade_health,
+                now,
+            ) {
+                let payload = speak_payload(&phrase, now);
+                if let Err(e) = sink.publish(TTS_SPEAK_TOPIC, payload).await {
+                    warn!(error = %e, "wm-brain degrade: tts.speak publish failed");
+                }
+            }
+            // Brain's own errors still continue to dialog decode below only if
+            // the topic is also under the dialog prefix (it isn't, so we skip).
+            if !ev.topic.starts_with(bus::DIALOG_TOPIC_PREFIX) {
+                continue;
+            }
         }
 
         match decode_request(&ev.topic, &ev.data) {
