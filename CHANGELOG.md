@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.9.0 — 2026-05-30
+
+Adds cross-session thread memory recall (wmd-session-recap): on session.start
+wmd queries recall for recent committed wintermute-thread-* memories and holds
+them session-scoped; spliced into every turn's system prompt under "Recent
+conversations:" distinct from per-turn profile recall. Optional recap_opener
+(default off) publishes a proactive continuity greeting before first turn.
+Recall outages tolerated. 15 new tests (293 total). AC1-AC8 covered.
+
 ## v0.8.0 — 2026-05-30
 
 PRD-wmd-turn-history gave the brain a rolling last-N buffer, but without session
