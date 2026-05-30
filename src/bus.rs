@@ -45,7 +45,19 @@ pub mod outgoing {
     pub const TOOL_RESULT: &str = "wm.brain.tool.result";
     /// Failure marker; payload carries `kind` + `message`.
     pub const ERROR: &str = "wm.brain.error";
+    /// Session opened — payload: `{ session_id, ts }`.
+    /// PRD-wmd-session-boundary §2.3.
+    pub const SESSION_START: &str = "wm.brain.session.start";
+    /// Session closed — payload: `{ session_id, ts, turn_count, reason }`.
+    /// PRD-wmd-session-boundary §2.3.
+    pub const SESSION_END: &str = "wm.brain.session.end";
 }
+
+/// The `wm.brain.session.*` topic prefix. The brain subscribes to
+/// `wm.dialog.*` inbound; it also publishes to this prefix. The self-emit
+/// filter in the daemon's subscribe loop must ignore events on this prefix to
+/// prevent feedback loops (PRD-wmd-session-boundary AC7).
+pub const SESSION_TOPIC_PREFIX: &str = "wm.brain.session.";
 
 /// Decoded request payloads. Returned by [`decode_request`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
