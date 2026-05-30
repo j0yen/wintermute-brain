@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.5.1 — 2026-05-29
+
+PRD-wmd-turn-history: complete test coverage pass — add 10 new integration
+tests closing the missing acceptance criteria.
+
+New tests in v0.5.1:
+- AC5: destructive-intent turns store the spoken prefix (not the JSON fence)
+  as the assistant history entry, verified end-to-end through `dispatch()`
+- AC7: `history_turns` persists through `brain.toml` save/reload (both
+  enabled and disabled=0 variants)
+- AC3 variant: empty-text LLM reply is not stored in history
+- Additional integration tests: monotonic growth, disabled accumulation,
+  single-pair `compose_request`, `DaemonState` capacity initialised from
+  `config.history_turns`
+
+223 lib tests pass (up from 204 at the last checkpoint). `cargo deny check
+bans licenses sources` clean.
+
 ## v0.5.0 — 2026-05-30
 
 `wm.almanac.due` is published but nothing spoke it. This version teaches
