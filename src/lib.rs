@@ -14,6 +14,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+pub mod almanac;
 pub mod anthropic;
 pub mod bus;
 pub mod daemon;

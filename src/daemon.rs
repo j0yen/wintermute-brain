@@ -25,6 +25,10 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
+use crate::almanac::{
+    AckClass, PendingAck, classify_ack_response, ack_payload, snooze_payload,
+    ALMANAC_ACK_TOPIC, ALMANAC_SNOOZE_TOPIC,
+};
 use crate::anthropic::{AnthropicClient, ClientError, Message, MessageRequest, Role, StreamEvent};
 use crate::bus::{
     self, ConfirmDeniedEvent, ConfirmGrantedEvent, DecodeError, Emit, ErrorEvent, ReplyEvent,
@@ -520,6 +524,15 @@ pub const TOOL_RECALL_SEARCH: &str = "wm.recall.search";
 /// See [`TOOL_RECALL_SEARCH`].
 pub const TOOL_RECALL_SAVE_FACT: &str = "wm.recall.save_fact";
 
+/// Default almanac acknowledgment patience window in milliseconds.
+///
+/// Used when earshot's dialog-timing config has not been supplied at
+/// runtime.  The live daemon should override this via
+/// [`DaemonState::with_almanac_patience_ms`] once it loads earshot's
+/// config (PRD AC5).  30 seconds is a safe fallback for test fixtures
+/// that don't wire earshot config.
+pub const DEFAULT_ALMANAC_PATIENCE_MS: u64 = 30_000;
+
 /// Fleet 1 recall tool router.
 ///
 /// Handles `wm.recall.search` (delegates to [`RecallSource::search`]) and
@@ -875,6 +888,19 @@ pub struct DaemonState {
     /// time. Successful turns push a [`Turn`] here; failures and empty
     /// replies do not (AC3 / PRD §2.1 — only real turns chain).
     pub history: Mutex<History>,
+    /// In-flight almanac acknowledgment awaiting the user's reply.
+    ///
+    /// Set by `handle_almanac_due` (speak-bridge path) when a prompt is
+    /// voiced; cleared by the STT handler or the patience-window timeout.
+    /// `None` means no prompt is currently awaiting acknowledgment (the
+    /// normal idle state).
+    pub pending_ack: Mutex<Option<PendingAck>>,
+    /// Earshot patience-window duration (milliseconds).
+    ///
+    /// Sourced from earshot's dialog-timing config at startup; the
+    /// almanac ack handler uses this value — it never hard-codes a
+    /// literal deadline (PRD AC5).
+    pub almanac_patience_ms: u64,
 }
 
 impl DaemonState {
@@ -897,6 +923,8 @@ impl DaemonState {
             ladder: None,
             session_floor: crate::ladder::SessionFloor::new(),
             history: Mutex::new(History::new(history_turns)),
+            pending_ack: Mutex::new(None),
+            almanac_patience_ms: DEFAULT_ALMANAC_PATIENCE_MS,
         }
     }
 
@@ -954,6 +982,34 @@ impl DaemonState {
     pub fn with_persona(mut self, persona: impl Into<String>) -> Self {
         self.persona = persona.into();
         self
+    }
+
+    /// Override the almanac patience-window duration.
+    ///
+    /// The live daemon calls this with the value loaded from earshot's
+    /// dialog-timing config so the acknowledgment FSM never hard-codes
+    /// a deadline (PRD AC5).
+    #[must_use]
+    pub const fn with_almanac_patience_ms(mut self, ms: u64) -> Self {
+        self.almanac_patience_ms = ms;
+        self
+    }
+
+    /// Set a [`PendingAck`] on this state (called by the almanac-due handler
+    /// after speaking a prompt).
+    ///
+    /// Replaces any previously open pending ack — in normal operation
+    /// there is at most one open ack per session, but if a second
+    /// due-prompt fires before the first is resolved, the new one takes
+    /// precedence.
+    pub async fn set_pending_ack(&self, ack: PendingAck) {
+        *self.pending_ack.lock().await = Some(ack);
+    }
+
+    /// Clear the pending ack (called after resolution — done, missed, or
+    /// a final missed with no further re-ask).
+    pub async fn clear_pending_ack(&self) {
+        *self.pending_ack.lock().await = None;
     }
 }
 
@@ -1041,6 +1097,184 @@ pub async fn dispatch(
         }
     }
     Ok(())
+}
+
+/// Handle a `wm.stt.final` event when an almanac acknowledgment window is open.
+///
+/// Called by the subscribe loop when the topic is `wm.stt.final` and the
+/// daemon has a `PendingAck` set.  The function:
+///
+/// 1. Checks whether the patience window is still open (`now_ms ≤ asked_ms +
+///    patience_ms`).  If the window has already elapsed the timeout path
+///    handles it — do nothing here (the timeout fires on its own tick).
+/// 2. Classifies the transcript via [`classify_ack_response`].
+/// 3. Publishes `wm.almanac.ack` + (for snooze) `wm.almanac.snooze`, updates
+///    `pending_ack` accordingly.
+/// 4. For **Unrelated** transcripts, leaves `pending_ack` open and does not
+///    publish anything (AC3).
+///
+/// Returns `Ok(true)` when the event was consumed by the ack path (so the
+/// caller can skip the regular dialog dispatch), `Ok(false)` when no
+/// `PendingAck` is open or the transcript is unrelated (AC7: the caller must
+/// then proceed with normal dispatch).
+///
+/// # Errors
+/// Propagates the first publish failure.
+pub async fn handle_stt_final_for_ack(
+    state: &DaemonState,
+    publish: &mut dyn EventSink,
+    transcript: &str,
+    now_ms: u64,
+) -> Result<bool> {
+    let patience_ms = state.almanac_patience_ms;
+
+    // Take a snapshot under the lock; if nothing is pending, exit fast (AC7).
+    let pending_snapshot = {
+        let guard = state.pending_ack.lock().await;
+        guard.clone()
+    };
+    let Some(pending) = pending_snapshot else {
+        return Ok(false);
+    };
+
+    // Window already elapsed — the timeout path will handle the missed emit.
+    // Do not double-emit; leave the pending slot for the caller to clean up.
+    if !pending.within_window(now_ms, patience_ms) {
+        return Ok(false);
+    }
+
+    let class = classify_ack_response(transcript);
+    match class {
+        AckClass::Done => {
+            // Clear the pending ack before publishing so a re-entrant STT
+            // event after a slow publish cannot double-emit.
+            state.clear_pending_ack().await;
+            let payload = ack_payload(&pending.id, "done", now_ms);
+            publish.publish(ALMANAC_ACK_TOPIC, payload).await
+                .context("publish wm.almanac.ack done")?;
+            info!(id = %pending.id, "wm-brain almanac: ack done");
+            Ok(true)
+        }
+        AckClass::Snooze => {
+            if pending.snoozes_used >= pending.config.max_snoozes {
+                // Exhausted — treat as missed (AC2 second branch).
+                state.clear_pending_ack().await;
+                let payload = ack_payload(&pending.id, "missed", now_ms);
+                publish.publish(ALMANAC_ACK_TOPIC, payload).await
+                    .context("publish wm.almanac.ack missed (snooze exhausted)")?;
+                info!(id = %pending.id, snoozes_used = pending.snoozes_used, "wm-brain almanac: ack missed (snooze exhausted)");
+            } else {
+                // Grant the snooze — increment counter and update pending.
+                let mut updated = pending.clone();
+                updated.snoozes_used += 1;
+                updated.asked_ms = now_ms; // reset window from now
+                updated.re_asked = false;
+                state.set_pending_ack(updated.clone()).await;
+
+                let resume_ts = now_ms.saturating_add(pending.config.snooze_ms);
+                let ack_v = ack_payload(&pending.id, "snoozed", now_ms);
+                publish.publish(ALMANAC_ACK_TOPIC, ack_v).await
+                    .context("publish wm.almanac.ack snoozed")?;
+                let snooze_v = snooze_payload(&pending.id, resume_ts, now_ms);
+                publish.publish(ALMANAC_SNOOZE_TOPIC, snooze_v).await
+                    .context("publish wm.almanac.snooze")?;
+                info!(id = %pending.id, snoozes_used = updated.snoozes_used, resume_ts, "wm-brain almanac: snoozed");
+            }
+            Ok(true)
+        }
+        AckClass::Unrelated => {
+            // AC3: leave pending open, do not emit.
+            debug!(id = %pending.id, transcript = %transcript, "wm-brain almanac: unrelated transcript; pending left open");
+            Ok(false)
+        }
+    }
+}
+
+/// Tick the almanac patience-window timeout for the current `pending_ack`.
+///
+/// Called periodically (e.g. on each `wm.stt.final` whose window has elapsed,
+/// or from a dedicated timer task).  If the window has elapsed:
+///
+/// - First elapse: emits `{state:"missed"}`, speaks one gentle re-ask via the
+///   speak-bridge reply path, sets `re_asked = true` and resets `asked_ms` to
+///   `now_ms` so the window reopens for the re-ask.
+/// - Second elapse: emits `{state:"missed"}` with no further re-ask and clears
+///   `pending_ack`.
+///
+/// Returns `Ok(true)` when the timeout fired (caller may want to log/trace),
+/// `Ok(false)` when the window is still open or there is no pending ack.
+///
+/// # Errors
+/// Propagates the first publish failure.
+pub async fn tick_almanac_timeout(
+    state: &DaemonState,
+    publish: &mut dyn EventSink,
+    now_ms: u64,
+) -> Result<bool> {
+    let patience_ms = state.almanac_patience_ms;
+    let pending_snapshot = {
+        let guard = state.pending_ack.lock().await;
+        guard.clone()
+    };
+    let Some(pending) = pending_snapshot else {
+        return Ok(false);
+    };
+    if pending.within_window(now_ms, patience_ms) {
+        return Ok(false);
+    }
+    // Window has elapsed.
+    if pending.re_asked {
+        // Second elapse — finalise missed with no further re-ask (AC4).
+        state.clear_pending_ack().await;
+        let payload = ack_payload(&pending.id, "missed", now_ms);
+        publish.publish(ALMANAC_ACK_TOPIC, payload).await
+            .context("publish wm.almanac.ack missed (final)")?;
+        info!(id = %pending.id, "wm-brain almanac: timeout final missed (re_asked already)");
+    } else {
+        // First elapse — speak the gentle re-ask and reset window (AC4).
+        let re_ask_text = "Did you take it? Just say yes or later if you need more time.";
+        let reply = bus::ReplyEvent { text: re_ask_text.to_string(), ts: now_ms };
+        publish
+            .publish(bus::outgoing::REPLY, serde_json::to_value(&reply)?)
+            .await
+            .context("publish re-ask reply")?;
+        let payload = ack_payload(&pending.id, "missed", now_ms);
+        publish.publish(ALMANAC_ACK_TOPIC, payload).await
+            .context("publish wm.almanac.ack missed (first elapse)")?;
+        // Update pending: set re_asked, reset window start.
+        let mut updated = pending.clone();
+        updated.re_asked = true;
+        updated.asked_ms = now_ms;
+        state.set_pending_ack(updated).await;
+        info!(id = %pending.id, "wm-brain almanac: timeout first elapse; re-ask spoken, window reset");
+    }
+    Ok(true)
+}
+
+/// Set a [`PendingAck`] from an almanac-due event (called by the almanac-due
+/// handler after a prompt has been spoken via the speak-bridge path).
+///
+/// This is a thin wrapper around [`DaemonState::set_pending_ack`] that
+/// constructs the [`PendingAck`] from the envelope fields and logs the
+/// transition.
+pub async fn handle_almanac_due(
+    state: &DaemonState,
+    id: impl Into<String>,
+    category: impl Into<String>,
+    config: crate::almanac::AlmanacEntryConfig,
+    now_ms: u64,
+) {
+    let id = id.into();
+    let category = category.into();
+    let ack = PendingAck::new(id.clone(), category.clone(), now_ms, config);
+    state.set_pending_ack(ack).await;
+    info!(
+        id = %id,
+        category = %category,
+        asked_ms = now_ms,
+        patience_ms = state.almanac_patience_ms,
+        "wm-brain almanac: pending ack set"
+    );
 }
 
 /// Persist the post-consume config when [`DaemonState::config_path`] is
@@ -1539,8 +1773,15 @@ pub async fn run(cfg: BrainConfig, config_path: Option<PathBuf>) -> Result<()> {
         )
         .await?;
     sub_client.subscribe(bus::DIALOG_TOPIC_PREFIX).await?;
+    // Also subscribe to the STT prefix so the almanac acknowledgment window
+    // can intercept `wm.stt.final` transcripts when a PendingAck is open
+    // (PRD-almanac-acknowledge AC1–AC3).
+    sub_client
+        .subscribe(crate::almanac::STT_TOPIC_PREFIX)
+        .await?;
     info!(
         dialog_prefix = bus::DIALOG_TOPIC_PREFIX,
+        stt_prefix = crate::almanac::STT_TOPIC_PREFIX,
         "wm-brain: subscribed"
     );
 
@@ -1621,6 +1862,43 @@ pub async fn run(cfg: BrainConfig, config_path: Option<PathBuf>) -> Result<()> {
             agorabus::client::InboundLine::Reply(_) => continue,
             agorabus::client::InboundLine::Event(ev) => ev,
         };
+        // Route `wm.stt.final` events to the almanac ack handler first.
+        // When a PendingAck is open and the transcript is consumed (Done or
+        // Snooze/exhausted), the event is NOT forwarded to the normal dialog
+        // dispatch (AC7: no double-processing).  For Unrelated transcripts
+        // `handle_stt_final_for_ack` returns false and we fall through to
+        // the normal path.
+        if ev.topic == crate::almanac::STT_FINAL_TOPIC {
+            let transcript = ev
+                .data
+                .get("transcript")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let now = now_unix_ms();
+            match handle_stt_final_for_ack(state.as_ref(), &mut sink, &transcript, now).await {
+                Ok(true) => {
+                    // Consumed by ack path — also run the timeout check in
+                    // case the window has since elapsed (belt-and-suspenders).
+                    let _ = tick_almanac_timeout(state.as_ref(), &mut sink, now).await;
+                    continue;
+                }
+                Ok(false) => {
+                    // Not consumed; check timeout regardless, then fall through.
+                    let _ = tick_almanac_timeout(state.as_ref(), &mut sink, now).await;
+                    // If the topic is not under the dialog prefix, skip dialog dispatch.
+                    if !ev.topic.starts_with(bus::DIALOG_TOPIC_PREFIX) {
+                        continue;
+                    }
+                }
+                Err(err) => {
+                    error!(err = %err, "wm-brain: almanac ack handler failed");
+                    let _ = publish_error(&mut sink, "almanac", &format!("{err}")).await;
+                    continue;
+                }
+            }
+        }
+
         match decode_request(&ev.topic, &ev.data) {
             Ok(req) => {
                 let now = now_unix_ms();
@@ -3825,5 +4103,230 @@ mod tests {
             events[0].1["text"],
             "It's a calm, pleasant afternoon here."
         );
+    }
+
+    // ── almanac-acknowledge integration tests (PRD-almanac-acknowledge) ────────
+
+    /// Build a state with a specific almanac patience window and a preset
+    /// [`PendingAck`] whose `asked_ms` is `0`.
+    fn state_with_pending_ack(patience_ms: u64, max_snoozes: u32, snooze_ms: u64) -> Arc<DaemonState> {
+        let cfg = BrainConfig::default();
+        let state = Arc::new(
+            DaemonState::new(cfg).with_almanac_patience_ms(patience_ms),
+        );
+        let ack_cfg = crate::almanac::AlmanacEntryConfig { max_snoozes, snooze_ms };
+        let ack = PendingAck::new("med-1", "medication", 0, ack_cfg);
+        // Use block_on trick: in test context we drive futures inline.
+        // We must synchronously initialise the pending_ack — use try_lock.
+        *state.pending_ack.try_lock().expect("init ack") = Some(ack);
+        state
+    }
+
+    // AC1: "I took it" → wm.almanac.ack {id, state:"done"}, pending cleared.
+    #[tokio::test]
+    async fn handle_stt_final_for_ack_done_emits_done_and_clears_pending() {
+        let patience_ms = 60_000u64;
+        let state = state_with_pending_ack(patience_ms, 2, 300_000);
+        let mut sink = MemSink::default();
+
+        let consumed = handle_stt_final_for_ack(state.as_ref(), &mut sink, "I took it", 1_000)
+            .await
+            .expect("handler ok");
+
+        assert!(consumed, "done transcript should be consumed by ack path");
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 1, "exactly one ack event published");
+        assert_eq!(events[0].0, crate::almanac::ALMANAC_ACK_TOPIC);
+        assert_eq!(events[0].1["id"], "med-1");
+        assert_eq!(events[0].1["state"], "done");
+        assert_eq!(events[0].1["ts"], 1_000_u64);
+        drop(events);
+        let pending = state.pending_ack.lock().await;
+        assert!(pending.is_none(), "pending ack must be cleared on done");
+    }
+
+    // AC2 (first branch): snooze below max → wm.almanac.ack snoozed + wm.almanac.snooze.
+    #[tokio::test]
+    async fn handle_stt_final_for_ack_snooze_below_max_emits_snoozed_and_snooze_event() {
+        let patience_ms = 60_000u64;
+        let snooze_ms = 5 * 60_000u64;
+        let state = state_with_pending_ack(patience_ms, 2, snooze_ms);
+        let mut sink = MemSink::default();
+
+        let consumed = handle_stt_final_for_ack(state.as_ref(), &mut sink, "in a minute", 1_000)
+            .await
+            .expect("handler ok");
+
+        assert!(consumed);
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 2, "ack + snooze events");
+        // First: ack snoozed
+        assert_eq!(events[0].0, crate::almanac::ALMANAC_ACK_TOPIC);
+        assert_eq!(events[0].1["state"], "snoozed");
+        // Second: snooze resume_ts
+        assert_eq!(events[1].0, crate::almanac::ALMANAC_SNOOZE_TOPIC);
+        let expected_resume = 1_000u64 + snooze_ms;
+        assert_eq!(events[1].1["resume_ts"], expected_resume);
+        drop(events);
+        // Pending ack still set (snooze_used incremented, window reset).
+        let guard = state.pending_ack.lock().await;
+        let updated = guard.as_ref().expect("pending must remain after snooze");
+        assert_eq!(updated.snoozes_used, 1, "snooze counter incremented");
+        assert_eq!(updated.asked_ms, 1_000, "window reset to now_ms");
+    }
+
+    // AC2 (second branch): snooze at max → wm.almanac.ack missed.
+    #[tokio::test]
+    async fn handle_stt_final_for_ack_snooze_at_max_emits_missed() {
+        let patience_ms = 60_000u64;
+        let state = state_with_pending_ack(patience_ms, 2, 300_000);
+        // Exhaust snoozes.
+        {
+            let mut guard = state.pending_ack.lock().await;
+            if let Some(ref mut ack) = *guard {
+                ack.snoozes_used = 2;
+            }
+        }
+        let mut sink = MemSink::default();
+
+        let consumed = handle_stt_final_for_ack(state.as_ref(), &mut sink, "in a minute", 1_000)
+            .await
+            .expect("handler ok");
+
+        assert!(consumed);
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 1, "only a missed ack event");
+        assert_eq!(events[0].0, crate::almanac::ALMANAC_ACK_TOPIC);
+        assert_eq!(events[0].1["state"], "missed");
+        drop(events);
+        let guard = state.pending_ack.lock().await;
+        assert!(guard.is_none(), "pending cleared on missed");
+    }
+
+    // AC3: unrelated transcript leaves pending open, returns false.
+    #[tokio::test]
+    async fn handle_stt_final_for_ack_unrelated_leaves_pending_open() {
+        let state = state_with_pending_ack(60_000, 2, 300_000);
+        let mut sink = MemSink::default();
+
+        let consumed = handle_stt_final_for_ack(state.as_ref(), &mut sink, "what time is it", 1_000)
+            .await
+            .expect("handler ok");
+
+        assert!(!consumed, "unrelated must not be consumed");
+        assert!(sink.events.lock().unwrap().is_empty(), "no events published for unrelated");
+        let guard = state.pending_ack.lock().await;
+        assert!(guard.is_some(), "pending must remain open on unrelated");
+    }
+
+    // AC7: no pending ack → handler returns false, no events.
+    #[tokio::test]
+    async fn handle_stt_final_for_ack_no_pending_is_noop() {
+        let state = fresh_state(); // no pending ack
+        let mut sink = MemSink::default();
+
+        let consumed = handle_stt_final_for_ack(state.as_ref(), &mut sink, "I took it", 1_000)
+            .await
+            .expect("handler ok");
+
+        assert!(!consumed);
+        assert!(sink.events.lock().unwrap().is_empty());
+    }
+
+    // Window expired → handler defers to timeout path, returns false.
+    #[tokio::test]
+    async fn handle_stt_final_for_ack_expired_window_returns_false() {
+        let patience_ms = 30_000u64;
+        let state = state_with_pending_ack(patience_ms, 2, 300_000);
+        // asked_ms = 0, now = 31_001 → window expired.
+        let mut sink = MemSink::default();
+
+        let consumed = handle_stt_final_for_ack(state.as_ref(), &mut sink, "I took it", 31_001)
+            .await
+            .expect("handler ok");
+
+        assert!(!consumed, "expired window must defer to timeout path");
+        assert!(sink.events.lock().unwrap().is_empty(), "no events from ack handler when window expired");
+    }
+
+    // AC4: timeout first elapse → missed + re-ask reply, window reset.
+    #[tokio::test]
+    async fn tick_almanac_timeout_first_elapse_speaks_reask_and_emits_missed() {
+        let patience_ms = 30_000u64;
+        let state = state_with_pending_ack(patience_ms, 2, 300_000);
+        // asked_ms = 0, now = 31_001 → window expired.
+        let mut sink = MemSink::default();
+
+        let fired = tick_almanac_timeout(state.as_ref(), &mut sink, 31_001)
+            .await
+            .expect("timeout ok");
+
+        assert!(fired, "timeout should fire on first elapse");
+        let events = sink.events.lock().unwrap();
+        // Two events: the re-ask reply + the missed ack.
+        assert_eq!(events.len(), 2, "re-ask reply + missed ack");
+        assert_eq!(events[0].0, outgoing::REPLY, "re-ask via reply topic");
+        assert!(events[0].1["text"].as_str().unwrap().contains("Did you take it"), "re-ask text");
+        assert_eq!(events[1].0, crate::almanac::ALMANAC_ACK_TOPIC);
+        assert_eq!(events[1].1["state"], "missed");
+        drop(events);
+        let guard = state.pending_ack.lock().await;
+        let updated = guard.as_ref().expect("pending must remain after first elapse");
+        assert!(updated.re_asked, "re_asked flag set");
+        assert_eq!(updated.asked_ms, 31_001, "window reset to now_ms");
+    }
+
+    // AC4: timeout second elapse → missed, no re-ask, pending cleared.
+    #[tokio::test]
+    async fn tick_almanac_timeout_second_elapse_emits_final_missed_and_clears() {
+        let patience_ms = 30_000u64;
+        let state = state_with_pending_ack(patience_ms, 2, 300_000);
+        // Set re_asked = true so we're on the second elapse.
+        {
+            let mut guard = state.pending_ack.lock().await;
+            if let Some(ref mut ack) = *guard {
+                ack.re_asked = true;
+            }
+        }
+        let mut sink = MemSink::default();
+
+        let fired = tick_almanac_timeout(state.as_ref(), &mut sink, 31_001)
+            .await
+            .expect("timeout ok");
+
+        assert!(fired);
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 1, "only final missed ack event, no re-ask");
+        assert_eq!(events[0].0, crate::almanac::ALMANAC_ACK_TOPIC);
+        assert_eq!(events[0].1["state"], "missed");
+        drop(events);
+        let guard = state.pending_ack.lock().await;
+        assert!(guard.is_none(), "pending cleared on second elapse");
+    }
+
+    // handle_almanac_due sets the pending ack correctly.
+    #[tokio::test]
+    async fn handle_almanac_due_sets_pending_ack() {
+        let state = fresh_state();
+        let cfg = crate::almanac::AlmanacEntryConfig { max_snoozes: 1, snooze_ms: 60_000 };
+        handle_almanac_due(state.as_ref(), "rem-99", "water", cfg.clone(), 5_000).await;
+
+        let guard = state.pending_ack.lock().await;
+        let ack = guard.as_ref().expect("pending should be set");
+        assert_eq!(ack.id, "rem-99");
+        assert_eq!(ack.category, "water");
+        assert_eq!(ack.asked_ms, 5_000);
+        assert_eq!(ack.snoozes_used, 0);
+        assert!(!ack.re_asked);
+        assert_eq!(ack.config, cfg);
+    }
+
+    // AC5: patience window is sourced externally — verify with_almanac_patience_ms builder.
+    #[test]
+    fn daemon_state_with_almanac_patience_ms_overrides_default() {
+        let cfg = BrainConfig::default();
+        let state = DaemonState::new(cfg).with_almanac_patience_ms(90_000);
+        assert_eq!(state.almanac_patience_ms, 90_000);
+        assert_ne!(state.almanac_patience_ms, DEFAULT_ALMANAC_PATIENCE_MS);
     }
 }

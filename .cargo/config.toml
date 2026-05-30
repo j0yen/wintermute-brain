@@ -1,0 +1,27 @@
+# Redirect the relative path dependencies that resolve correctly from
+# wintermute-brain/ but not from this worktree location.
+[patch.crates-io]
+
+[patch."https://github.com/example.com"]
+
+# Alias path overrides for the workspace-sibling crates.
+# The Cargo.toml uses `path = "../<slug>"` which from the canonical repo
+# resolves to `/home/jsy/wintermute/<slug>`.  From this worktree the
+# resolved paths would be wrong; use absolute paths here.
+#
+# Note: Cargo does not support [patch] for path crates directly, but we can
+# use a [patch.unused] section — path deps in Cargo.toml always win as-is.
+# Instead we patch the Cargo.toml via a replace-paths trick:
+# set `paths` in this config so Cargo replaces the relative paths with
+# absolute ones.
+[patch."path+file:///home/jsy/wintermute/.build-worktrees/wm-local-llm"]
+wm-local-llm = { path = "/home/jsy/wintermute/wm-local-llm" }
+
+[patch."path+file:///home/jsy/wintermute/.build-worktrees/wm-router"]
+wm-router = { path = "/home/jsy/wintermute/wm-router" }
+
+[patch."path+file:///home/jsy/wintermute/.build-worktrees/wm-verify"]
+wm-verify = { path = "/home/jsy/wintermute/wm-verify" }
+
+[patch."path+file:///home/jsy/wintermute/.build-worktrees/agorabus"]
+agorabus = { path = "/home/jsy/wintermute/agorabus" }
