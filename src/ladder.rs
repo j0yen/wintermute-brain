@@ -536,7 +536,19 @@ fn describe(err: &ClientError) -> String {
 fn prompt_from_request(request: &MessageRequest, transcript: &str) -> Prompt {
     let mut prompt = Prompt::new();
     if let Some(system) = request.system.as_ref() {
-        prompt = prompt.with(LocalMessage::system(system.clone()));
+        use crate::anthropic::{SystemField, SystemBlock};
+        // Local LLM expects a plain String; extract text from either form.
+        let text = match system {
+            SystemField::Plain(s) => s.clone(),
+            SystemField::Blocks(blocks) => blocks
+                .iter()
+                .map(|b| match b {
+                    SystemBlock::Text { text, .. } => text.as_str(),
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        };
+        prompt = prompt.with(LocalMessage::system(text));
     }
     if request.messages.is_empty() {
         prompt = prompt.with(LocalMessage::user(transcript.to_string()));
@@ -776,7 +788,7 @@ mod tests {
         fn answering(text: &str) -> Self {
             Self {
                 events: vec![
-                    StreamEvent::MessageStart,
+                    StreamEvent::MessageStart { usage: crate::anthropic::MessageUsage::default() },
                     StreamEvent::TextDelta {
                         index: 0,
                         text: text.to_string(),

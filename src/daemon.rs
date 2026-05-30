@@ -29,7 +29,10 @@ use crate::almanac::{
     AckClass, PendingAck, classify_ack_response, ack_payload, snooze_payload,
     ALMANAC_ACK_TOPIC, ALMANAC_SNOOZE_TOPIC,
 };
-use crate::anthropic::{AnthropicClient, ClientError, Message, MessageRequest, Role, StreamEvent};
+use crate::anthropic::{
+    AnthropicClient, ClientError, Message, MessageRequest, Role, StreamEvent,
+    SystemBlock,
+};
 use crate::bus::{
     self, ConfirmDeniedEvent, ConfirmGrantedEvent, DecodeError, Emit, ErrorEvent, ReplyEvent,
     ReplyDestructiveEvent, Request, ToolCallEvent, ToolResultEvent, TurnUserEvent, decode_request,
@@ -161,9 +164,16 @@ impl ExtractorClient for AnthropicExtractor {
     }
 }
 
-/// Build a buffered streaming request for a single user turn. Pure
-/// function; the caller is responsible for splicing recall context and
-/// child-lock guidance into `persona` via [`compose_persona`].
+/// Build a buffered streaming request for a single user turn.
+///
+/// The caller is responsible for supplying the stable prefix via
+/// [`compose_persona`] and the volatile recall context separately.
+///
+/// When `recall_context` is `Some`, it is placed as a plain (non-cached)
+/// block *after* the cached stable prefix, ensuring the cache breakpoint on
+/// the stable prefix is never busted by per-turn recall hits
+/// (PRD-brain-prompt-cache §2.2). When `None`, only the stable prefix block
+/// is present.
 ///
 /// `history_msgs` is the flat `[user, assistant, …]` prefix produced by
 /// [`History::to_messages`] or [`History::trimmed_messages`]; callers pass
@@ -174,7 +184,8 @@ impl ExtractorClient for AnthropicExtractor {
 #[must_use]
 pub fn compose_request(
     model: &str,
-    persona: &str,
+    stable_prefix: &str,
+    recall_context: Option<&str>,
     history_msgs: &[Message],
     transcript: &str,
 ) -> MessageRequest {
@@ -183,18 +194,42 @@ pub fn compose_request(
         role: Role::User,
         content: transcript.to_string(),
     });
-    MessageRequest::streaming(canonical_model(model), DEFAULT_MAX_TOKENS, messages)
-        .with_system(persona.to_string())
+    let req = MessageRequest::streaming(canonical_model(model), DEFAULT_MAX_TOKENS, messages);
+    // Build the system block array: stable prefix (with cache breakpoint)
+    // + optional volatile recall tail (without breakpoint, so it doesn't
+    // bust the cache).
+    let mut blocks = vec![SystemBlock::text_cached(stable_prefix)];
+    if let Some(ctx) = recall_context {
+        if !ctx.is_empty() {
+            blocks.push(SystemBlock::text(ctx));
+        }
+    }
+    req.with_system_blocks(blocks)
 }
 
-/// Assemble the effective system prompt the Anthropic call receives.
+/// Assemble the *stable cacheable prefix* sent as the first system block.
 ///
-/// Layers in this order: `base` (persona), child-lock guard when set,
-/// the destructive-intent gate (always — PRD §2.4), then a
-/// recall-context block when non-empty. Each layer is separated by a
-/// blank line so the model parses them as distinct paragraphs.
+/// Layers in this order: `base` (persona), child-lock guard when set, and
+/// the destructive-intent gate (always). Each layer is separated by a blank
+/// line so the model parses them as distinct paragraphs. Crucially, **no
+/// per-turn recall context is included here** — it is returned separately via
+/// [`format_recall_context`] and placed as a non-cached tail block by
+/// [`compose_request`] so it never busts the prompt-cache breakpoint.
+///
+/// PRD-brain-prompt-cache §2.2.
 #[must_use]
-pub fn compose_persona(base: &str, child_lock: bool, recall_context: Option<&str>) -> String {
+pub fn compose_persona(base: &str, child_lock: bool, _recall_context: Option<&str>) -> String {
+    compose_stable_prefix(base, child_lock)
+}
+
+/// Build the stable cacheable prefix string (no per-turn recall context).
+///
+/// The recall context must be passed separately to [`compose_request`] as a
+/// non-cached tail block (PRD-brain-prompt-cache §2.2 / AC3). This function
+/// is the single source of truth for the stable prefix so tests can compare
+/// bytes across turns and prove the prefix never changes.
+#[must_use]
+pub fn compose_stable_prefix(base: &str, child_lock: bool) -> String {
     let mut out = base.to_string();
     if child_lock {
         out.push_str("\n\n");
@@ -202,12 +237,6 @@ pub fn compose_persona(base: &str, child_lock: bool, recall_context: Option<&str
     }
     out.push_str("\n\n");
     out.push_str(DESTRUCTIVE_GATE_GUARD);
-    if let Some(ctx) = recall_context {
-        if !ctx.is_empty() {
-            out.push_str("\n\n");
-            out.push_str(ctx);
-        }
-    }
     out
 }
 
@@ -844,6 +873,27 @@ pub fn extract_assistant_text(events: &[StreamEvent]) -> String {
         }
     }
     out
+}
+
+/// Log per-turn cache usage counters from `message_start.usage`.
+///
+/// Emits a structured `info!` log line so the cache-read ratio is observable
+/// in the journal (PRD-brain-prompt-cache AC6). Called after every successful
+/// `collect_messages` call.
+fn log_cache_usage(events: &[StreamEvent], model: &str) {
+    for ev in events {
+        if let StreamEvent::MessageStart { usage } = ev {
+            info!(
+                model = %model,
+                input_tokens = usage.input_tokens,
+                cache_read_input_tokens = usage.cache_read_input_tokens,
+                cache_creation_input_tokens = usage.cache_creation_input_tokens,
+                output_tokens = usage.output_tokens,
+                "wm-brain: turn usage (cache metrics)"
+            );
+            return;
+        }
+    }
 }
 
 /// Publish abstraction so per-request handlers can be tested without
@@ -1607,16 +1657,19 @@ async fn handle_turn_user(
             Vec::new()
         }
     };
-    let context = format_recall_context(&hits);
-    let persona = compose_persona(&state.persona, child_lock, context.as_deref());
+    let recall_ctx = format_recall_context(&hits);
+    // Stable cacheable prefix (no per-turn recall context — PRD-brain-prompt-cache §2.2).
+    let stable_prefix = compose_persona(&state.persona, child_lock, None);
     // Build the request with history prefix (PRD-wmd-turn-history §2.2).
     let history_msgs = {
         let history = state.history.lock().await;
         history.trimmed_messages(DEFAULT_MAX_TOKENS as usize)
     };
-    let req = compose_request(model, &persona, &history_msgs, &turn.transcript);
+    let req = compose_request(model, &stable_prefix, recall_ctx.as_deref(), &history_msgs, &turn.transcript);
     match llm.collect_messages(&req).await {
         Ok(events) => {
+            // PRD-brain-prompt-cache AC6: log cache usage counters per turn.
+            log_cache_usage(&events, model);
             let text = extract_assistant_text(&events);
             if text.is_empty() {
                 warn!(
@@ -1699,14 +1752,15 @@ async fn handle_turn_user_ladder(
             Vec::new()
         }
     };
-    let context = format_recall_context(&hits);
-    let persona = compose_persona(&state.persona, child_lock, context.as_deref());
+    let recall_ctx = format_recall_context(&hits);
+    // Stable cacheable prefix (no per-turn recall context — PRD-brain-prompt-cache §2.2).
+    let stable_prefix = compose_persona(&state.persona, child_lock, None);
     // Build the request with history prefix (PRD-wmd-turn-history §2.2).
     let history_msgs = {
         let history = state.history.lock().await;
         history.trimmed_messages(DEFAULT_MAX_TOKENS as usize)
     };
-    let req = compose_request(model, &persona, &history_msgs, &turn.transcript);
+    let req = compose_request(model, &stable_prefix, recall_ctx.as_deref(), &history_msgs, &turn.transcript);
 
     let sink = crate::ladder::BufferingSink::default();
     let outcome = ladder
@@ -2625,6 +2679,25 @@ mod tests {
         Arc::new(DaemonState::new(cfg))
     }
 
+    /// Concatenate all text from the system field of a request (both the
+    /// plain-string and block-array forms) into a single `String`. Useful
+    /// for asserting on system content in tests without caring about the
+    /// serialization form.
+    fn system_text(req: &MessageRequest) -> String {
+        use crate::anthropic::{SystemField, SystemBlock};
+        match req.system.as_ref() {
+            None => String::new(),
+            Some(SystemField::Plain(s)) => s.clone(),
+            Some(SystemField::Blocks(blocks)) => blocks
+                .iter()
+                .map(|b| match b {
+                    SystemBlock::Text { text, .. } => text.as_str(),
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        }
+    }
+
     #[derive(Clone)]
     struct FakeLlm {
         response: std::result::Result<Vec<StreamEvent>, &'static str>,
@@ -2720,12 +2793,22 @@ mod tests {
 
     #[test]
     fn compose_request_uses_canonical_model_and_includes_persona() {
+        use crate::anthropic::{SystemField, SystemBlock};
         // AC4 / baseline: empty history → exactly one user message (single-message behaviour).
-        let req = compose_request("sonnet", "be terse", &[], "hello there");
+        let req = compose_request("sonnet", "be terse", None, &[], "hello there");
         assert_eq!(req.model, "claude-sonnet-4-6");
         assert_eq!(req.max_tokens, DEFAULT_MAX_TOKENS);
         assert!(req.stream);
-        assert_eq!(req.system.as_deref(), Some("be terse"));
+        // system is now a block array with a cache breakpoint on the stable prefix.
+        assert!(req.system.is_some());
+        let sys = req.system.as_ref().unwrap();
+        let SystemField::Blocks(blocks) = sys else {
+            panic!("expected blocks form for system");
+        };
+        assert_eq!(blocks.len(), 1, "no recall ctx → only the stable prefix block");
+        let SystemBlock::Text { text, cache_control } = &blocks[0];
+        assert_eq!(text, "be terse");
+        assert!(cache_control.is_some(), "stable prefix block must have a cache breakpoint");
         assert_eq!(req.messages.len(), 1);
         assert_eq!(req.messages[0].role, Role::User);
         assert_eq!(req.messages[0].content, "hello there");
@@ -2748,7 +2831,7 @@ mod tests {
             ts: 2,
         });
         let history_msgs = h.to_messages();
-        let req = compose_request("sonnet", "persona", &history_msgs, "third question");
+        let req = compose_request("sonnet", "persona", None, &history_msgs, "third question");
         assert_eq!(req.messages.len(), 5, "2 prior pairs + current user = 5");
         assert_eq!(req.messages[0].role, Role::User);
         assert_eq!(req.messages[0].content, "first question");
@@ -2765,7 +2848,7 @@ mod tests {
     #[test]
     fn extract_assistant_text_concatenates_deltas_in_order() {
         let events = vec![
-            StreamEvent::MessageStart,
+            StreamEvent::MessageStart { usage: crate::anthropic::MessageUsage::default() },
             StreamEvent::ContentBlockStart { index: 0 },
             text_delta("Hi "),
             text_delta("there."),
@@ -2778,7 +2861,7 @@ mod tests {
     #[test]
     fn extract_assistant_text_returns_empty_when_no_deltas() {
         let events = vec![
-            StreamEvent::MessageStart,
+            StreamEvent::MessageStart { usage: crate::anthropic::MessageUsage::default() },
             StreamEvent::MessageDelta { stop_reason: None },
             StreamEvent::MessageStop,
         ];
@@ -2789,7 +2872,7 @@ mod tests {
     async fn dispatch_turn_user_publishes_reply_when_llm_returns_text() {
         let llm = FakeLlm {
             response: Ok(vec![
-                StreamEvent::MessageStart,
+                StreamEvent::MessageStart { usage: crate::anthropic::MessageUsage::default() },
                 text_delta("Hello, "),
                 text_delta("Joe."),
                 StreamEvent::MessageStop,
@@ -2845,7 +2928,7 @@ mod tests {
     async fn dispatch_turn_user_publishes_error_when_no_text_deltas() {
         let llm = FakeLlm {
             response: Ok(vec![
-                StreamEvent::MessageStart,
+                StreamEvent::MessageStart { usage: crate::anthropic::MessageUsage::default() },
                 StreamEvent::MessageDelta {
                     stop_reason: Some("end_turn".to_string()),
                 },
@@ -3146,25 +3229,85 @@ mod tests {
 
     #[test]
     fn compose_persona_with_empty_context_still_includes_destructive_guard() {
+        // compose_persona ignores recall_context (moved to compose_request tail block).
         let out = compose_persona("base", false, Some(""));
         assert!(out.starts_with("base"));
         assert!(out.contains(DESTRUCTIVE_GATE_GUARD));
         assert!(
             !out.contains("ctx"),
-            "empty context block must not be appended"
+            "recall context is never spliced by compose_persona (PRD-brain-prompt-cache §2.2)"
         );
     }
 
+    /// PRD-brain-prompt-cache AC3: compose_persona never includes recall context —
+    /// it is the stable cacheable prefix only. Recall lands in a non-cached tail
+    /// block via compose_request.
     #[test]
-    fn compose_persona_with_context_appends_block_after_destructive_guard() {
+    fn compose_persona_never_includes_recall_context() {
+        // Previously compose_persona spliced recall into the system prompt;
+        // now it must not — the context is kept out of the cached prefix.
         let out = compose_persona("base", true, Some("ctx block"));
+        assert!(
+            !out.contains("ctx block"),
+            "compose_persona must not splice recall context (PRD-brain-prompt-cache AC3)"
+        );
+        // But the stable guards must still be present.
         let lock_idx = out.find(CHILD_LOCK_GUARD).expect("lock guard present");
         let dest_idx = out
             .find(DESTRUCTIVE_GATE_GUARD)
             .expect("destructive guard present");
-        let ctx_idx = out.find("ctx block").expect("context present");
         assert!(dest_idx > lock_idx, "destructive guard follows lock guard");
-        assert!(ctx_idx > dest_idx, "context follows destructive guard");
+    }
+
+    /// PRD-brain-prompt-cache AC3 / AC4: compose_request places the recall
+    /// context as a non-cached tail block *after* the cached stable prefix.
+    #[test]
+    fn compose_request_places_recall_context_after_cached_prefix() {
+        use crate::anthropic::{SystemField, SystemBlock};
+        let recall = "ctx: user likes tea";
+        let req = compose_request("sonnet", "stable persona", Some(recall), &[], "hi");
+        let SystemField::Blocks(blocks) = req.system.as_ref().unwrap() else {
+            panic!("expected blocks form");
+        };
+        assert_eq!(blocks.len(), 2, "stable prefix + recall tail = 2 blocks");
+        // First block: stable prefix with cache breakpoint.
+        let SystemBlock::Text { text, cache_control } = &blocks[0];
+        assert_eq!(text, "stable persona");
+        assert!(cache_control.is_some(), "first block must carry cache breakpoint");
+        // Second block: recall tail without breakpoint.
+        let SystemBlock::Text { text: text2, cache_control: cc2 } = &blocks[1];
+        assert!(text2.contains("user likes tea"), "recall text must be present");
+        assert!(cc2.is_none(), "recall tail must NOT carry breakpoint (AC3)");
+        // Verify by JSON: the second block has no cache_control key.
+        let v = serde_json::to_value(&req).unwrap();
+        let sys = v["system"].as_array().unwrap();
+        assert!(
+            sys[1].get("cache_control").is_none(),
+            "second block must not have cache_control key"
+        );
+    }
+
+    /// PRD-brain-prompt-cache AC3: bytes before the breakpoint are identical
+    /// across two turns with *different* recall hits.
+    #[test]
+    fn stable_prefix_bytes_are_identical_across_turns_with_different_recall() {
+        use crate::anthropic::{SystemField, SystemBlock};
+        let base = "You are Wintermute.";
+        let recall_turn1 = Some("ctx: user likes tea");
+        let recall_turn2 = Some("ctx: user likes coffee");
+        let req1 = compose_request("sonnet", base, recall_turn1, &[], "turn 1");
+        let req2 = compose_request("sonnet", base, recall_turn2, &[], "turn 2");
+        let SystemField::Blocks(b1) = req1.system.as_ref().unwrap() else { panic!() };
+        let SystemField::Blocks(b2) = req2.system.as_ref().unwrap() else { panic!() };
+        // The first block (stable prefix) must be byte-identical across turns.
+        let SystemBlock::Text { text: first_prefix, .. } = &b1[0];
+        let SystemBlock::Text { text: second_prefix, .. } = &b2[0];
+        assert_eq!(first_prefix, second_prefix,
+            "stable prefix bytes must be identical across turns (AC3)");
+        // Serialised first blocks must also be byte-identical.
+        let j1 = serde_json::to_string(&b1[0]).unwrap();
+        let j2 = serde_json::to_string(&b2[0]).unwrap();
+        assert_eq!(j1, j2, "serialised stable-prefix JSON must be identical (AC3)");
     }
 
     #[test]
@@ -3385,7 +3528,7 @@ mod tests {
             .expect("dispatch ok");
         let calls = captured.lock().unwrap();
         assert_eq!(calls.len(), 1);
-        let system = calls[0].system.as_deref().expect("system spliced");
+        let system = system_text(&calls[0]);
         assert!(system.contains("She prefers chamomile tea."));
         assert!(system.starts_with(DEFAULT_PERSONA));
         assert!(
@@ -3416,7 +3559,7 @@ mod tests {
             .await
             .expect("dispatch ok");
         let calls = captured.lock().unwrap();
-        let system = calls[0].system.as_deref().expect("system spliced");
+        let system = system_text(&calls[0]);
         assert!(system.contains(CHILD_LOCK_GUARD));
     }
 
@@ -3447,7 +3590,7 @@ mod tests {
         assert_eq!(events[0].0, outgoing::REPLY);
         assert_eq!(events[0].1["text"], "fallback reply");
         let calls = captured.lock().unwrap();
-        let system = calls[0].system.as_deref().expect("system");
+        let system = system_text(&calls[0]);
         assert!(
             system.starts_with(DEFAULT_PERSONA),
             "persona base preserved on recall error"
@@ -3643,7 +3786,7 @@ mod tests {
     async fn dispatch_turn_user_does_not_touch_when_text_empty() {
         let llm = FakeLlm {
             response: Ok(vec![
-                StreamEvent::MessageStart,
+                StreamEvent::MessageStart { usage: crate::anthropic::MessageUsage::default() },
                 StreamEvent::MessageDelta { stop_reason: None },
                 StreamEvent::MessageStop,
             ]),
@@ -4285,7 +4428,7 @@ mod tests {
         CapturingLlm {
             captured: Arc::new(StdMutex::new(Vec::new())),
             response: vec![
-                StreamEvent::MessageStart,
+                StreamEvent::MessageStart { usage: crate::anthropic::MessageUsage::default() },
                 StreamEvent::TextDelta {
                     index: 0,
                     text: "ok".to_string(),
@@ -4474,7 +4617,7 @@ mod tests {
                 .expect("seq llm responses poisoned")
                 .remove(0);
             Ok(vec![
-                StreamEvent::MessageStart,
+                StreamEvent::MessageStart { usage: crate::anthropic::MessageUsage::default() },
                 StreamEvent::TextDelta { index: 0, text: reply },
                 StreamEvent::MessageStop,
             ])
@@ -4615,7 +4758,7 @@ mod tests {
                 }
                 let reply = if *calls == 1 { "reply one" } else { "reply three" };
                 Ok(vec![
-                    StreamEvent::MessageStart,
+                    StreamEvent::MessageStart { usage: crate::anthropic::MessageUsage::default() },
                     StreamEvent::TextDelta { index: 0, text: reply.to_string() },
                     StreamEvent::MessageStop,
                 ])
@@ -4734,7 +4877,7 @@ mod tests {
                     "ordinary reply two".to_string()
                 };
                 Ok(vec![
-                    StreamEvent::MessageStart,
+                    StreamEvent::MessageStart { usage: crate::anthropic::MessageUsage::default() },
                     StreamEvent::TextDelta { index: 0, text },
                     StreamEvent::MessageStop,
                 ])
@@ -4900,10 +5043,10 @@ mod tests {
                 self.captured.lock().unwrap().push(req.clone());
                 if *c == 1 {
                     // Return no text deltas (empty reply).
-                    Ok(vec![StreamEvent::MessageStart, StreamEvent::MessageStop])
+                    Ok(vec![StreamEvent::MessageStart { usage: crate::anthropic::MessageUsage::default() }, StreamEvent::MessageStop])
                 } else {
                     Ok(vec![
-                        StreamEvent::MessageStart,
+                        StreamEvent::MessageStart { usage: crate::anthropic::MessageUsage::default() },
                         StreamEvent::TextDelta { index: 0, text: "ok reply".to_string() },
                         StreamEvent::MessageStop,
                     ])
@@ -5010,7 +5153,7 @@ mod tests {
         let mut h = History::new(4);
         h.push(HTurn { user: "prev user".to_string(), assistant: "prev asst".to_string(), ts: 0 });
         let msgs = h.to_messages();
-        let req = compose_request("sonnet", "persona", &msgs, "current");
+        let req = compose_request("sonnet", "persona", None, &msgs, "current");
         assert_eq!(req.messages.len(), 3);
         assert_eq!(req.messages[0].role, Role::User);
         assert_eq!(req.messages[0].content, "prev user");

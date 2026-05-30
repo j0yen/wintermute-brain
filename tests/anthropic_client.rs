@@ -130,7 +130,7 @@ async fn collect_messages_decodes_full_sse_response() {
     let events = client.collect_messages(&req).await.unwrap();
 
     assert_eq!(events.len(), 7);
-    assert_eq!(events[0], StreamEvent::MessageStart);
+    assert_eq!(events[0], StreamEvent::MessageStart { usage: wintermute_brain::anthropic::MessageUsage::default() });
     assert_eq!(events[1], StreamEvent::ContentBlockStart { index: 0 });
     assert_eq!(
         events[2],
@@ -235,7 +235,7 @@ async fn stream_messages_emits_events_in_order() {
     assert_eq!(
         events,
         vec![
-            StreamEvent::MessageStart,
+            StreamEvent::MessageStart { usage: wintermute_brain::anthropic::MessageUsage::default() },
             StreamEvent::ContentBlockStart { index: 0 },
             StreamEvent::TextDelta {
                 index: 0,
@@ -278,5 +278,5 @@ async fn collect_messages_skips_ping_keepalive() {
     let (base, _recorded) = spawn_mock(StatusCode::OK, sse, "text/event-stream").await;
     let client = AnthropicClient::new("k").unwrap().with_base_url(base);
     let events = client.collect_messages(&sample_request()).await.unwrap();
-    assert_eq!(events, vec![StreamEvent::MessageStart, StreamEvent::MessageStop]);
+    assert_eq!(events, vec![StreamEvent::MessageStart { usage: wintermute_brain::anthropic::MessageUsage::default() }, StreamEvent::MessageStop]);
 }

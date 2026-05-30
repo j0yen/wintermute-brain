@@ -14,6 +14,115 @@ use std::task::{Context, Poll};
 use futures_util::Stream;
 use serde::{Deserialize, Serialize};
 
+/// Cache-control type understood by the Anthropic API.
+///
+/// Currently only `ephemeral` (5-minute TTL) is supported by the API.
+/// Carrying this as a typed enum avoids stringly-typed mistakes in call
+/// sites and makes the serialized `{"type":"ephemeral"}` shape explicit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CacheType {
+    /// Cache the prefix for up to 5 minutes (Anthropic ephemeral TTL).
+    Ephemeral,
+}
+
+/// `cache_control` object attached to a system or message block.
+///
+/// Serializes as `{"type":"ephemeral"}` (or the appropriate variant).
+/// Adding a breakpoint on the *last stable block* tells Anthropic to
+/// cache everything up to and including that block as a reusable prefix.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheControl {
+    /// The kind of caching to apply.
+    #[serde(rename = "type")]
+    pub kind: CacheType,
+}
+
+impl CacheControl {
+    /// Convenience constructor for the common ephemeral breakpoint.
+    #[must_use]
+    pub const fn ephemeral() -> Self {
+        Self { kind: CacheType::Ephemeral }
+    }
+}
+
+/// One block in the `system` content-block array form.
+///
+/// The API accepts `system` as either a plain `String` or an array of
+/// these objects.  We model only the `text` block type (the only variant
+/// the brain uses); tool-result and image blocks are not needed here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum SystemBlock {
+    /// A plain-text block, optionally carrying a cache breakpoint.
+    Text {
+        /// The text content of this block.
+        text: String,
+        /// When `Some`, Anthropic caches the prompt prefix up to and
+        /// including this block for `cache_control.type` duration.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
+    },
+}
+
+impl SystemBlock {
+    /// Build a text block without a cache breakpoint.
+    #[must_use]
+    pub fn text(text: impl Into<String>) -> Self {
+        Self::Text { text: text.into(), cache_control: None }
+    }
+
+    /// Build a text block with an ephemeral cache breakpoint.
+    #[must_use]
+    pub fn text_cached(text: impl Into<String>) -> Self {
+        Self::Text { text: text.into(), cache_control: Some(CacheControl::ephemeral()) }
+    }
+}
+
+/// The value of the top-level `system` field in a [`MessageRequest`].
+///
+/// The Anthropic API accepts two forms:
+/// - A plain `String` — the legacy form; serialised as a JSON string.
+/// - An array of [`SystemBlock`] objects — the content-block form used
+///   when cache-control breakpoints are needed.
+///
+/// [`SystemField::Plain`] round-trips identically to the previous
+/// `system: Option<String>` surface (the existing serialization tests
+/// still pass); [`SystemField::Blocks`] enables prompt caching.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SystemField {
+    /// Legacy plain-string form. Serialised as a JSON `String`.
+    Plain(String),
+    /// Content-block array form. Serialised as a JSON array of objects.
+    Blocks(Vec<SystemBlock>),
+}
+
+impl Serialize for SystemField {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Plain(text) => text.serialize(s),
+            Self::Blocks(blocks) => blocks.serialize(s),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SystemField {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let v = serde_json::Value::deserialize(d)?;
+        match v {
+            serde_json::Value::String(s) => Ok(Self::Plain(s)),
+            serde_json::Value::Array(_) => {
+                let blocks: Vec<SystemBlock> =
+                    serde_json::from_value(v).map_err(serde::de::Error::custom)?;
+                Ok(Self::Blocks(blocks))
+            }
+            other => Err(serde::de::Error::custom(format!(
+                "expected string or array for system field, got {other}"
+            ))),
+        }
+    }
+}
+
 /// Anthropic-API role labels. The Messages API accepts only `user` and
 /// `assistant` in the message list (`system` rides on a top-level field).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,20 +148,43 @@ pub struct Message {
 /// Top-level body sent in the `POST /v1/messages` request. iter-3
 /// covers the fields `wmd` populates; tool definitions and metadata
 /// land in iter-4+.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+///
+/// The `system` field accepts both the legacy plain-string form and the
+/// content-block array form with [`CacheControl`] breakpoints
+/// (PRD-brain-prompt-cache §2.1).  Use [`Self::with_system`] for the
+/// legacy string form and [`Self::with_system_blocks`] for the
+/// cache-enabled block form.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageRequest {
     /// Canonical model id (e.g. `claude-sonnet-4-6`). Resolve via
     /// [`crate::canonical_model`] before constructing.
     pub model: String,
     /// Maximum tokens the response may emit. Anthropic requires this.
     pub max_tokens: u32,
-    /// Optional top-level system prompt.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub system: Option<String>,
+    /// Optional top-level system prompt — either a plain string or a
+    /// content-block array with optional cache-control breakpoints.
+    pub system: Option<SystemField>,
     /// Conversation history, oldest first.
     pub messages: Vec<Message>,
     /// Request streamed delta events.
     pub stream: bool,
+}
+
+impl Serialize for MessageRequest {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        // Count fields: model + max_tokens + messages + stream + optional system.
+        let field_count = 4 + usize::from(self.system.is_some());
+        let mut map = s.serialize_map(Some(field_count))?;
+        map.serialize_entry("model", &self.model)?;
+        map.serialize_entry("max_tokens", &self.max_tokens)?;
+        if let Some(ref sys) = self.system {
+            map.serialize_entry("system", sys)?;
+        }
+        map.serialize_entry("messages", &self.messages)?;
+        map.serialize_entry("stream", &self.stream)?;
+        map.end()
+    }
 }
 
 impl MessageRequest {
@@ -68,12 +200,46 @@ impl MessageRequest {
         }
     }
 
-    /// Set the top-level system prompt and return `self`.
+    /// Set the top-level system prompt as a plain string and return `self`.
+    ///
+    /// This produces the legacy wire form (`"system": "<text>"`). For
+    /// cache-enabled requests use [`Self::with_system_blocks`] instead.
     #[must_use]
     pub fn with_system(mut self, system: impl Into<String>) -> Self {
-        self.system = Some(system.into());
+        self.system = Some(SystemField::Plain(system.into()));
         self
     }
+
+    /// Set the top-level system prompt as a content-block array and
+    /// return `self`. The last block in `blocks` that carries a
+    /// `cache_control` breakpoint tells Anthropic to cache everything
+    /// up to that point.
+    ///
+    /// Use [`SystemBlock::text_cached`] on the last stable block to
+    /// mark the caching boundary.
+    #[must_use]
+    pub fn with_system_blocks(mut self, blocks: Vec<SystemBlock>) -> Self {
+        self.system = Some(SystemField::Blocks(blocks));
+        self
+    }
+}
+
+/// Usage counters surfaced by the `message_start` SSE event.
+///
+/// The cache fields (`cache_read_input_tokens`, `cache_creation_input_tokens`)
+/// are absent when no `cache_control` breakpoint is present in the request;
+/// they default to zero when omitted so callers can sum unconditionally.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[allow(clippy::struct_field_names, reason = "mirrors the Anthropic API field names exactly")]
+pub struct MessageUsage {
+    /// Number of tokens billed at the full input rate.
+    pub input_tokens: u32,
+    /// Tokens read from a previously-warmed cache prefix (billed at ~10%).
+    pub cache_read_input_tokens: u32,
+    /// Tokens written into the cache this turn (billed at ~125%).
+    pub cache_creation_input_tokens: u32,
+    /// Tokens in the assistant's reply.
+    pub output_tokens: u32,
 }
 
 /// One server-sent event from the Messages stream.
@@ -84,9 +250,13 @@ impl MessageRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamEvent {
     /// `message_start` — opening event carrying the model id + usage
-    /// counters (the body is dropped on the floor in iter-3; iter-4
-    /// surfaces usage telemetry).
-    MessageStart,
+    /// counters. Cache fields (`cache_read_input_tokens`,
+    /// `cache_creation_input_tokens`) are zero when no breakpoint was
+    /// sent (PRD-brain-prompt-cache §2.3).
+    MessageStart {
+        /// Per-turn token accounting including cache-hit metrics.
+        usage: MessageUsage,
+    },
     /// `content_block_start` — a new content block opened. We only
     /// track text blocks for now.
     ContentBlockStart {
@@ -167,7 +337,12 @@ pub fn parse_sse_event(data: &str) -> Result<StreamEvent, ParseError> {
         .ok_or(ParseError::MissingType)?;
 
     match kind {
-        "message_start" => Ok(StreamEvent::MessageStart),
+        "message_start" => {
+            let msg = v.get("message");
+            let usage_val = msg.and_then(|m| m.get("usage"));
+            let usage = parse_message_usage(usage_val);
+            Ok(StreamEvent::MessageStart { usage })
+        }
         "content_block_start" => {
             let index = require_index(&v, "content_block_start")?;
             Ok(StreamEvent::ContentBlockStart { index })
@@ -234,6 +409,27 @@ pub fn parse_sse_event(data: &str) -> Result<StreamEvent, ParseError> {
         other => Ok(StreamEvent::Other {
             event_type: other.to_string(),
         }),
+    }
+}
+
+/// Extract [`MessageUsage`] from a JSON `usage` object, defaulting
+/// missing or non-integer fields to `0`. Cache fields are optional (the
+/// API omits them when no breakpoint was sent).
+fn parse_message_usage(usage: Option<&serde_json::Value>) -> MessageUsage {
+    let Some(obj) = usage else {
+        return MessageUsage::default();
+    };
+    let get_u32 = |key: &str| -> u32 {
+        obj.get(key)
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+            .unwrap_or(0)
+    };
+    MessageUsage {
+        input_tokens: get_u32("input_tokens"),
+        cache_read_input_tokens: get_u32("cache_read_input_tokens"),
+        cache_creation_input_tokens: get_u32("cache_creation_input_tokens"),
+        output_tokens: get_u32("output_tokens"),
     }
 }
 
@@ -685,7 +881,7 @@ mod tests {
     fn parses_message_start() {
         let raw = r#"{"type":"message_start","message":{"id":"msg_x"}}"#;
         let ev = parse_sse_event(raw).unwrap();
-        assert_eq!(ev, StreamEvent::MessageStart);
+        assert_eq!(ev, StreamEvent::MessageStart { usage: MessageUsage::default() });
     }
 
     #[test]
@@ -798,7 +994,7 @@ mod tests {
         let body = "event: message_start\n\
                     data: {\"type\":\"message_start\"}\n\n";
         let evs = decode_sse_body(body).unwrap();
-        assert_eq!(evs, vec![StreamEvent::MessageStart]);
+        assert_eq!(evs, vec![StreamEvent::MessageStart { usage: MessageUsage::default() }]);
     }
 
     #[test]
@@ -813,7 +1009,7 @@ mod tests {
                     data: {\"type\":\"message_stop\"}\n\n";
         let evs = decode_sse_body(body).unwrap();
         assert_eq!(evs.len(), 4);
-        assert_eq!(evs[0], StreamEvent::MessageStart);
+        assert_eq!(evs[0], StreamEvent::MessageStart { usage: MessageUsage::default() });
         assert_eq!(evs[1], StreamEvent::ContentBlockStart { index: 0 });
         assert_eq!(
             evs[2],
@@ -832,7 +1028,7 @@ mod tests {
                     event: message_stop\r\n\
                     data: {\"type\":\"message_stop\"}\r\n\r\n";
         let evs = decode_sse_body(body).unwrap();
-        assert_eq!(evs, vec![StreamEvent::MessageStart, StreamEvent::MessageStop]);
+        assert_eq!(evs, vec![StreamEvent::MessageStart { usage: MessageUsage::default() }, StreamEvent::MessageStop]);
     }
 
     #[test]
@@ -842,7 +1038,7 @@ mod tests {
                     event: message_start\n\
                     data: {\"type\":\"message_start\"}\n\n";
         let evs = decode_sse_body(body).unwrap();
-        assert_eq!(evs, vec![StreamEvent::MessageStart]);
+        assert_eq!(evs, vec![StreamEvent::MessageStart { usage: MessageUsage::default() }]);
     }
 
     #[test]
@@ -882,7 +1078,7 @@ mod tests {
         assert!(d.pop_event().is_none());
         d.feed(b"\n\n");
         let ev = d.pop_event().unwrap().unwrap();
-        assert_eq!(ev, StreamEvent::MessageStart);
+        assert_eq!(ev, StreamEvent::MessageStart { usage: MessageUsage::default() });
         assert!(d.pop_event().is_none());
     }
 
@@ -905,7 +1101,7 @@ mod tests {
         assert_eq!(
             events,
             vec![
-                StreamEvent::MessageStart,
+                StreamEvent::MessageStart { usage: MessageUsage::default() },
                 StreamEvent::TextDelta {
                     index: 0,
                     text: "hi".to_string()
@@ -961,7 +1157,122 @@ mod tests {
         d.feed(b"event: message_start\r\ndata: {\"type\":\"message_start\"}\r\n\r\nevent: message_stop\r\ndata: {\"type\":\"message_stop\"}\r\n\r\n");
         let a = d.pop_event().unwrap().unwrap();
         let b = d.pop_event().unwrap().unwrap();
-        assert_eq!(a, StreamEvent::MessageStart);
+        assert_eq!(a, StreamEvent::MessageStart { usage: MessageUsage::default() });
         assert_eq!(b, StreamEvent::MessageStop);
+    }
+
+    // ── PRD-brain-prompt-cache AC1 / AC2 ────────────────────────────────────
+
+    /// AC1: `MessageRequest` can serialize a `system` content-block array
+    /// with a `cache_control: {"type":"ephemeral"}` breakpoint on the final
+    /// stable block, and the serialized JSON matches Anthropic's documented
+    /// form exactly.
+    #[test]
+    fn system_block_with_cache_control_serializes_correctly() {
+        let req = MessageRequest::streaming("claude-sonnet-4-6", 256, vec![])
+            .with_system_blocks(vec![
+                SystemBlock::text_cached("Stable persona prefix."),
+            ]);
+        let v = serde_json::to_value(&req).unwrap();
+        let system = &v["system"];
+        assert!(system.is_array(), "system must be a JSON array when blocks used");
+        let blocks = system.as_array().unwrap();
+        assert_eq!(blocks.len(), 1);
+        let block = &blocks[0];
+        assert_eq!(block["type"], "text");
+        assert_eq!(block["text"], "Stable persona prefix.");
+        assert_eq!(block["cache_control"]["type"], "ephemeral",
+            "cache_control must be {{\"type\":\"ephemeral\"}} on the marked block");
+    }
+
+    /// AC1 (continued): two blocks — first without breakpoint, last with.
+    #[test]
+    fn system_blocks_only_last_carries_cache_control() {
+        let req = MessageRequest::streaming("claude-sonnet-4-6", 256, vec![])
+            .with_system_blocks(vec![
+                SystemBlock::text("Volatile recall context."),
+                SystemBlock::text_cached("Stable persona."),
+            ]);
+        let v = serde_json::to_value(&req).unwrap();
+        let blocks = v["system"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks[0].get("cache_control").is_none(),
+            "first block must not have cache_control");
+        assert_eq!(blocks[1]["cache_control"]["type"], "ephemeral");
+    }
+
+    /// AC2: when no breakpoint is configured, `system` is serialized as a
+    /// plain string (byte-identical to the previous format), and the
+    /// existing serialization invariants hold.
+    #[test]
+    fn plain_system_string_serializes_as_string_not_array() {
+        let req = MessageRequest::streaming("claude-sonnet-4-6", 256, vec![])
+            .with_system("You are Wintermute.");
+        let v = serde_json::to_value(&req).unwrap();
+        assert!(v["system"].is_string(),
+            "plain system must serialize as a JSON string, not array");
+        assert_eq!(v["system"], "You are Wintermute.");
+    }
+
+    /// AC2 (continued): `system` is omitted when `None`, not serialized as null.
+    #[test]
+    fn system_omitted_when_none_with_blocks_api() {
+        let req = MessageRequest::streaming("claude-sonnet-4-6", 256, vec![]);
+        let v = serde_json::to_value(&req).unwrap();
+        assert!(v.get("system").is_none(),
+            "system must be omitted (not null) when unset");
+    }
+
+    /// AC6: `cache_read_input_tokens` and `cache_creation_input_tokens` are
+    /// parsed from `message_start.message.usage`.
+    #[test]
+    fn message_start_parses_cache_usage_fields() {
+        let raw = r#"{
+            "type": "message_start",
+            "message": {
+                "id": "msg_abc",
+                "usage": {
+                    "input_tokens": 1000,
+                    "cache_read_input_tokens": 800,
+                    "cache_creation_input_tokens": 50,
+                    "output_tokens": 120
+                }
+            }
+        }"#;
+        let ev = parse_sse_event(raw).unwrap();
+        let StreamEvent::MessageStart { usage } = ev else {
+            panic!("expected MessageStart");
+        };
+        assert_eq!(usage.input_tokens, 1000);
+        assert_eq!(usage.cache_read_input_tokens, 800);
+        assert_eq!(usage.cache_creation_input_tokens, 50);
+        assert_eq!(usage.output_tokens, 120);
+    }
+
+    /// AC6 (continued): cache fields default to 0 when absent.
+    #[test]
+    fn message_start_cache_fields_default_to_zero() {
+        let raw = r#"{"type":"message_start","message":{"usage":{"input_tokens":200,"output_tokens":10}}}"#;
+        let ev = parse_sse_event(raw).unwrap();
+        let StreamEvent::MessageStart { usage } = ev else {
+            panic!("expected MessageStart");
+        };
+        assert_eq!(usage.cache_read_input_tokens, 0);
+        assert_eq!(usage.cache_creation_input_tokens, 0);
+    }
+
+    /// AC2 / backward compat: the existing `streaming_request_serializes_with_stream_true`
+    /// invariant — system absent means it's omitted, not null — still holds
+    /// after the `SystemField` refactor.
+    #[test]
+    fn streaming_request_no_system_omits_field() {
+        let req = MessageRequest::streaming(
+            "claude-sonnet-4-6",
+            1024,
+            vec![Message { role: Role::User, content: "ping".to_string() }],
+        );
+        let v = serde_json::to_value(&req).unwrap();
+        assert!(v.get("system").is_none(), "system must be absent, not null");
+        assert_eq!(v["stream"], true);
     }
 }
