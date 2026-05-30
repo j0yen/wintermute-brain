@@ -42,6 +42,7 @@ use crate::degrade::{
 };
 use crate::history::{History, Turn};
 use crate::recall_client::{self, QueryArgs, QueryHit, RecallClient, TouchArgs};
+use crate::session::{AdvanceOutcome, CloseReason, SessionTracker};
 use crate::writeback::{ExtractorClient, WritebackGuard};
 use crate::{BrainConfig, PROFILE_SUBJECT, canonical_model};
 
@@ -947,7 +948,14 @@ pub struct DaemonState {
     /// Capacity is set from [`BrainConfig::history_turns`] at construction
     /// time. Successful turns push a [`Turn`] here; failures and empty
     /// replies do not (AC3 / PRD §2.1 — only real turns chain).
+    /// Cleared on every session boundary (PRD-wmd-session-boundary §2.4).
     pub history: Mutex<History>,
+    /// Conversation session boundary tracker (PRD-wmd-session-boundary §2.1).
+    ///
+    /// Derives session boundaries from idle gaps and explicit close phrases;
+    /// emits `wm.brain.session.{start,end}` on transitions. Wrapped in a
+    /// `Mutex` so `dispatch` and the graceful-shutdown hook share access.
+    pub session_tracker: Mutex<SessionTracker>,
     /// In-flight almanac acknowledgment awaiting the user's reply.
     ///
     /// Set by `handle_almanac_due` (speak-bridge path) when a prompt is
@@ -989,6 +997,10 @@ impl DaemonState {
     pub fn new(config: BrainConfig) -> Self {
         let history_turns = config.history_turns;
         let now = crate::bus::now_unix_ms();
+        let session_tracker = SessionTracker::new(
+            config.idle_gap_ms,
+            config.session_end_phrases.clone(),
+        );
         Self {
             config: Mutex::new(config),
             config_path: None,
@@ -1001,6 +1013,7 @@ impl DaemonState {
             ladder: None,
             session_floor: crate::ladder::SessionFloor::new(),
             history: Mutex::new(History::new(history_turns)),
+            session_tracker: Mutex::new(session_tracker),
             pending_ack: Mutex::new(None),
             almanac_patience_ms: DEFAULT_ALMANAC_PATIENCE_MS,
             degrade_rate: Arc::new(RateLimitState::new()),
@@ -1157,6 +1170,66 @@ pub async fn dispatch(
 ) -> Result<()> {
     match req {
         Request::TurnUser(t) => {
+            // --- Session boundary (PRD-wmd-session-boundary §2.1 / §2.4) ---
+            //
+            // Advance the session tracker before any other work. On a new
+            // session: emit SESSION_END for the closed session (if any), emit
+            // SESSION_START for the fresh session, and clear the history ring
+            // so context never bleeds across sessions. On an extended session:
+            // no events, no history reset.
+            let explicit_close = {
+                let tracker = state.session_tracker.lock().await;
+                tracker.is_explicit_close(&t.transcript)
+            };
+
+            let outcome = {
+                let mut tracker = state.session_tracker.lock().await;
+                tracker.advance(now_ms)
+            };
+
+            match outcome {
+                AdvanceOutcome::NewSession { closed, opened } => {
+                    if let Some(end_payload) = closed {
+                        info!(
+                            session_id = %end_payload.session_id,
+                            reason = ?end_payload.reason,
+                            turn_count = end_payload.turn_count,
+                            "wm-brain: session closed"
+                        );
+                        if let Ok(v) = serde_json::to_value(&end_payload) {
+                            if let Err(err) = publish
+                                .publish(outgoing::SESSION_END, v)
+                                .await
+                            {
+                                warn!(err = %err, "wm-brain: failed to publish session.end");
+                            }
+                        }
+                    }
+                    info!(
+                        session_id = %opened.session_id,
+                        "wm-brain: session started"
+                    );
+                    if let Ok(v) = serde_json::to_value(&opened) {
+                        if let Err(err) = publish
+                            .publish(outgoing::SESSION_START, v)
+                            .await
+                        {
+                            warn!(err = %err, "wm-brain: failed to publish session.start");
+                        }
+                    }
+                    // Clear history on session boundary (PRD §2.4).
+                    let max_turns = {
+                        let cfg = state.config.lock().await;
+                        cfg.history_turns
+                    };
+                    let mut history = state.history.lock().await;
+                    *history = History::new(max_turns);
+                }
+                AdvanceOutcome::Extended => {
+                    // Nothing to emit; history continues.
+                }
+            }
+
             // AC6: `wmd --model opus` for the next turn only. Read
             // effective_model + child_lock and, if pending_model was
             // set, clear it now so the *next* turn uses the default.
@@ -1179,6 +1252,31 @@ pub async fn dispatch(
             handle_turn_user(state, publish, &model, &tier, child_lock, &t, now_ms).await?;
             if consumed_pending {
                 persist_after_pending_consume(state).await;
+            }
+
+            // --- Explicit close (PRD §2.2): close after the reply, not before.
+            // The model answered the goodbye turn; now close the session.
+            if explicit_close {
+                let closed = {
+                    let mut tracker = state.session_tracker.lock().await;
+                    tracker.close(now_ms, CloseReason::Explicit)
+                };
+                if let Some(end_payload) = closed {
+                    info!(
+                        session_id = %end_payload.session_id,
+                        reason = ?end_payload.reason,
+                        turn_count = end_payload.turn_count,
+                        "wm-brain: session closed (explicit phrase)"
+                    );
+                    if let Ok(v) = serde_json::to_value(&end_payload) {
+                        if let Err(err) = publish
+                            .publish(outgoing::SESSION_END, v)
+                            .await
+                        {
+                            warn!(err = %err, "wm-brain: failed to publish session.end (explicit)");
+                        }
+                    }
+                }
             }
         }
         Request::ConfirmGranted(c) => {
@@ -2403,6 +2501,15 @@ pub async fn run(cfg: BrainConfig, config_path: Option<PathBuf>) -> Result<()> {
             }
         }
 
+        // AC7 (PRD-wmd-session-boundary): ignore self-emitted session.*
+        // envelopes that the bus echoes back to our own subscription.
+        // These are outbound-only events; re-ingesting them would create a
+        // feedback loop (brain hears its own session.start / session.end).
+        if ev.topic.starts_with(bus::SESSION_TOPIC_PREFIX) {
+            debug!(topic = %ev.topic, "wm-brain: ignoring self-emitted session topic");
+            continue;
+        }
+
         match decode_request(&ev.topic, &ev.data) {
             Ok(req) => {
                 let now = now_unix_ms();
@@ -2420,6 +2527,26 @@ pub async fn run(cfg: BrainConfig, config_path: Option<PathBuf>) -> Result<()> {
             }
         }
     }
+    // Graceful shutdown: close any open session so downstream PRDs
+    // (writeback, recap) get their trigger.
+    // Best-effort — we don't abort the shutdown on publish failure.
+    {
+        let closed = {
+            let mut tracker = state.session_tracker.lock().await;
+            tracker.close(now_unix_ms(), CloseReason::Shutdown)
+        };
+        if let Some(end_payload) = closed {
+            info!(
+                session_id = %end_payload.session_id,
+                turn_count = end_payload.turn_count,
+                "wm-brain: session closed on shutdown"
+            );
+            if let Ok(v) = serde_json::to_value(&end_payload) {
+                let _ = sink.publish(outgoing::SESSION_END, v).await;
+            }
+        }
+    }
+
     info!("wm-brain: bus closed; daemon exiting");
     Ok(())
 }
@@ -2463,6 +2590,33 @@ mod tests {
                 .expect("mem sink poisoned")
                 .push((topic.to_string(), data));
             Ok(())
+        }
+    }
+
+    impl MemSink {
+        /// Return only events that are NOT session boundary events
+        /// (`wm.brain.session.*`). Used by tests focused on LLM dispatch
+        /// behaviour so they don't need to account for the session events
+        /// that are always emitted by the session tracker.
+        fn non_session_events(&self) -> Vec<(String, Value)> {
+            self.events
+                .lock()
+                .expect("mem sink poisoned")
+                .iter()
+                .filter(|(topic, _)| !topic.starts_with(bus::SESSION_TOPIC_PREFIX))
+                .cloned()
+                .collect()
+        }
+
+        /// Return only `wm.brain.session.*` events.
+        fn session_events(&self) -> Vec<(String, Value)> {
+            self.events
+                .lock()
+                .expect("mem sink poisoned")
+                .iter()
+                .filter(|(topic, _)| topic.starts_with(bus::SESSION_TOPIC_PREFIX))
+                .cloned()
+                .collect()
         }
     }
 
@@ -2516,11 +2670,15 @@ mod tests {
         dispatch(state.as_ref(), &mut sink, req, 1)
             .await
             .expect("dispatch ok");
-        let events = sink.events.lock().unwrap();
+        let non_session = sink.non_session_events();
         assert!(
-            events.is_empty(),
-            "no LLM configured -> dispatch must not publish"
+            non_session.is_empty(),
+            "no LLM configured -> dispatch must not publish LLM events"
         );
+        // The session tracker still emits a SESSION_START on the first turn.
+        let sess_events = sink.session_events();
+        assert_eq!(sess_events.len(), 1);
+        assert_eq!(sess_events[0].0, outgoing::SESSION_START);
     }
 
     #[tokio::test]
@@ -2647,7 +2805,7 @@ mod tests {
         dispatch(state.as_ref(), &mut sink, req, 7777)
             .await
             .expect("dispatch ok");
-        let events = sink.events.lock().unwrap();
+        let events = sink.non_session_events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].0, outgoing::REPLY);
         assert_eq!(events[0].1["text"], "Hello, Joe.");
@@ -2669,7 +2827,7 @@ mod tests {
         dispatch(state.as_ref(), &mut sink, req, 4242)
             .await
             .expect("dispatch ok");
-        let events = sink.events.lock().unwrap();
+        let events = sink.non_session_events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].0, outgoing::ERROR);
         assert_eq!(events[0].1["kind"], "anthropic");
@@ -2704,7 +2862,7 @@ mod tests {
         dispatch(state.as_ref(), &mut sink, req, 9001)
             .await
             .expect("dispatch ok");
-        let events = sink.events.lock().unwrap();
+        let events = sink.non_session_events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].0, outgoing::ERROR);
         assert_eq!(events[0].1["kind"], "anthropic");
@@ -3284,7 +3442,7 @@ mod tests {
         dispatch(state.as_ref(), &mut sink, req, 13)
             .await
             .expect("dispatch ok");
-        let events = sink.events.lock().unwrap();
+        let events = sink.non_session_events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].0, outgoing::REPLY);
         assert_eq!(events[0].1["text"], "fallback reply");
@@ -3446,7 +3604,7 @@ mod tests {
         dispatch(state.as_ref(), &mut sink, req, 7)
             .await
             .expect("dispatch ok");
-        let events = sink.events.lock().unwrap();
+        let events = sink.non_session_events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].0, outgoing::REPLY);
         let calls = recall_handle.touched_calls();
@@ -3564,7 +3722,7 @@ mod tests {
         dispatch(state.as_ref(), &mut sink, req, 7)
             .await
             .expect("dispatch ok");
-        let events = sink.events.lock().unwrap();
+        let events = sink.non_session_events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].0, outgoing::REPLY_DESTRUCTIVE);
         let calls = recall_handle.touched_calls();
@@ -3594,7 +3752,7 @@ mod tests {
         dispatch(state.as_ref(), &mut sink, req, 7)
             .await
             .expect("dispatch must succeed even when touch fails");
-        let events = sink.events.lock().unwrap();
+        let events = sink.non_session_events();
         assert_eq!(events.len(), 1, "reply still published despite touch failure");
         assert_eq!(events[0].0, outgoing::REPLY);
         assert_eq!(events[0].1["text"], "brewing");
@@ -3704,7 +3862,7 @@ mod tests {
         dispatch(state.as_ref(), &mut sink, req, 5555)
             .await
             .expect("dispatch ok");
-        let events = sink.events.lock().unwrap();
+        let events = sink.non_session_events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].0, outgoing::REPLY_DESTRUCTIVE);
         assert_eq!(events[0].1["text"], "About to delete /tmp/x.");
@@ -3741,7 +3899,7 @@ mod tests {
         dispatch(state.as_ref(), &mut sink, req, 1)
             .await
             .expect("dispatch ok");
-        let events = sink.events.lock().unwrap();
+        let events = sink.non_session_events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].0, outgoing::REPLY_DESTRUCTIVE);
         assert_eq!(events[0].1["text"], "delete /tmp/x");
@@ -3762,7 +3920,7 @@ mod tests {
         dispatch(state.as_ref(), &mut sink, req, 9)
             .await
             .expect("dispatch ok");
-        let events = sink.events.lock().unwrap();
+        let events = sink.non_session_events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].0, outgoing::REPLY);
         let pending = state.pending.lock().await;
@@ -3997,7 +4155,9 @@ mod tests {
             .expect("turn-user dispatch ok");
 
             let intent_id = {
-                let events = sink.events.lock().unwrap();
+                // Filter out session events — this test focuses on the
+                // destructive-intent gate, not the session boundary.
+                let events = sink.non_session_events();
                 assert_eq!(events.len(), 1, "{utterance}: exactly one destructive event");
                 assert_eq!(
                     events[0].0,
@@ -4945,7 +5105,7 @@ mod tests {
         )
         .await
         .expect("dispatch ok");
-        let events = sink.events.lock().unwrap();
+        let events = sink.non_session_events();
         assert_eq!(events.len(), 1, "exactly one reply published");
         assert_eq!(events[0].0, outgoing::REPLY);
         assert_eq!(
@@ -5302,5 +5462,199 @@ mod tests {
         assert_eq!(events.len(), 1);
         // The published text is EXACTLY ev.say — no appended persona clause.
         assert_eq!(events[0].1["text"], "this is the exact say field");
+    }
+
+    // --- Session-boundary integration (PRD-wmd-session-boundary) ---------------
+
+    // AC1 (dispatch integration): Two turns 6 minutes apart produce
+    // SESSION_START → SESSION_END(reason=idle) → SESSION_START.
+    // The second turn's history ring is empty (AC§2.4).
+    #[tokio::test]
+    async fn session_ac1_gap_emits_end_then_start_and_clears_history() {
+        let cfg = BrainConfig {
+            idle_gap_ms: 300_000, // 5 min
+            history_turns: 6,
+            ..BrainConfig::default()
+        };
+        let state = Arc::new(DaemonState::new(cfg));
+
+        // Turn 1 at t=0 — should open session 1.
+        let mut sink = MemSink::default();
+        dispatch(
+            state.as_ref(),
+            &mut sink,
+            Request::TurnUser(TurnUserEvent {
+                transcript: "first turn".to_string(),
+                confidence: 1.0,
+                ts: 0,
+            }),
+            0,
+        )
+        .await
+        .expect("first turn ok");
+        let sess_events = sink.session_events();
+        assert_eq!(sess_events.len(), 1, "Turn 1 opens a session");
+        assert_eq!(sess_events[0].0, outgoing::SESSION_START);
+        let sess1_id = sess_events[0].1["session_id"]
+            .as_str()
+            .expect("session_id")
+            .to_string();
+
+        // Turn 2 at t=6min — gap exceeded → SESSION_END + SESSION_START.
+        let six_min_ms = 6 * 60_000_u64;
+        let mut sink2 = MemSink::default();
+        dispatch(
+            state.as_ref(),
+            &mut sink2,
+            Request::TurnUser(TurnUserEvent {
+                transcript: "second turn after gap".to_string(),
+                confidence: 1.0,
+                ts: six_min_ms,
+            }),
+            six_min_ms,
+        )
+        .await
+        .expect("second turn ok");
+        let sess_events2 = sink2.session_events();
+        // Should have SESSION_END (close old) + SESSION_START (open new).
+        assert_eq!(sess_events2.len(), 2, "gap triggers end+start");
+        assert_eq!(sess_events2[0].0, outgoing::SESSION_END, "end first");
+        assert_eq!(sess_events2[0].1["session_id"], sess1_id, "end closes sess1");
+        assert_eq!(sess_events2[0].1["reason"], "idle");
+        assert_eq!(sess_events2[1].0, outgoing::SESSION_START, "then start");
+        let sess2_id = sess_events2[1].1["session_id"]
+            .as_str()
+            .expect("session2_id")
+            .to_string();
+        assert_ne!(sess2_id, sess1_id, "new session has different id");
+
+        // History must be empty at the start of session 2 (no LLM so no
+        // turns were actually pushed, but verify the ring was reset).
+        let history = state.history.lock().await;
+        assert!(history.is_empty(), "history cleared on session boundary");
+    }
+
+    // AC2 (dispatch integration): Three turns 1 minute apart share one session.
+    #[tokio::test]
+    async fn session_ac2_turns_within_gap_share_one_session() {
+        let cfg = BrainConfig {
+            idle_gap_ms: 300_000,
+            ..BrainConfig::default()
+        };
+        let state = Arc::new(DaemonState::new(cfg));
+        let min_ms: u64 = 60_000;
+
+        for ts in [0_u64, min_ms, 2 * min_ms] {
+            let mut sink = MemSink::default();
+            dispatch(
+                state.as_ref(),
+                &mut sink,
+                Request::TurnUser(TurnUserEvent {
+                    transcript: "a turn".to_string(),
+                    confidence: 1.0,
+                    ts,
+                }),
+                ts,
+            )
+            .await
+            .expect("turn ok");
+            if ts == 0 {
+                // First turn: start event only.
+                let sess = sink.session_events();
+                assert_eq!(sess.len(), 1);
+                assert_eq!(sess[0].0, outgoing::SESSION_START);
+            } else {
+                // Subsequent turns within gap: no session events.
+                let sess = sink.session_events();
+                assert!(sess.is_empty(), "no session event for turn within gap");
+            }
+        }
+
+        // Verify session is still open with 3 turns.
+        let tracker = state.session_tracker.lock().await;
+        assert_eq!(tracker.current_turn_count(), 3);
+    }
+
+    // AC3 (dispatch integration): "goodbye" phrase closes the session after
+    // the reply (reason=explicit). A subsequent turn opens a new session.
+    #[tokio::test]
+    async fn session_ac3_explicit_close_phrase_closes_after_reply() {
+        let cfg = BrainConfig {
+            idle_gap_ms: 300_000,
+            ..BrainConfig::default()
+        };
+        let state = Arc::new(DaemonState::new(cfg));
+
+        // Turn 1: ordinary turn (opens session).
+        let mut sink1 = MemSink::default();
+        dispatch(
+            state.as_ref(),
+            &mut sink1,
+            Request::TurnUser(TurnUserEvent {
+                transcript: "hello".to_string(),
+                confidence: 1.0,
+                ts: 1000,
+            }),
+            1000,
+        )
+        .await
+        .expect("turn1 ok");
+        assert_eq!(sink1.session_events().len(), 1, "turn 1 opens session");
+        let sess1_id = sink1.session_events()[0].1["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Turn 2: "goodbye" — should close the session after the reply.
+        // (No LLM configured so reply isn't published, but the session close fires.)
+        let mut sink2 = MemSink::default();
+        dispatch(
+            state.as_ref(),
+            &mut sink2,
+            Request::TurnUser(TurnUserEvent {
+                transcript: "goodbye".to_string(),
+                confidence: 1.0,
+                ts: 2000,
+            }),
+            2000,
+        )
+        .await
+        .expect("goodbye turn ok");
+        let sess2 = sink2.session_events();
+        // No new session opened (still in the same session).
+        // SESSION_END(reason=explicit) after the reply.
+        assert_eq!(sess2.len(), 1, "goodbye closes the session");
+        assert_eq!(sess2[0].0, outgoing::SESSION_END);
+        assert_eq!(sess2[0].1["session_id"], sess1_id);
+        assert_eq!(sess2[0].1["reason"], "explicit");
+
+        // Turn 3 should open a fresh session.
+        let mut sink3 = MemSink::default();
+        dispatch(
+            state.as_ref(),
+            &mut sink3,
+            Request::TurnUser(TurnUserEvent {
+                transcript: "good morning".to_string(),
+                confidence: 1.0,
+                ts: 3000,
+            }),
+            3000,
+        )
+        .await
+        .expect("turn3 ok");
+        let sess3 = sink3.session_events();
+        assert_eq!(sess3.len(), 1, "turn 3 opens a new session");
+        assert_eq!(sess3[0].0, outgoing::SESSION_START);
+        let sess3_id = sess3[0].1["session_id"].as_str().unwrap().to_string();
+        assert_ne!(sess3_id, sess1_id, "new session has different id");
+    }
+
+    // AC7 (self-emit filter): SESSION_TOPIC_PREFIX is defined and points to
+    // the session topic namespace. Tests that the constant is well-formed.
+    #[test]
+    fn session_ac7_session_topic_prefix_is_correct() {
+        assert_eq!(bus::SESSION_TOPIC_PREFIX, "wm.brain.session.");
+        assert!(outgoing::SESSION_START.starts_with(bus::SESSION_TOPIC_PREFIX));
+        assert!(outgoing::SESSION_END.starts_with(bus::SESSION_TOPIC_PREFIX));
     }
 }

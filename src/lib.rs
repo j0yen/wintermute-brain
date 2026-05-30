@@ -23,6 +23,7 @@ pub mod history;
 pub mod ladder;
 pub mod persist;
 pub mod recall_client;
+pub mod session;
 pub mod writeback;
 pub use persist::default_config_path;
 
@@ -237,11 +238,17 @@ pub struct BrainConfig {
     #[serde(default = "default_writeback_confidence_floor")]
     pub writeback_confidence_floor: f64,
     /// Idle gap in milliseconds after which a new `turn.user` starts a
-    /// fresh session and fires writeback on the old one.
-    /// Defaults to `300_000` ms (5 minutes).
+    /// fresh session. Defaults to `300_000` ms (5 minutes).
     /// PRD-wmd-session-boundary §2.1 / PRD-wmd-memory-writeback §2.2.
     #[serde(default = "default_idle_gap_ms")]
     pub idle_gap_ms: u64,
+    /// End-of-conversation phrases that trigger an explicit session close
+    /// after the reply is published. Matched case-insensitively with
+    /// punctuation stripped. Default: see
+    /// [`crate::session::DEFAULT_END_PHRASES`].
+    /// PRD-wmd-session-boundary §2.2.
+    #[serde(default = "default_session_end_phrases")]
+    pub session_end_phrases: Vec<String>,
 }
 
 impl Default for BrainConfig {
@@ -263,6 +270,7 @@ impl Default for BrainConfig {
             writeback_model: default_writeback_model(),
             writeback_confidence_floor: default_writeback_confidence_floor(),
             idle_gap_ms: default_idle_gap_ms(),
+            session_end_phrases: default_session_end_phrases(),
         }
     }
 }
@@ -295,8 +303,15 @@ const fn default_writeback_confidence_floor() -> f64 {
     0.5
 }
 
-const fn default_idle_gap_ms() -> u64 {
-    300_000
+fn default_idle_gap_ms() -> u64 {
+    crate::session::DEFAULT_IDLE_GAP_MS
+}
+
+fn default_session_end_phrases() -> Vec<String> {
+    crate::session::DEFAULT_END_PHRASES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
 }
 
 fn default_api_key_env() -> String {
@@ -498,6 +513,7 @@ impl BrainConfig {
             writeback_model,
             writeback_confidence_floor,
             idle_gap_ms,
+            session_end_phrases: default_session_end_phrases(),
         })
     }
 
