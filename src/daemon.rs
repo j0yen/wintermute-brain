@@ -42,6 +42,7 @@ use crate::degrade::{
 };
 use crate::history::{History, Turn};
 use crate::recall_client::{self, QueryArgs, QueryHit, RecallClient, TouchArgs};
+use crate::writeback::{ExtractorClient, WritebackGuard};
 use crate::{BrainConfig, PROFILE_SUBJECT, canonical_model};
 
 /// Default upper bound on tokens the daemon requests per turn.
@@ -118,6 +119,44 @@ impl LlmClient for AnthropicClient {
         req: &MessageRequest,
     ) -> Result<Vec<StreamEvent>, ClientError> {
         Self::collect_messages(self, req).await
+    }
+}
+
+/// Production [`ExtractorClient`] backed by an [`LlmClient`].
+///
+/// Issues a single non-streaming extraction call using the writeback model
+/// configured in [`BrainConfig::writeback_model`]. Uses a small token budget
+/// (512) since the extractor only needs to produce `FACT | …` lines.
+pub struct AnthropicExtractor {
+    llm: Arc<dyn LlmClient>,
+    model: String,
+}
+
+impl AnthropicExtractor {
+    /// Construct an extractor backed by `llm` and targeting `model`.
+    #[must_use]
+    pub fn new(llm: Arc<dyn LlmClient>, model: impl Into<String>) -> Self {
+        Self { llm, model: model.into() }
+    }
+}
+
+/// Token budget for the extraction call. Small: we only need `FACT | …` lines.
+const EXTRACTION_MAX_TOKENS: u32 = 512;
+
+#[async_trait::async_trait]
+impl ExtractorClient for AnthropicExtractor {
+    async fn extract(&self, transcript: &str) -> std::result::Result<String, String> {
+        use crate::writeback::EXTRACTION_SYSTEM_PROMPT;
+        let req = MessageRequest::streaming(
+            canonical_model(&self.model),
+            EXTRACTION_MAX_TOKENS,
+            vec![Message { role: Role::User, content: transcript.to_string() }],
+        )
+        .with_system(EXTRACTION_SYSTEM_PROMPT.to_string());
+        match self.llm.collect_messages(&req).await {
+            Ok(events) => Ok(extract_assistant_text(&events)),
+            Err(e) => Err(format!("{e}")),
+        }
     }
 }
 
@@ -850,6 +889,22 @@ impl EventSink for AgoraSink {
     }
 }
 
+/// Minimal in-daemon session tracker for writeback.
+///
+/// Tracks the current session so [`writeback`] can fire when the idle gap
+/// expires or an explicit close phrase is detected.  The session-boundary
+/// PRD will expand this; for now we carry just enough state for writeback
+/// (PRD-wmd-memory-writeback §2.2 / AC7).
+#[derive(Debug, Clone)]
+pub struct WritebackSession {
+    /// Stable id minted when the session opened.
+    pub session_id: String,
+    /// Unix milliseconds of the last turn in this session.
+    pub last_turn_ms: u64,
+    /// Copy of all turns so far (mirrored from history at write-back time).
+    pub turns: Vec<Turn>,
+}
+
 /// Live daemon state.
 ///
 /// iter-10 adds the destructive-intent pending registry + per-process
@@ -912,6 +967,17 @@ pub struct DaemonState {
     /// Per-component health state, updated by the degradation aggregator
     /// and snapshotted every 60 s (PRD-wintermute-companion-degrade §2.4).
     pub degrade_health: Arc<HealthState>,
+    /// Current writeback session (idle-gap + turn tracking).
+    ///
+    /// `None` until the first `turn.user` arrives.  Updated on every
+    /// turn and closed (triggering writeback) when the idle gap expires.
+    /// PRD-wmd-memory-writeback §2.2.
+    pub writeback_session: Mutex<Option<WritebackSession>>,
+    /// Idempotence guard: ensures each session writes back at most once.
+    pub writeback_guard: WritebackGuard,
+    /// Optional extraction client. When `Some`, end-of-session writeback
+    /// fires; when `None` writeback is disabled (no LLM configured).
+    pub extractor: Option<Arc<dyn ExtractorClient>>,
 }
 
 impl DaemonState {
@@ -939,6 +1005,9 @@ impl DaemonState {
             almanac_patience_ms: DEFAULT_ALMANAC_PATIENCE_MS,
             degrade_rate: Arc::new(RateLimitState::new()),
             degrade_health: Arc::new(HealthState::new(now)),
+            writeback_session: Mutex::new(None),
+            writeback_guard: WritebackGuard::new(),
+            extractor: None,
         }
     }
 
@@ -995,6 +1064,15 @@ impl DaemonState {
     #[must_use]
     pub fn with_persona(mut self, persona: impl Into<String>) -> Self {
         self.persona = persona.into();
+        self
+    }
+
+    /// Attach an extraction client for end-of-session writeback.
+    ///
+    /// When not set, writeback is silently skipped.
+    #[must_use]
+    pub fn with_extractor(mut self, extractor: Arc<dyn ExtractorClient>) -> Self {
+        self.extractor = Some(extractor);
         self
     }
 
@@ -1406,6 +1484,9 @@ async fn handle_turn_user(
     turn: &TurnUserEvent,
     now_ms: u64,
 ) -> Result<()> {
+    // Advance the writeback session (check idle gap, open new session if needed).
+    advance_writeback_session(state, now_ms).await;
+
     // When a ladder is configured it owns dispatch (local-first + climb);
     // otherwise fall back to the single Anthropic client path.
     if state.ladder.is_some() {
@@ -1458,9 +1539,11 @@ async fn handle_turn_user(
                 let mut history = state.history.lock().await;
                 history.push(Turn {
                     user: turn.transcript.clone(),
-                    assistant: assistant_stored,
+                    assistant: assistant_stored.clone(),
                     ts: now_ms,
                 });
+                drop(history);
+                record_turn_for_writeback(state, &turn.transcript, &assistant_stored, now_ms).await;
             } else {
                 let stored = text.clone();
                 let reply = ReplyEvent { text, ts: now_ms };
@@ -1473,9 +1556,11 @@ async fn handle_turn_user(
                 let mut history = state.history.lock().await;
                 history.push(Turn {
                     user: turn.transcript.clone(),
-                    assistant: stored,
+                    assistant: stored.clone(),
                     ts: now_ms,
                 });
+                drop(history);
+                record_turn_for_writeback(state, &turn.transcript, &stored, now_ms).await;
             }
         }
         Err(err) => {
@@ -1557,9 +1642,11 @@ async fn handle_turn_user_ladder(
                 let mut history = state.history.lock().await;
                 history.push(Turn {
                     user: turn.transcript.clone(),
-                    assistant: assistant_stored,
+                    assistant: assistant_stored.clone(),
                     ts: now_ms,
                 });
+                drop(history);
+                record_turn_for_writeback(state, &turn.transcript, &assistant_stored, now_ms).await;
             } else {
                 let stored = text.clone();
                 let reply = ReplyEvent { text, ts: now_ms };
@@ -1570,9 +1657,11 @@ async fn handle_turn_user_ladder(
                 let mut history = state.history.lock().await;
                 history.push(Turn {
                     user: turn.transcript.clone(),
-                    assistant: stored,
+                    assistant: stored.clone(),
                     ts: now_ms,
                 });
+                drop(history);
+                record_turn_for_writeback(state, &turn.transcript, &stored, now_ms).await;
             }
         }
         crate::ladder::LadderOutcome::Degraded { reason } => {
@@ -1582,6 +1671,207 @@ async fn handle_turn_user_ladder(
         }
     }
     Ok(())
+}
+
+/// Check the idle gap and, if expired, fire writeback for the old session.
+///
+/// This is called at the *start* of each `turn.user` handler, before the
+/// turn is processed.  If the gap since `last_turn_ms` exceeds
+/// `idle_gap_ms`, the old session is finalised (writeback fires) and a
+/// new one is opened.  The history ring is NOT cleared here (history
+/// scoping is PRD-wmd-session-boundary work); we only track the turns for
+/// writeback purposes.
+///
+/// Returns the `session_id` that should receive the current turn (new or
+/// continued).
+///
+/// PRD-wmd-memory-writeback §2.2 / AC7.
+#[allow(
+    clippy::cognitive_complexity,
+    clippy::too_many_lines,
+    reason = "session-boundary + spawn shell: two linear branches (gap expired / still active); \
+              factoring out the spawn would introduce more complexity, not less"
+)]
+async fn advance_writeback_session(state: &DaemonState, now_ms: u64) -> String {
+    let idle_gap_ms = { state.config.lock().await.idle_gap_ms };
+    let mut sess_guard = state.writeback_session.lock().await;
+
+    if let Some(ref current) = *sess_guard {
+        let elapsed = now_ms.saturating_sub(current.last_turn_ms);
+        if elapsed >= idle_gap_ms {
+            // Idle gap expired — fire writeback for the closing session.
+            let old_session_id = current.session_id.clone();
+            let old_turns = current.turns.clone();
+            let (config_snap, date_str) = {
+                let cfg = state.config.lock().await;
+                let date = chrono_local_date();
+                (cfg.clone(), date)
+            };
+            if let Some(ref extractor) = state.extractor {
+                // Spawn best-effort writeback; do not await (avoid blocking the
+                // turn path — writeback must never stall the conversation).
+                let recall = Arc::clone(&state.recall);
+                let extractor_clone: Arc<dyn ExtractorClient> = Arc::clone(extractor);
+                let guard_ref: &WritebackGuard = &state.writeback_guard;
+                // We must await here to get the `try_claim` done before we
+                // drop the session (otherwise the next advance_writeback_session
+                // for the same id might see a live `writeback_session` entry
+                // that's already been claimed).  The actual I/O is spawned.
+                if guard_ref.try_claim(&old_session_id).await {
+                    let old_session_id2 = old_session_id.clone();
+                    tokio::spawn(async move {
+                        // The guard was already claimed above; use a
+                        // pre-claimed guard so trigger_writeback doesn't
+                        // double-claim.
+                        let single_use_guard = WritebackGuard::new();
+                        let _ = single_use_guard.try_claim(&old_session_id2).await;
+                        // Release and let trigger_writeback re-claim.
+                        // Actually we call the inner path directly to avoid
+                        // double-claim confusion.
+                        trigger_writeback_inner(
+                            &old_session_id2,
+                            &old_turns,
+                            &date_str,
+                            &config_snap,
+                            extractor_clone.as_ref(),
+                            recall.as_ref(),
+                        )
+                        .await;
+                    });
+                }
+            }
+            // Open a new session.
+            let new_id = format!("wmd-sess-{now_ms}");
+            *sess_guard = Some(WritebackSession {
+                session_id: new_id.clone(),
+                last_turn_ms: now_ms,
+                turns: Vec::new(),
+            });
+            return new_id;
+        }
+        // Still within the gap — extend the current session.
+        let id = current.session_id.clone();
+        if let Some(ref mut s) = *sess_guard {
+            s.last_turn_ms = now_ms;
+        }
+        return id;
+    }
+
+    // No current session — open the first one.
+    let new_id = format!("wmd-sess-{now_ms}");
+    *sess_guard = Some(WritebackSession {
+        session_id: new_id.clone(),
+        last_turn_ms: now_ms,
+        turns: Vec::new(),
+    });
+    new_id
+}
+
+/// Record a completed turn into the current writeback session's turn list.
+async fn record_turn_for_writeback(state: &DaemonState, user: &str, assistant: &str, ts: u64) {
+    let mut sess_guard = state.writeback_session.lock().await;
+    if let Some(ref mut s) = *sess_guard {
+        s.turns.push(Turn {
+            user: user.to_string(),
+            assistant: assistant.to_string(),
+            ts,
+        });
+    }
+}
+
+/// Inner writeback driver that bypasses the guard (called only after the
+/// guard has already been claimed by the caller).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "writeback context: session_id + turns + date + config + extractor + recall; \
+              each is semantically distinct"
+)]
+async fn trigger_writeback_inner(
+    session_id: &str,
+    turns: &[Turn],
+    date_str: &str,
+    config: &BrainConfig,
+    extractor: &dyn ExtractorClient,
+    recall: &dyn RecallSource,
+) {
+    use crate::writeback::{MIN_TURNS_FOR_WRITEBACK, parse_extraction_response, render_transcript,
+                           recall_subject_for};
+
+    if turns.len() < MIN_TURNS_FOR_WRITEBACK {
+        debug!(session_id, "writeback(inner): too few turns; skipping");
+        return;
+    }
+    let transcript = render_transcript(turns);
+    let raw = match extractor.extract(&transcript).await {
+        Ok(r) => r,
+        Err(err) => {
+            warn!(session_id, err = %err, "writeback(inner): extraction failed; skipping");
+            return;
+        }
+    };
+    let facts = parse_extraction_response(&raw, config.writeback_confidence_floor);
+    if facts.is_empty() {
+        debug!(session_id, "writeback(inner): no facts extracted");
+        return;
+    }
+    let mut written = 0usize;
+    for fact in &facts {
+        let subject = recall_subject_for(&fact.subject_hint, date_str);
+        match recall.save_fact(&subject, &fact.body).await {
+            Ok(id) => {
+                debug!(session_id, id = %id, subject = %subject, "writeback(inner): fact written");
+                written = written.saturating_add(1);
+            }
+            Err(err) => {
+                warn!(session_id, subject = %subject, err = %err,
+                      "writeback(inner): save_fact failed; skipping fact");
+            }
+        }
+    }
+    info!(session_id, facts_extracted = facts.len(), facts_written = written,
+          "writeback(inner): session writeback complete");
+}
+
+/// Get today's date as an ISO-8601 string (`YYYY-MM-DD`).
+///
+/// Uses the system clock; falls back to `"1970-01-01"` if the clock is
+/// somehow unavailable (should never happen in practice).
+#[must_use]
+fn chrono_local_date() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    // Compute YYYY-MM-DD from Unix timestamp (no chrono dep).
+    // Algorithm: count days since epoch, then compute calendar date.
+    let days = secs / 86400;
+    let (year, month, day) = days_to_ymd(days);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+/// Convert days-since-Unix-epoch to `(year, month, day)`.
+///
+/// Uses the proleptic Gregorian calendar algorithm.
+/// Algorithm from <https://howardhinnant.github.io/date_algorithms.html> (public domain).
+#[allow(
+    clippy::similar_names,
+    reason = "doe/doy are standard names in the Hinnant date algorithm; renaming would obscure \
+              the well-known derivation"
+)]
+const fn days_to_ymd(days: u64) -> (u64, u64, u64) {
+    // Shift to the civil date epoch (days since 1 Jan 1970 → proleptic
+    // Gregorian days since 1 March 0000 using the 400-year cycle).
+    let z = days.wrapping_add(719_468);
+    let era = z / 146_097;
+    let doe = z % 146_097; // day of era [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
 }
 
 /// Fire-and-log [`RecallSource::touch`] for each id in `hits`. Touch
@@ -1812,6 +2102,12 @@ fn build_llm_from_env(api_key_env: &str) -> Option<Arc<dyn LlmClient>> {
 /// client. A missing agorabus socket is *not* an error: the daemon
 /// logs and exits cleanly so the systemd unit restarts it when the bus
 /// comes back (same pattern as `wm-stt` / `wm-tts`).
+#[allow(
+    clippy::cognitive_complexity,
+    clippy::too_many_lines,
+    reason = "live daemon entry-point: sequential setup + subscribe loop; refactoring into smaller \
+              functions would scatter the startup sequence and obscure the linear flow"
+)]
 pub async fn run(cfg: BrainConfig, config_path: Option<PathBuf>) -> Result<()> {
     cfg.validate().context("wm-brain: config validation failed")?;
 
@@ -1839,10 +2135,19 @@ pub async fn run(cfg: BrainConfig, config_path: Option<PathBuf>) -> Result<()> {
         if let Some(p) = config_path {
             base = base.with_config_path(p);
         }
-        match llm {
-            Some(client) => base.with_llm(client),
+        // Wire the extraction client for end-of-session writeback when
+        // an LLM is available (PRD-wmd-memory-writeback §2.2 / §2.4).
+        // `cfg.writeback_model` is moved before this; re-read from state.
+        base = match llm {
+            Some(client) => {
+                let extractor_model = { base.config.lock().await.writeback_model.clone() };
+                let extractor: Arc<dyn ExtractorClient> =
+                    Arc::new(AnthropicExtractor::new(Arc::clone(&client), extractor_model));
+                base.with_llm(client).with_extractor(extractor)
+            }
             None => base,
-        }
+        };
+        base
     });
 
     // `WM_BRAIN_BUS_SOCKET` override mirrors `wm-dialog`'s `WM_DIALOG_BUS_SOCKET`
