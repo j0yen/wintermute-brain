@@ -126,6 +126,14 @@ pub struct ReplyEvent {
     pub text: String,
     /// Unix milliseconds at emission.
     pub ts: u64,
+    /// Optional loudness hint for `wm-tts` (PRD-wmd-repair-affordances §2.2).
+    ///
+    /// When present, `wm-tts` may honor it with a volume bump. Absent for all
+    /// ordinary replies; only set to `"loud"` by the `RepeatLouder` repair
+    /// path. Existing consumers that don't inspect this field are unaffected
+    /// (backward-compatible — `#[serde(skip_serializing_if = "Option::is_none")]`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loudness: Option<String>,
 }
 
 /// Outbound `wm.brain.reply.destructive` payload.
@@ -309,10 +317,32 @@ mod tests {
         let r = ReplyEvent {
             text: "hello".to_string(),
             ts: 17,
+            loudness: None,
         };
         let v = serde_json::to_value(&r).expect("serialises");
         let back: ReplyEvent = serde_json::from_value(v).expect("round-trips");
         assert_eq!(back, r);
+    }
+
+    #[test]
+    fn outbound_reply_loudness_roundtrip() {
+        // AC6: loudness field is backward-compatible; when absent it deserialises
+        // to None, when present it round-trips unchanged.
+        let r_loud = ReplyEvent {
+            text: "Hello!".to_string(),
+            ts: 42,
+            loudness: Some("loud".to_string()),
+        };
+        let v = serde_json::to_value(&r_loud).expect("serialises");
+        // The serialised form includes the loudness key.
+        assert_eq!(v.get("loudness").and_then(|x| x.as_str()), Some("loud"));
+        let back: ReplyEvent = serde_json::from_value(v).expect("round-trips");
+        assert_eq!(back, r_loud);
+
+        // A payload without "loudness" deserialises to loudness=None.
+        let plain = serde_json::json!({ "text": "hi", "ts": 1_u64 });
+        let back_plain: ReplyEvent = serde_json::from_value(plain).expect("round-trips without loudness");
+        assert_eq!(back_plain.loudness, None);
     }
 
     #[test]

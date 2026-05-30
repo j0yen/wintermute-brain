@@ -23,6 +23,7 @@ pub mod history;
 pub mod ladder;
 pub mod persist;
 pub mod recall_client;
+pub mod repair;
 pub mod session;
 pub mod writeback;
 pub use persist::default_config_path;
@@ -265,6 +266,19 @@ pub struct BrainConfig {
     /// PRD-wmd-session-recap §2.3.
     #[serde(default)]
     pub recap_opener: bool,
+    /// Phrases that trigger verbatim replay of the last assistant turn without
+    /// a new LLM call. Matched case-insensitively with punctuation stripped.
+    /// An empty list uses [`crate::repair::DEFAULT_REPEAT_PHRASES`].
+    /// PRD-wmd-repair-affordances §2.1.
+    #[serde(default)]
+    pub repair_repeat_phrases: Vec<String>,
+    /// Phrases that trigger verbatim replay of the last assistant turn with a
+    /// `loudness = "loud"` hint on the emitted [`crate::bus::ReplyEvent`].
+    /// Matched case-insensitively with punctuation stripped.
+    /// An empty list uses [`crate::repair::DEFAULT_LOUDER_PHRASES`].
+    /// PRD-wmd-repair-affordances §2.1.
+    #[serde(default)]
+    pub repair_louder_phrases: Vec<String>,
 }
 
 impl Default for BrainConfig {
@@ -289,6 +303,8 @@ impl Default for BrainConfig {
             session_end_phrases: default_session_end_phrases(),
             recap_max_memories: default_recap_max_memories(),
             recap_opener: false,
+            repair_repeat_phrases: Vec::new(),
+            repair_louder_phrases: Vec::new(),
         }
     }
 }
@@ -556,6 +572,8 @@ impl BrainConfig {
             session_end_phrases: default_session_end_phrases(),
             recap_max_memories,
             recap_opener,
+            repair_repeat_phrases: Vec::new(),
+            repair_louder_phrases: Vec::new(),
         })
     }
 

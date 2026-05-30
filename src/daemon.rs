@@ -15,7 +15,7 @@
 //! Recall retrieval, tool routing, destructive-intent gating, and turn
 //! memorisation remain iter-9+ work.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -43,6 +43,7 @@ use crate::degrade::{
 use crate::history::{History, Turn};
 use crate::recall_client::{self, QueryArgs, QueryHit, RecallClient, TouchArgs};
 use crate::session::{AdvanceOutcome, CloseReason, SessionTracker};
+use crate::repair::{self, Repair};
 use crate::writeback::{ExtractorClient, WritebackGuard};
 use crate::{BrainConfig, PROFILE_SUBJECT, THREAD_SUBJECT_PREFIX, canonical_model};
 
@@ -615,6 +616,31 @@ pub const TOOL_RECALL_SAVE_FACT: &str = "wm.recall.save_fact";
 /// config (PRD AC5).  30 seconds is a safe fallback for test fixtures
 /// that don't wire earshot config.
 pub const DEFAULT_ALMANAC_PATIENCE_MS: u64 = 30_000;
+
+/// Graceful degrade phrase emitted when a repair request arrives but the
+/// history buffer is empty (AC3). The user hears this instead of silence or
+/// an empty reply.
+pub const REPAIR_EMPTY_HISTORY_REPLY: &str = "I haven't said anything yet.";
+
+/// Build the effective phrase sets for repair classification from the daemon
+/// config. When a list is empty the built-in defaults are used instead.
+///
+/// This is called once per `TurnUser` event, before the LLM dispatch check,
+/// so the overhead is two `BTreeSet` constructions at most (cheap).
+#[must_use]
+fn repair_phrase_sets(cfg: &BrainConfig) -> (BTreeSet<String>, BTreeSet<String>) {
+    let repeat = if cfg.repair_repeat_phrases.is_empty() {
+        repair::default_repeat_phrases()
+    } else {
+        repair::build_phrase_set(&cfg.repair_repeat_phrases)
+    };
+    let louder = if cfg.repair_louder_phrases.is_empty() {
+        repair::default_louder_phrases()
+    } else {
+        repair::build_phrase_set(&cfg.repair_louder_phrases)
+    };
+    (repeat, louder)
+}
 
 /// Fleet 1 recall tool router.
 ///
@@ -1480,7 +1506,7 @@ pub async fn tick_almanac_timeout(
     } else {
         // First elapse — speak the gentle re-ask and reset window (AC4).
         let re_ask_text = "Did you take it? Just say yes or later if you need more time.";
-        let reply = bus::ReplyEvent { text: re_ask_text.to_string(), ts: now_ms };
+        let reply = bus::ReplyEvent { text: re_ask_text.to_string(), ts: now_ms, loudness: None };
         publish
             .publish(bus::outgoing::REPLY, serde_json::to_value(&reply)?)
             .await
@@ -1578,6 +1604,7 @@ pub async fn handle_speak_almanac_due(
     let reply = bus::ReplyEvent {
         text: say.to_string(),
         ts: now_ms,
+        loudness: None,
     };
     publish
         .publish(
@@ -1687,7 +1714,7 @@ pub async fn handle_session_start(
                 .filter(|s| !s.is_empty())
             {
                 let opener_text = format!("Earlier you mentioned: {first_snippet}");
-                let reply = bus::ReplyEvent { text: opener_text, ts: now_ms };
+                let reply = bus::ReplyEvent { text: opener_text, ts: now_ms, loudness: None };
                 if let Ok(payload) = serde_json::to_value(&reply) {
                     if let Err(err) = publish.publish(outgoing::REPLY, payload).await {
                         warn!(err = %err, "wm-brain recap: opener publish failed");
@@ -1724,6 +1751,50 @@ async fn persist_after_pending_consume(state: &DaemonState) {
     }
 }
 
+/// Handle a classified repair request (PRD-wmd-repair-affordances §2.2).
+///
+/// Reads the last assistant turn from `state.history`. On `RepeatLast`, re-
+/// publishes its text with a fresh `ts`. On `RepeatLouder`, does the same but
+/// adds `loudness = "loud"` to the event. When history is empty, publishes the
+/// graceful degrade phrase [`REPAIR_EMPTY_HISTORY_REPLY`] instead.
+///
+/// The replayed turn is **not** pushed back into history (AC4 — prevents
+/// "say that again" × N from filling the ring with duplicates).
+///
+/// # Errors
+/// Propagates publish failures.
+async fn handle_repair(
+    state: &DaemonState,
+    publish: &mut dyn EventSink,
+    repair: Repair,
+    now_ms: u64,
+) -> Result<()> {
+    let last_text = {
+        let history = state.history.lock().await;
+        history.last().map(|t| t.assistant.clone())
+    };
+
+    let (text, loudness) = if let Some(t) = last_text {
+        let loud = (repair == Repair::RepeatLouder).then(|| "loud".to_string());
+        (t, loud)
+    } else {
+        info!("wm-brain: repair request with empty history; emitting degrade phrase");
+        (REPAIR_EMPTY_HISTORY_REPLY.to_string(), None)
+    };
+
+    info!(
+        repair = ?repair,
+        loudness = ?loudness,
+        "wm-brain: repair replay"
+    );
+    let reply = ReplyEvent { text, ts: now_ms, loudness };
+    publish
+        .publish(outgoing::REPLY, serde_json::to_value(&reply)?)
+        .await
+        .context("publish repair replay")?;
+    Ok(())
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "per-turn handler: state + sink + model + child_lock + turn + ts; refactoring into \
@@ -1745,6 +1816,22 @@ async fn handle_turn_user(
 ) -> Result<()> {
     // Advance the writeback session (check idle gap, open new session if needed).
     advance_writeback_session(state, now_ms).await;
+
+    // --- Repair-affordance check (PRD-wmd-repair-affordances §2.1 / §2.2) ---
+    //
+    // Run BEFORE the LLM dispatch. If the transcript is a verbatim-replay or
+    // louder-replay request, handle it locally from history and return — no
+    // model call, no token cost, near-zero latency.
+    {
+        let repair_result = {
+            let cfg = state.config.lock().await;
+            let (repeat_set, louder_set) = repair_phrase_sets(&cfg);
+            repair::classify(&turn.transcript, &repeat_set, &louder_set)
+        };
+        if repair_result != Repair::None {
+            return handle_repair(state, publish, repair_result, now_ms).await;
+        }
+    }
 
     // When a ladder is configured it owns dispatch (local-first + climb);
     // otherwise fall back to the single Anthropic client path.
@@ -1806,7 +1893,7 @@ async fn handle_turn_user(
                 record_turn_for_writeback(state, &turn.transcript, &assistant_stored, now_ms).await;
             } else {
                 let stored = text.clone();
-                let reply = ReplyEvent { text, ts: now_ms };
+                let reply = ReplyEvent { text, ts: now_ms, loudness: None };
                 publish
                     .publish(outgoing::REPLY, serde_json::to_value(&reply)?)
                     .await
@@ -1878,7 +1965,7 @@ async fn handle_turn_user_ladder(
 
     // Publish any filler backchannels first (AC9), then the answer.
     for filler in sink.take_fillers() {
-        let reply = ReplyEvent { text: filler, ts: now_ms };
+        let reply = ReplyEvent { text: filler, ts: now_ms, loudness: None };
         publish
             .publish(outgoing::REPLY, serde_json::to_value(&reply)?)
             .await
@@ -1910,7 +1997,7 @@ async fn handle_turn_user_ladder(
                 record_turn_for_writeback(state, &turn.transcript, &assistant_stored, now_ms).await;
             } else {
                 let stored = text.clone();
-                let reply = ReplyEvent { text, ts: now_ms };
+                let reply = ReplyEvent { text, ts: now_ms, loudness: None };
                 publish
                     .publish(outgoing::REPLY, serde_json::to_value(&reply)?)
                     .await
@@ -2261,6 +2348,7 @@ async fn handle_confirm_denied(
     let reply = ReplyEvent {
         text: DESTRUCTIVE_CANCELLATION_REPLY.to_string(),
         ts: now_ms,
+        loudness: None,
     };
     publish
         .publish(outgoing::REPLY, serde_json::to_value(&reply)?)
@@ -3046,6 +3134,7 @@ mod tests {
             topic_for_emit(&Emit::Reply(ReplyEvent {
                 text: String::new(),
                 ts: 0,
+                loudness: None,
             })),
             outgoing::REPLY
         );
@@ -3092,6 +3181,7 @@ mod tests {
         let e = Emit::Reply(ReplyEvent {
             text: "ok".to_string(),
             ts: 42,
+            loudness: None,
         });
         let v = emit_to_value(&e).expect("serialises");
         assert_eq!(v["text"], "ok");
