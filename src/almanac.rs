@@ -48,6 +48,23 @@ pub const ALMANAC_ACK_TOPIC: &str = "wm.almanac.ack";
 /// `wm.almanac.snooze {id, resume_ts}`.
 pub const ALMANAC_SNOOZE_TOPIC: &str = "wm.almanac.snooze";
 
+/// Inbound due-entry topic from the almanac tick daemon.
+///
+/// The brain subscribes to the parent [`ALMANAC_TOPIC_PREFIX`] and routes
+/// this exact topic to the speak-bridge handler
+/// (`crate::daemon::handle_speak_almanac_due`).  The envelope carries the
+/// prompt text in the `say` field; the brain publishes it verbatim as
+/// `wm.brain.reply` — persona wrapping and TTS pacing are the existing
+/// reply-path's job, not the speak-bridge's.
+pub const ALMANAC_DUE_TOPIC: &str = "wm.almanac.due";
+
+/// Subscribe prefix for all almanac events (due + ack + snooze).
+///
+/// The brain subscribes to this prefix so both `wm.almanac.due` (speak-bridge
+/// trigger) and any future almanac sub-topics reach the same subscriber socket
+/// without needing extra `subscribe` calls.
+pub const ALMANAC_TOPIC_PREFIX: &str = "wm.almanac.";
+
 // ── Wire event types ──────────────────────────────────────────────────────────
 
 /// Inbound `wm.stt.final` payload as seen by `wm-brain`.
@@ -60,6 +77,26 @@ pub struct SttFinalEvent {
     pub confidence: f32,
     /// Unix milliseconds when the STT engine finalised.
     pub ts: u64,
+}
+
+/// Inbound `wm.almanac.due` payload from the almanac tick daemon.
+///
+/// The `say` field carries the prompt text the user should hear.  The brain
+/// speaks it verbatim in v0.1 — persona wrapping is hearth's responsibility,
+/// not this crate's.  All other fields are metadata for logging and the
+/// subsequent acknowledge window (PRD §1 / AC1, AC4).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AlmanacDueEvent {
+    /// Stable reminder id (matches the tick daemon's entry id).
+    pub id: String,
+    /// Human-readable label for logging (e.g. "blue pill").
+    pub label: String,
+    /// Prompt text to speak verbatim.
+    pub say: String,
+    /// Reminder category (e.g. "medication"), used by the ack FSM.
+    pub category: String,
+    /// Unix milliseconds when the tick daemon fired this event.
+    pub fire_ts: u64,
 }
 
 /// Outbound `wm.almanac.ack` payload.

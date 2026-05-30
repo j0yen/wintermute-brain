@@ -1277,6 +1277,84 @@ pub async fn handle_almanac_due(
     );
 }
 
+/// Speak an almanac due-entry and arm the acknowledgment window.
+///
+/// This is the speak-bridge handler for `wm.almanac.due` envelopes
+/// (PRD-almanac-speak-bridge).  It:
+///
+/// 1. Checks the `almanac_speak` config gate; returns `Ok(false)` immediately
+///    when disabled (AC3 — publishes nothing).
+/// 2. Validates `ev.say` is non-empty; logs WARN and returns `Ok(false)` when
+///    blank (AC4 — malformed envelope degrades without panic or reply).
+/// 3. Builds `ReplyEvent { text: ev.say, ts: now_ms }` and publishes to
+///    `outgoing::REPLY` — the identical call `handle_session_start` (recap
+///    path) makes.  Persona wrapping and TTS pacing are the existing
+///    reply-path's responsibility (AC6 — no persona string added here).
+/// 4. Arms the acknowledgment window by calling [`handle_almanac_due`] with
+///    the entry-level config from the envelope (AC2-AC5 — patience window,
+///    snooze handling).
+///
+/// Returns `Ok(true)` when the reply was published and the ack window armed,
+/// `Ok(false)` when the gate was off or the envelope was malformed.
+///
+/// # Errors
+/// Propagates the first publish failure (bus transport errors).
+pub async fn handle_speak_almanac_due(
+    state: &DaemonState,
+    publish: &mut dyn EventSink,
+    ev: &crate::almanac::AlmanacDueEvent,
+    now_ms: u64,
+) -> Result<bool> {
+    // AC3: gate — disabled speak publishes nothing.
+    let almanac_speak = { state.config.lock().await.almanac_speak };
+    if !almanac_speak {
+        debug!(
+            id = %ev.id,
+            "wm-brain almanac: speak gate off; dropping due event"
+        );
+        return Ok(false);
+    }
+
+    // AC4: malformed envelope (missing / empty say) → WARN, no panic, no reply.
+    let say = ev.say.trim();
+    if say.is_empty() {
+        warn!(
+            id = %ev.id,
+            label = %ev.label,
+            category = %ev.category,
+            "wm-brain almanac: wm.almanac.due envelope has empty say field; dropping"
+        );
+        return Ok(false);
+    }
+
+    // AC1: speak verbatim via the same publish path recap_opener uses.
+    let reply = bus::ReplyEvent {
+        text: say.to_string(),
+        ts: now_ms,
+    };
+    publish
+        .publish(
+            bus::outgoing::REPLY,
+            serde_json::to_value(&reply).context("serialise almanac reply")?,
+        )
+        .await
+        .context("publish almanac reply")?;
+
+    info!(
+        id = %ev.id,
+        label = %ev.label,
+        category = %ev.category,
+        "wm-brain almanac: due-entry spoken via reply path"
+    );
+
+    // Arm the ack window with a default AlmanacEntryConfig (v0.1 doesn't
+    // carry per-entry config on the envelope; use the built-in defaults).
+    let ack_config = crate::almanac::AlmanacEntryConfig::default();
+    handle_almanac_due(state, &ev.id, &ev.category, ack_config, now_ms).await;
+
+    Ok(true)
+}
+
 /// Persist the post-consume config when [`DaemonState::config_path`] is
 /// set. Save failures are logged and swallowed: the in-memory cfg has
 /// already been mutated, so the running daemon keeps the AC6 contract;
@@ -1779,9 +1857,15 @@ pub async fn run(cfg: BrainConfig, config_path: Option<PathBuf>) -> Result<()> {
     sub_client
         .subscribe(crate::almanac::STT_TOPIC_PREFIX)
         .await?;
+    // Subscribe to the almanac prefix so `wm.almanac.due` events reach the
+    // speak-bridge handler (PRD-almanac-speak-bridge).
+    sub_client
+        .subscribe(crate::almanac::ALMANAC_TOPIC_PREFIX)
+        .await?;
     info!(
         dialog_prefix = bus::DIALOG_TOPIC_PREFIX,
         stt_prefix = crate::almanac::STT_TOPIC_PREFIX,
+        almanac_prefix = crate::almanac::ALMANAC_TOPIC_PREFIX,
         "wm-brain: subscribed"
     );
 
@@ -1897,6 +1981,45 @@ pub async fn run(cfg: BrainConfig, config_path: Option<PathBuf>) -> Result<()> {
                     continue;
                 }
             }
+        }
+
+        // Route `wm.almanac.due` to the speak-bridge handler
+        // (PRD-almanac-speak-bridge AC1–AC4). Other `wm.almanac.*` topics
+        // (ack, snooze) are outbound — we published them ourselves, so any
+        // echo from the bus is silently dropped below.
+        if ev.topic == crate::almanac::ALMANAC_DUE_TOPIC {
+            let now = now_unix_ms();
+            let parsed_ev: std::result::Result<crate::almanac::AlmanacDueEvent, _> =
+                serde_json::from_value(ev.data.clone());
+            match parsed_ev {
+                Ok(due_ev) => {
+                    match handle_speak_almanac_due(state.as_ref(), &mut sink, &due_ev, now).await {
+                        Ok(_) => {}
+                        Err(err) => {
+                            error!(err = %err, "wm-brain: almanac speak-bridge failed");
+                            let _ =
+                                publish_error(&mut sink, "almanac", &format!("{err}")).await;
+                        }
+                    }
+                }
+                Err(err) => {
+                    // AC4: malformed envelope — log WARN, never panic the loop.
+                    warn!(
+                        err = %err,
+                        topic = %ev.topic,
+                        "wm-brain: wm.almanac.due parse failed; dropping"
+                    );
+                }
+            }
+            continue;
+        }
+
+        // Silently skip non-dialog almanac topics (ack/snooze echoes).
+        if ev.topic.starts_with(crate::almanac::ALMANAC_TOPIC_PREFIX)
+            && !ev.topic.starts_with(bus::DIALOG_TOPIC_PREFIX)
+        {
+            debug!(topic = %ev.topic, "wm-brain: ignoring non-due almanac topic");
+            continue;
         }
 
         match decode_request(&ev.topic, &ev.data) {
@@ -4328,5 +4451,130 @@ mod tests {
         let state = DaemonState::new(cfg).with_almanac_patience_ms(90_000);
         assert_eq!(state.almanac_patience_ms, 90_000);
         assert_ne!(state.almanac_patience_ms, DEFAULT_ALMANAC_PATIENCE_MS);
+    }
+
+    // ── speak-bridge tests (PRD-almanac-speak-bridge) ─────────────────────────
+
+    fn make_due_event(id: &str, say: &str) -> crate::almanac::AlmanacDueEvent {
+        crate::almanac::AlmanacDueEvent {
+            id: id.to_string(),
+            label: "test-label".to_string(),
+            say: say.to_string(),
+            category: "medication".to_string(),
+            fire_ts: 1_000,
+        }
+    }
+
+    // AC1: wm.almanac.due with say="time for your blue pill" causes exactly one
+    // wm.brain.reply with text = ev.say (verbatim), via handle_speak_almanac_due.
+    #[tokio::test]
+    async fn speak_bridge_publishes_reply_with_verbatim_say() {
+        let state = fresh_state(); // almanac_speak defaults to true
+        let mut sink = MemSink::default();
+        let ev = make_due_event("rem-1", "time for your blue pill");
+
+        let spoke = handle_speak_almanac_due(state.as_ref(), &mut sink, &ev, 5_000)
+            .await
+            .expect("speak ok");
+        assert!(spoke, "should return true when speak fires");
+
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 1, "exactly one reply published");
+        assert_eq!(events[0].0, outgoing::REPLY, "published on reply topic");
+        assert_eq!(
+            events[0].1["text"],
+            "time for your blue pill",
+            "text is verbatim from ev.say"
+        );
+        assert_eq!(events[0].1["ts"], 5_000_u64);
+    }
+
+    // AC2: after speak, the pending ack is armed via handle_almanac_due.
+    #[tokio::test]
+    async fn speak_bridge_arms_pending_ack_after_speak() {
+        let state = fresh_state();
+        let mut sink = MemSink::default();
+        let ev = make_due_event("rem-arm", "drink water");
+
+        handle_speak_almanac_due(state.as_ref(), &mut sink, &ev, 9_000)
+            .await
+            .expect("speak ok");
+
+        let guard = state.pending_ack.lock().await;
+        let ack = guard.as_ref().expect("pending ack must be set after speak");
+        assert_eq!(ack.id, "rem-arm");
+        assert_eq!(ack.category, "medication");
+        assert_eq!(ack.asked_ms, 9_000, "asked_ms matches now_ms");
+        assert_eq!(ack.snoozes_used, 0);
+        assert!(!ack.re_asked);
+    }
+
+    // AC3: with almanac_speak=false, wm.almanac.due publishes NO reply.
+    #[tokio::test]
+    async fn speak_bridge_disabled_publishes_nothing() {
+        let cfg = BrainConfig {
+            almanac_speak: false,
+            ..BrainConfig::default()
+        };
+        let state = Arc::new(DaemonState::new(cfg));
+        let mut sink = MemSink::default();
+        let ev = make_due_event("rem-off", "time for your blue pill");
+
+        let spoke = handle_speak_almanac_due(state.as_ref(), &mut sink, &ev, 1_234)
+            .await
+            .expect("call ok even when disabled");
+        assert!(!spoke, "almanac_speak=false -> returns false");
+
+        let events = sink.events.lock().unwrap();
+        assert!(events.is_empty(), "no reply published when gate is off");
+    }
+
+    // AC4: malformed envelope (empty say) logs WARN and publishes nothing.
+    #[tokio::test]
+    async fn speak_bridge_empty_say_logs_warn_and_publishes_nothing() {
+        let state = fresh_state();
+        let mut sink = MemSink::default();
+        let ev = make_due_event("rem-bad", ""); // empty say
+
+        let spoke = handle_speak_almanac_due(state.as_ref(), &mut sink, &ev, 2_000)
+            .await
+            .expect("call must not Err on malformed envelope");
+        assert!(!spoke, "empty say -> returns false, no panic");
+
+        let events = sink.events.lock().unwrap();
+        assert!(events.is_empty(), "no reply published for empty say");
+    }
+
+    // AC4 (whitespace-only say is also malformed).
+    #[tokio::test]
+    async fn speak_bridge_whitespace_say_publishes_nothing() {
+        let state = fresh_state();
+        let mut sink = MemSink::default();
+        let ev = make_due_event("rem-ws", "   \t  ");
+
+        let spoke = handle_speak_almanac_due(state.as_ref(), &mut sink, &ev, 3_000)
+            .await
+            .expect("call must not Err");
+        assert!(!spoke);
+        assert!(sink.events.lock().unwrap().is_empty());
+    }
+
+    // AC6: no persona string / phrase bank embedded in the speak-bridge diff.
+    // Tested structurally: handle_speak_almanac_due publishes ev.say verbatim
+    // without appending or prepending any persona text.
+    #[tokio::test]
+    async fn speak_bridge_publishes_say_verbatim_no_persona_wrapping() {
+        let state = fresh_state();
+        let mut sink = MemSink::default();
+        let ev = make_due_event("rem-v", "this is the exact say field");
+
+        handle_speak_almanac_due(state.as_ref(), &mut sink, &ev, 7_777)
+            .await
+            .expect("speak ok");
+
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        // The published text is EXACTLY ev.say — no appended persona clause.
+        assert_eq!(events[0].1["text"], "this is the exact say field");
     }
 }

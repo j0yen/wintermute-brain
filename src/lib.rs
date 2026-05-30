@@ -210,6 +210,13 @@ pub struct BrainConfig {
     /// PRD-wmd-turn-history §2.3.
     #[serde(default = "default_history_turns")]
     pub history_turns: usize,
+    /// When `true` (the default), `wm.almanac.due` envelopes cause wmd to
+    /// speak the prompt text via `wm.brain.reply` — the speak-bridge path
+    /// described in PRD-almanac-speak-bridge.  Set to `false` (or
+    /// `WM_BRAIN_ALMANAC_SPEAK=0`) in tests and developer desks that do
+    /// not want live almanac audio.
+    #[serde(default = "default_almanac_speak")]
+    pub almanac_speak: bool,
 }
 
 impl Default for BrainConfig {
@@ -226,6 +233,7 @@ impl Default for BrainConfig {
             pending_tier: None,
             local_endpoint: default_local_endpoint(),
             history_turns: default_history_turns(),
+            almanac_speak: default_almanac_speak(),
         }
     }
 }
@@ -244,6 +252,10 @@ fn default_local_endpoint() -> String {
 
 fn default_history_turns() -> usize {
     DEFAULT_HISTORY_TURNS
+}
+
+const fn default_almanac_speak() -> bool {
+    true
 }
 
 fn default_api_key_env() -> String {
@@ -372,6 +384,7 @@ impl BrainConfig {
     /// - `WM_USER_NAME` (string; optional)
     /// - `WM_TIMEZONE` (IANA tz string; optional)
     /// - `WM_BRAIN_CHILD_LOCK` (`true`/`false`; default `false`)
+    /// - `WM_BRAIN_ALMANAC_SPEAK` (`true`/`false`; default `true`)
     ///
     /// # Errors
     /// Returns [`BrainError::InvalidEnv`] when a var is set but
@@ -394,6 +407,11 @@ impl BrainConfig {
             None => false,
         };
 
+        let almanac_speak = match env_string("WM_BRAIN_ALMANAC_SPEAK") {
+            Some(raw) => parse_bool_env("WM_BRAIN_ALMANAC_SPEAK", &raw)?,
+            None => default_almanac_speak(),
+        };
+
         let default_tier = env_string("WM_BRAIN_DEFAULT_TIER").unwrap_or_else(default_tier);
         let local_endpoint =
             env_string("WM_BRAIN_LOCAL_ENDPOINT").unwrap_or_else(default_local_endpoint);
@@ -406,6 +424,7 @@ impl BrainConfig {
             user_name,
             timezone,
             child_lock,
+            almanac_speak,
             default_tier,
             pending_tier: None,
             local_endpoint,
@@ -702,5 +721,43 @@ mod tests {
         let v = serde_json::to_value(&cfg).expect("serialises");
         let back: BrainConfig = serde_json::from_value(v).expect("round-trips");
         assert_eq!(cfg, back);
+    }
+
+    // ── almanac_speak config gate (PRD AC3 / AC5) ────────────────────────────
+
+    #[test]
+    fn default_almanac_speak_is_true() {
+        // AC5: default BrainConfig has almanac_speak=true.
+        let cfg = BrainConfig::default();
+        assert!(cfg.almanac_speak, "almanac_speak must default to true");
+    }
+
+    #[test]
+    fn almanac_speak_round_trips_through_serde() {
+        // AC5: almanac_speak round-trips through serde.
+        let cfg = BrainConfig {
+            almanac_speak: false,
+            ..BrainConfig::default()
+        };
+        let v = serde_json::to_value(&cfg).expect("serialises");
+        let back: BrainConfig = serde_json::from_value(v).expect("round-trips");
+        assert!(!back.almanac_speak);
+        // Also verify true round-trips.
+        let cfg2 = BrainConfig::default();
+        let v2 = serde_json::to_value(&cfg2).expect("serialises");
+        let back2: BrainConfig = serde_json::from_value(v2).expect("round-trips");
+        assert!(back2.almanac_speak);
+    }
+
+    #[test]
+    fn env_override_wm_brain_almanac_speak_false() {
+        // AC5: WM_BRAIN_ALMANAC_SPEAK=0 disables speak.
+        // We exercise parse_bool_env directly (env mutation in tests is messy).
+        let parsed = parse_bool_env("WM_BRAIN_ALMANAC_SPEAK", "0").expect("parses");
+        assert!(!parsed);
+        let parsed_false = parse_bool_env("WM_BRAIN_ALMANAC_SPEAK", "false").expect("parses");
+        assert!(!parsed_false);
+        let parsed_true = parse_bool_env("WM_BRAIN_ALMANAC_SPEAK", "1").expect("parses");
+        assert!(parsed_true);
     }
 }
