@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.5.0 — 2026-05-30
+
+`wm.almanac.due` is published but nothing spoke it. This version teaches
+`wmd` to subscribe to `wm.almanac.due` and speak the prompt by reusing the
+exact proactive publish path `recap_opener` already uses — so the reminder
+comes out in hearth's persona, at earshot's pace, through wm-tts, with no
+new speech mechanism invented.
+
+New in v0.5.0:
+- `AlmanacDueEvent` wire type + `ALMANAC_DUE_TOPIC` / `ALMANAC_TOPIC_PREFIX` constants
+- `BrainConfig.almanac_speak` gate (default `true`; env `WM_BRAIN_ALMANAC_SPEAK`)
+- `handle_speak_almanac_due`: speaks `ev.say` verbatim via `wm.brain.reply`;
+  arms the PendingAck window; gracefully degrades on empty/malformed say
+- Subscribe loop wired to `wm.almanac.` prefix; routes due events to handler
+
 ## v0.4.0 — 2026-05-29
 
 Add almanac acknowledgment FSM — close the reminder loop with spoken reply classification.
