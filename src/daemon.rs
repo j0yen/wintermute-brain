@@ -31,6 +31,7 @@ use crate::bus::{
     ReplyDestructiveEvent, Request, ToolCallEvent, ToolResultEvent, TurnUserEvent, decode_request,
     now_unix_ms, outgoing,
 };
+use crate::history::{History, Turn};
 use crate::recall_client::{self, QueryArgs, QueryHit, RecallClient, TouchArgs};
 use crate::{BrainConfig, PROFILE_SUBJECT, canonical_model};
 
@@ -114,17 +115,27 @@ impl LlmClient for AnthropicClient {
 /// Build a buffered streaming request for a single user turn. Pure
 /// function; the caller is responsible for splicing recall context and
 /// child-lock guidance into `persona` via [`compose_persona`].
+///
+/// `history_msgs` is the flat `[user, assistant, …]` prefix produced by
+/// [`History::to_messages`] or [`History::trimmed_messages`]; callers pass
+/// an empty slice when history is disabled (`history_turns = 0`).
+/// The full message list is `[…history_msgs…, current_user]`, satisfying
+/// `messages.len() == history_msgs.len() + 1`.
+/// PRD-wmd-turn-history §2.2.
 #[must_use]
-pub fn compose_request(model: &str, persona: &str, transcript: &str) -> MessageRequest {
-    MessageRequest::streaming(
-        canonical_model(model),
-        DEFAULT_MAX_TOKENS,
-        vec![Message {
-            role: Role::User,
-            content: transcript.to_string(),
-        }],
-    )
-    .with_system(persona.to_string())
+pub fn compose_request(
+    model: &str,
+    persona: &str,
+    history_msgs: &[Message],
+    transcript: &str,
+) -> MessageRequest {
+    let mut messages = history_msgs.to_vec();
+    messages.push(Message {
+        role: Role::User,
+        content: transcript.to_string(),
+    });
+    MessageRequest::streaming(canonical_model(model), DEFAULT_MAX_TOKENS, messages)
+        .with_system(persona.to_string())
 }
 
 /// Assemble the effective system prompt the Anthropic call receives.
@@ -858,6 +869,12 @@ pub struct DaemonState {
     pub ladder: Option<Arc<crate::ladder::LadderClient>>,
     /// Per-session tier floor for conversational stickiness (AC10).
     pub session_floor: crate::ladder::SessionFloor,
+    /// Bounded rolling turn history (PRD-wmd-turn-history §2.1).
+    ///
+    /// Capacity is set from [`BrainConfig::history_turns`] at construction
+    /// time. Successful turns push a [`Turn`] here; failures and empty
+    /// replies do not (AC3 / PRD §2.1 — only real turns chain).
+    pub history: Mutex<History>,
 }
 
 impl DaemonState {
@@ -867,6 +884,7 @@ impl DaemonState {
     /// `with_*` builders.
     #[must_use]
     pub fn new(config: BrainConfig) -> Self {
+        let history_turns = config.history_turns;
         Self {
             config: Mutex::new(config),
             config_path: None,
@@ -878,6 +896,7 @@ impl DaemonState {
             intent_counter: AtomicU64::new(0),
             ladder: None,
             session_floor: crate::ladder::SessionFloor::new(),
+            history: Mutex::new(History::new(history_turns)),
         }
     }
 
@@ -1085,7 +1104,12 @@ async fn handle_turn_user(
     };
     let context = format_recall_context(&hits);
     let persona = compose_persona(&state.persona, child_lock, context.as_deref());
-    let req = compose_request(model, &persona, &turn.transcript);
+    // Build the request with history prefix (PRD-wmd-turn-history §2.2).
+    let history_msgs = {
+        let history = state.history.lock().await;
+        history.trimmed_messages(DEFAULT_MAX_TOKENS as usize)
+    };
+    let req = compose_request(model, &persona, &history_msgs, &turn.transcript);
     match llm.collect_messages(&req).await {
         Ok(events) => {
             let text = extract_assistant_text(&events);
@@ -1099,18 +1123,39 @@ async fn handle_turn_user(
             }
             touch_recalled_hits(state.recall.as_ref(), &hits).await;
             if let Some((intent, spoken)) = parse_destructive_intent(&text) {
+                // Destructive turns store the *spoken* prefix, not the JSON
+                // fence, so the companion hears the right text on replay
+                // (PRD-wmd-turn-history §2.1 + AC5).
+                let assistant_stored = spoken.clone();
                 publish_destructive(state, publish, intent, spoken, now_ms).await?;
+                // Push the stored spoken text as the assistant turn.
+                let mut history = state.history.lock().await;
+                history.push(Turn {
+                    user: turn.transcript.clone(),
+                    assistant: assistant_stored,
+                    ts: now_ms,
+                });
             } else {
+                let stored = text.clone();
                 let reply = ReplyEvent { text, ts: now_ms };
                 publish
                     .publish(outgoing::REPLY, serde_json::to_value(&reply)?)
                     .await
                     .context("publish reply")?;
+                // Only push after successful publish (AC3 — errors don't
+                // pollute history).
+                let mut history = state.history.lock().await;
+                history.push(Turn {
+                    user: turn.transcript.clone(),
+                    assistant: stored,
+                    ts: now_ms,
+                });
             }
         }
         Err(err) => {
             error!(err = %err, model = %model, "wm-brain: anthropic call failed");
             publish_error_at(publish, "anthropic", &format!("{err}"), now_ms).await?;
+            // Do NOT push to history on LLM failure (AC3).
         }
     }
     Ok(())
@@ -1147,7 +1192,12 @@ async fn handle_turn_user_ladder(
     };
     let context = format_recall_context(&hits);
     let persona = compose_persona(&state.persona, child_lock, context.as_deref());
-    let req = compose_request(model, &persona, &turn.transcript);
+    // Build the request with history prefix (PRD-wmd-turn-history §2.2).
+    let history_msgs = {
+        let history = state.history.lock().await;
+        history.trimmed_messages(DEFAULT_MAX_TOKENS as usize)
+    };
+    let req = compose_request(model, &persona, &history_msgs, &turn.transcript);
 
     let sink = crate::ladder::BufferingSink::default();
     let outcome = ladder
@@ -1168,23 +1218,41 @@ async fn handle_turn_user_ladder(
             if text.is_empty() {
                 warn!(tier = %served, "wm-brain ladder: empty answer; emitting error");
                 publish_error_at(publish, "ladder", "no text in response", now_ms).await?;
+                // Do NOT push empty-answer turns to history (AC3).
                 return Ok(());
             }
             info!(tier = %served, "wm-brain ladder: turn served");
             touch_recalled_hits(state.recall.as_ref(), &hits).await;
             if let Some((intent, spoken)) = parse_destructive_intent(&text) {
+                // Store the spoken prefix (AC5 — destructive turns store
+                // what the user heard, not the JSON fence).
+                let assistant_stored = spoken.clone();
                 publish_destructive(state, publish, intent, spoken, now_ms).await?;
+                let mut history = state.history.lock().await;
+                history.push(Turn {
+                    user: turn.transcript.clone(),
+                    assistant: assistant_stored,
+                    ts: now_ms,
+                });
             } else {
+                let stored = text.clone();
                 let reply = ReplyEvent { text, ts: now_ms };
                 publish
                     .publish(outgoing::REPLY, serde_json::to_value(&reply)?)
                     .await
                     .context("publish ladder reply")?;
+                let mut history = state.history.lock().await;
+                history.push(Turn {
+                    user: turn.transcript.clone(),
+                    assistant: stored,
+                    ts: now_ms,
+                });
             }
         }
         crate::ladder::LadderOutcome::Degraded { reason } => {
             error!(reason = %reason, "wm-brain ladder: turn degraded (no tier could serve)");
             publish_error_at(publish, "ladder", &reason, now_ms).await?;
+            // Do NOT push degraded turns to history (AC3).
         }
     }
     Ok(())
@@ -1712,7 +1780,8 @@ mod tests {
 
     #[test]
     fn compose_request_uses_canonical_model_and_includes_persona() {
-        let req = compose_request("sonnet", "be terse", "hello there");
+        // AC4 / baseline: empty history → exactly one user message (single-message behaviour).
+        let req = compose_request("sonnet", "be terse", &[], "hello there");
         assert_eq!(req.model, "claude-sonnet-4-6");
         assert_eq!(req.max_tokens, DEFAULT_MAX_TOKENS);
         assert!(req.stream);
@@ -1720,6 +1789,37 @@ mod tests {
         assert_eq!(req.messages.len(), 1);
         assert_eq!(req.messages[0].role, Role::User);
         assert_eq!(req.messages[0].content, "hello there");
+    }
+
+    #[test]
+    fn compose_request_with_history_prepends_prior_pairs() {
+        // AC1 (unit): compose_request with two prior turns builds a
+        // [user, asst, user, asst, current_user] list (5 messages).
+        use crate::history::{History, Turn as HTurn};
+        let mut h = History::new(6);
+        h.push(HTurn {
+            user: "first question".to_string(),
+            assistant: "first answer".to_string(),
+            ts: 1,
+        });
+        h.push(HTurn {
+            user: "second question".to_string(),
+            assistant: "second answer".to_string(),
+            ts: 2,
+        });
+        let history_msgs = h.to_messages();
+        let req = compose_request("sonnet", "persona", &history_msgs, "third question");
+        assert_eq!(req.messages.len(), 5, "2 prior pairs + current user = 5");
+        assert_eq!(req.messages[0].role, Role::User);
+        assert_eq!(req.messages[0].content, "first question");
+        assert_eq!(req.messages[1].role, Role::Assistant);
+        assert_eq!(req.messages[1].content, "first answer");
+        assert_eq!(req.messages[2].role, Role::User);
+        assert_eq!(req.messages[2].content, "second question");
+        assert_eq!(req.messages[3].role, Role::Assistant);
+        assert_eq!(req.messages[3].content, "second answer");
+        assert_eq!(req.messages[4].role, Role::User);
+        assert_eq!(req.messages[4].content, "third question");
     }
 
     #[test]
@@ -3393,6 +3493,271 @@ mod tests {
         assert_eq!(reqs.len(), 2, "two turns dispatched");
         assert_eq!(reqs[0].model, canonical_model(crate::SHORT_MODEL_OPUS));
         assert_eq!(reqs[1].model, canonical_model(crate::DEFAULT_MODEL_NAME));
+    }
+
+    // --- turn-history integration tests (PRD-wmd-turn-history) ------------
+
+    /// A capturing LLM that returns a distinct text reply for each successive
+    /// call. The responses vec is consumed in order; if exhausted it panics
+    /// (test design error). Captures each `MessageRequest` for assertion.
+    struct SequenceLlm {
+        captured: Arc<StdMutex<Vec<MessageRequest>>>,
+        responses: Arc<StdMutex<Vec<String>>>,
+    }
+
+    impl SequenceLlm {
+        fn new(replies: Vec<&str>) -> Self {
+            Self {
+                captured: Arc::new(StdMutex::new(Vec::new())),
+                responses: Arc::new(StdMutex::new(
+                    replies.into_iter().map(str::to_string).collect(),
+                )),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for SequenceLlm {
+        async fn collect_messages(
+            &self,
+            req: &MessageRequest,
+        ) -> std::result::Result<Vec<StreamEvent>, ClientError> {
+            self.captured
+                .lock()
+                .expect("seq llm captured poisoned")
+                .push(req.clone());
+            let reply = self
+                .responses
+                .lock()
+                .expect("seq llm responses poisoned")
+                .remove(0);
+            Ok(vec![
+                StreamEvent::MessageStart,
+                StreamEvent::TextDelta { index: 0, text: reply },
+                StreamEvent::MessageStop,
+            ])
+        }
+    }
+
+    // AC1 — multi-turn request shape.
+    // Three sequential TurnUser dispatches through a SequenceLlm. On the 3rd
+    // turn the request must carry the prior two (user, assistant) pairs
+    // followed by the current user transcript: messages.len() == 5,
+    // alternating roles, last message is the 3rd user transcript.
+    #[tokio::test]
+    async fn turn_history_ac1_third_turn_carries_two_prior_pairs() {
+        let llm = SequenceLlm::new(vec!["reply one", "reply two", "reply three"]);
+        let captured = Arc::clone(&llm.captured);
+        let cfg = BrainConfig {
+            history_turns: 6,
+            ..BrainConfig::default()
+        };
+        let state = Arc::new(DaemonState::new(cfg).with_llm(Arc::new(llm)));
+
+        let turns = ["question one", "question two", "question three"];
+        for (i, t) in turns.iter().enumerate() {
+            let mut sink = MemSink::default();
+            dispatch(
+                state.as_ref(),
+                &mut sink,
+                Request::TurnUser(TurnUserEvent {
+                    transcript: (*t).to_string(),
+                    confidence: 1.0,
+                    ts: i as u64 + 1,
+                }),
+                i as u64 + 1,
+            )
+            .await
+            .expect("dispatch ok");
+        }
+
+        let reqs = captured.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 3, "three calls to the LLM");
+
+        // Turn 1: just one message (no history yet).
+        assert_eq!(reqs[0].messages.len(), 1);
+        assert_eq!(reqs[0].messages[0].role, Role::User);
+        assert_eq!(reqs[0].messages[0].content, "question one");
+
+        // Turn 2: prior (user, asst) pair + current user = 3 messages.
+        assert_eq!(reqs[1].messages.len(), 3);
+        assert_eq!(reqs[1].messages[0].role, Role::User);
+        assert_eq!(reqs[1].messages[0].content, "question one");
+        assert_eq!(reqs[1].messages[1].role, Role::Assistant);
+        assert_eq!(reqs[1].messages[1].content, "reply one");
+        assert_eq!(reqs[1].messages[2].role, Role::User);
+        assert_eq!(reqs[1].messages[2].content, "question two");
+
+        // Turn 3: two prior (user, asst) pairs + current user = 5 messages.
+        assert_eq!(reqs[2].messages.len(), 5, "AC1: 5 messages on 3rd turn");
+        assert_eq!(reqs[2].messages[0].role, Role::User);
+        assert_eq!(reqs[2].messages[0].content, "question one");
+        assert_eq!(reqs[2].messages[1].role, Role::Assistant);
+        assert_eq!(reqs[2].messages[1].content, "reply one");
+        assert_eq!(reqs[2].messages[2].role, Role::User);
+        assert_eq!(reqs[2].messages[2].content, "question two");
+        assert_eq!(reqs[2].messages[3].role, Role::Assistant);
+        assert_eq!(reqs[2].messages[3].content, "reply two");
+        assert_eq!(reqs[2].messages[4].role, Role::User);
+        assert_eq!(reqs[2].messages[4].content, "question three");
+    }
+
+    // AC2 — ring bound.
+    // With history_turns=2, after 5 successful turns the 6th turn's request
+    // carries at most 2*2+1=5 messages; oldest turns are evicted first.
+    #[tokio::test]
+    async fn turn_history_ac2_ring_bound_evicts_oldest() {
+        let llm = SequenceLlm::new(vec!["r1", "r2", "r3", "r4", "r5", "r6"]);
+        let captured = Arc::clone(&llm.captured);
+        let cfg = BrainConfig {
+            history_turns: 2,
+            ..BrainConfig::default()
+        };
+        let state = Arc::new(DaemonState::new(cfg).with_llm(Arc::new(llm)));
+
+        for i in 0u64..6 {
+            let mut sink = MemSink::default();
+            dispatch(
+                state.as_ref(),
+                &mut sink,
+                Request::TurnUser(TurnUserEvent {
+                    transcript: format!("q{i}"),
+                    confidence: 1.0,
+                    ts: i,
+                }),
+                i,
+            )
+            .await
+            .expect("dispatch ok");
+        }
+
+        let reqs = captured.lock().unwrap().clone();
+        // The 6th request (index 5) must carry at most 2*2+1=5 messages.
+        let sixth = &reqs[5];
+        assert!(
+            sixth.messages.len() <= 5,
+            "AC2: ring bound should cap at 5 messages on 6th turn, got {}",
+            sixth.messages.len()
+        );
+        // Last message is always the current user turn.
+        assert_eq!(sixth.messages.last().unwrap().role, Role::User);
+        assert_eq!(sixth.messages.last().unwrap().content, "q5");
+    }
+
+    // AC3 — failures don't pollute history.
+    // A turn whose LLM call errors adds nothing to history; the next
+    // successful turn's request shows the prior successful turn only.
+    #[tokio::test]
+    async fn turn_history_ac3_failed_turn_not_added_to_history() {
+        // Turn 1: success ("reply one"), Turn 2: error, Turn 3: success ("reply three").
+        // Turn 3's request should carry only turn 1's (user, asst) pair — turn 2 is absent.
+        struct FailOnSecondCall {
+            captured: Arc<StdMutex<Vec<MessageRequest>>>,
+            calls: Arc<StdMutex<u32>>,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmClient for FailOnSecondCall {
+            async fn collect_messages(
+                &self,
+                req: &MessageRequest,
+            ) -> std::result::Result<Vec<StreamEvent>, ClientError> {
+                let mut calls = self.calls.lock().unwrap();
+                *calls += 1;
+                self.captured.lock().unwrap().push(req.clone());
+                if *calls == 2 {
+                    return Err(ClientError::Status {
+                        code: 500,
+                        body: "simulated failure".to_string(),
+                    });
+                }
+                let reply = if *calls == 1 { "reply one" } else { "reply three" };
+                Ok(vec![
+                    StreamEvent::MessageStart,
+                    StreamEvent::TextDelta { index: 0, text: reply.to_string() },
+                    StreamEvent::MessageStop,
+                ])
+            }
+        }
+
+        let captured = Arc::new(StdMutex::new(Vec::new()));
+        let llm = FailOnSecondCall {
+            captured: Arc::clone(&captured),
+            calls: Arc::new(StdMutex::new(0)),
+        };
+        let cfg = BrainConfig {
+            history_turns: 6,
+            ..BrainConfig::default()
+        };
+        let state = Arc::new(DaemonState::new(cfg).with_llm(Arc::new(llm)));
+
+        let turns = ["success q1", "fail q2", "success q3"];
+        for (i, t) in turns.iter().enumerate() {
+            let mut sink = MemSink::default();
+            let _ = dispatch(
+                state.as_ref(),
+                &mut sink,
+                Request::TurnUser(TurnUserEvent {
+                    transcript: (*t).to_string(),
+                    confidence: 1.0,
+                    ts: i as u64,
+                }),
+                i as u64,
+            )
+            .await;
+        }
+
+        let reqs = captured.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 3, "three LLM calls attempted");
+
+        // Turn 3 request should only carry turn 1's pair (turn 2 failed → not stored).
+        let third = &reqs[2];
+        assert_eq!(
+            third.messages.len(),
+            3,
+            "AC3: only 1 prior successful pair + current user = 3 msgs; got {}",
+            third.messages.len()
+        );
+        assert_eq!(third.messages[0].role, Role::User);
+        assert_eq!(third.messages[0].content, "success q1");
+        assert_eq!(third.messages[1].role, Role::Assistant);
+        assert_eq!(third.messages[1].content, "reply one");
+        assert_eq!(third.messages[2].role, Role::User);
+        assert_eq!(third.messages[2].content, "success q3");
+    }
+
+    // AC4 — history_turns=0 restores single-message behaviour.
+    #[tokio::test]
+    async fn turn_history_ac4_disabled_single_message() {
+        let llm = SequenceLlm::new(vec!["r1", "r2"]);
+        let captured = Arc::clone(&llm.captured);
+        let cfg = BrainConfig {
+            history_turns: 0,
+            ..BrainConfig::default()
+        };
+        let state = Arc::new(DaemonState::new(cfg).with_llm(Arc::new(llm)));
+
+        for i in 0u64..2 {
+            let mut sink = MemSink::default();
+            dispatch(
+                state.as_ref(),
+                &mut sink,
+                Request::TurnUser(TurnUserEvent {
+                    transcript: format!("q{i}"),
+                    confidence: 1.0,
+                    ts: i,
+                }),
+                i,
+            )
+            .await
+            .expect("dispatch ok");
+        }
+
+        let reqs = captured.lock().unwrap().clone();
+        // Both requests must carry exactly 1 message each.
+        assert_eq!(reqs[0].messages.len(), 1, "AC4: first turn single message");
+        assert_eq!(reqs[1].messages.len(), 1, "AC4: second turn still single message with history disabled");
+        assert_eq!(reqs[1].messages[0].content, "q1");
     }
 
     // --- ladder integration through dispatch() ----------------------------

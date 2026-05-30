@@ -57,10 +57,10 @@ name = "wmd"
 path = "src/main.rs"
 
 [dependencies]
-agorabus = { path = "../agorabus", version = "0.4" }
-wm-local-llm = { path = "../wm-local-llm", version = "0.1" }
-wm-verify = { path = "../wm-verify", version = "0.1" }
-wm-router = { path = "../wm-router", version = "0.1" }
+agorabus = { path = "/home/jsy/wintermute/agorabus", version = "0.4" }
+wm-local-llm = { path = "/home/jsy/wintermute/wm-local-llm", version = "0.1" }
+wm-verify = { path = "/home/jsy/wintermute/wm-verify", version = "0.1" }
+wm-router = { path = "/home/jsy/wintermute/wm-router", version = "0.1" }
 anyhow = "1"
 async-trait = "0.1"
 bytes = "1"

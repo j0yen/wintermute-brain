@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 pub mod anthropic;
 pub mod bus;
 pub mod daemon;
+pub mod history;
 pub mod ladder;
 pub mod persist;
 pub mod recall_client;
@@ -54,6 +55,11 @@ pub const THREAD_SUBJECT_PREFIX: &str = "wintermute-thread-";
 /// Default config file location relative to `$XDG_CONFIG_HOME`. The
 /// daemon persists the per-turn + default-model swaps here. iter-1 log.
 pub const DEFAULT_CONFIG_BASENAME: &str = "wintermute/brain.toml";
+
+/// Default number of recent `(user, assistant)` turn pairs retained in the
+/// in-memory history ring. `0` disables history (single-message behaviour).
+/// PRD-wmd-turn-history §2.3.
+pub const DEFAULT_HISTORY_TURNS: usize = 6;
 
 /// Short and canonical model names the daemon accepts on the CLI and
 /// in config files. PRD §2.6 promises Sonnet/Opus; the backend-ladder
@@ -197,6 +203,12 @@ pub struct BrainConfig {
     /// PRD-brain-backend-ladder §2.1.
     #[serde(default = "default_local_endpoint")]
     pub local_endpoint: String,
+    /// Number of recent `(user, assistant)` turn pairs retained in the
+    /// in-memory rolling history ring. `0` disables history (restores
+    /// single-message behaviour). Persisted through `brain.toml`.
+    /// PRD-wmd-turn-history §2.3.
+    #[serde(default = "default_history_turns")]
+    pub history_turns: usize,
 }
 
 impl Default for BrainConfig {
@@ -212,6 +224,7 @@ impl Default for BrainConfig {
             default_tier: default_tier(),
             pending_tier: None,
             local_endpoint: default_local_endpoint(),
+            history_turns: default_history_turns(),
         }
     }
 }
@@ -226,6 +239,10 @@ fn default_tier() -> String {
 
 fn default_local_endpoint() -> String {
     DEFAULT_LOCAL_ENDPOINT.to_string()
+}
+
+fn default_history_turns() -> usize {
+    DEFAULT_HISTORY_TURNS
 }
 
 fn default_api_key_env() -> String {
@@ -391,6 +408,7 @@ impl BrainConfig {
             default_tier,
             pending_tier: None,
             local_endpoint,
+            history_turns: default_history_turns(),
         })
     }
 
