@@ -322,6 +322,42 @@ mod tests {
         assert_eq!(p, PathBuf::from("/tmp/xdg-wins/wintermute/brain.toml"));
     }
 
+    // AC7 — history_turns persists through brain.toml write/reload.
+    #[test]
+    fn history_turns_round_trips_through_file() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("brain.toml");
+        let original = BrainConfig {
+            history_turns: 3,
+            ..BrainConfig::default()
+        };
+        original.save_to_file(&path).expect("save");
+        let loaded = BrainConfig::load_from_file(&path).expect("load");
+        assert_eq!(
+            loaded.history_turns,
+            3,
+            "AC7: history_turns round-trips through brain.toml"
+        );
+    }
+
+    // AC7 — history_turns=0 (disabled) persists through brain.toml.
+    #[test]
+    fn history_turns_disabled_round_trips_through_file() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("brain.toml");
+        let original = BrainConfig {
+            history_turns: 0,
+            ..BrainConfig::default()
+        };
+        original.save_to_file(&path).expect("save");
+        let loaded = BrainConfig::load_from_file(&path).expect("load");
+        assert_eq!(
+            loaded.history_turns,
+            0,
+            "AC7: history_turns=0 (disabled) round-trips through brain.toml"
+        );
+    }
+
     #[test]
     fn pending_model_swap_persists_across_reload() {
         // AC6 acceptance-test seed: swap-model writes pending_model;

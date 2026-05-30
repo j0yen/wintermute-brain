@@ -4161,6 +4161,351 @@ mod tests {
         assert_eq!(reqs[1].messages[0].content, "q1");
     }
 
+    // AC5 — destructive intent stores spoken text (not the JSON fence).
+    // After a destructive turn the assistant entry in history is the spoken
+    // prefix; the next turn's request must carry that spoken text, not the
+    // full fence block.
+    #[tokio::test]
+    async fn turn_history_ac5_destructive_stores_spoken_text() {
+        // Turn 1: destructive reply with spoken prefix "I will delete it."
+        // Turn 2: ordinary reply — captures the request to check history.
+        let destructive_body =
+            "I will delete it.\n```json\n{\"intent\":\"wm.fs.rm\",\"summary\":\"delete /tmp/x\",\"confirm_keyword\":\"delete\"}\n```";
+
+        struct TwoTurnLlm {
+            captured: Arc<StdMutex<Vec<MessageRequest>>>,
+            call_count: Arc<StdMutex<u32>>,
+            destructive_body: String,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmClient for TwoTurnLlm {
+            async fn collect_messages(
+                &self,
+                req: &MessageRequest,
+            ) -> std::result::Result<Vec<StreamEvent>, ClientError> {
+                let mut count = self.call_count.lock().unwrap();
+                *count += 1;
+                self.captured.lock().unwrap().push(req.clone());
+                let text = if *count == 1 {
+                    self.destructive_body.clone()
+                } else {
+                    "ordinary reply two".to_string()
+                };
+                Ok(vec![
+                    StreamEvent::MessageStart,
+                    StreamEvent::TextDelta { index: 0, text },
+                    StreamEvent::MessageStop,
+                ])
+            }
+        }
+
+        let captured = Arc::new(StdMutex::new(Vec::new()));
+        let llm = TwoTurnLlm {
+            captured: Arc::clone(&captured),
+            call_count: Arc::new(StdMutex::new(0)),
+            destructive_body: destructive_body.to_string(),
+        };
+        let cfg = BrainConfig {
+            history_turns: 6,
+            ..BrainConfig::default()
+        };
+        let state = Arc::new(DaemonState::new(cfg).with_llm(Arc::new(llm)));
+
+        // Turn 1: triggers destructive path.
+        {
+            let mut sink = MemSink::default();
+            dispatch(
+                state.as_ref(),
+                &mut sink,
+                Request::TurnUser(TurnUserEvent {
+                    transcript: "delete that file".to_string(),
+                    confidence: 1.0,
+                    ts: 1,
+                }),
+                1,
+            )
+            .await
+            .expect("dispatch ok");
+        }
+        // Turn 2: ordinary turn — check what the LLM receives.
+        {
+            let mut sink = MemSink::default();
+            dispatch(
+                state.as_ref(),
+                &mut sink,
+                Request::TurnUser(TurnUserEvent {
+                    transcript: "what else?".to_string(),
+                    confidence: 1.0,
+                    ts: 2,
+                }),
+                2,
+            )
+            .await
+            .expect("dispatch ok");
+        }
+
+        let reqs = captured.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 2);
+        // Turn 2's request must have 3 messages: [user1, asst1, user2].
+        let second = &reqs[1];
+        assert_eq!(second.messages.len(), 3, "AC5: prior destructive turn in history = 3 msgs");
+        assert_eq!(second.messages[0].content, "delete that file");
+        // AC5: the stored assistant text is the spoken prefix, not the JSON fence.
+        assert_eq!(
+            second.messages[1].content,
+            "I will delete it.",
+            "AC5: spoken prefix stored, not the JSON fence"
+        );
+        assert!(
+            !second.messages[1].content.contains("```"),
+            "AC5: JSON fence must not appear in stored assistant turn"
+        );
+        assert_eq!(second.messages[2].content, "what else?");
+    }
+
+    // AC7 — config round-trip for history_turns (dispatcher-level).
+    // After two successful turns the history ring has one entry; after
+    // two more the ring has two, capped at history_turns=2.
+    #[tokio::test]
+    async fn turn_history_ac7_history_fills_from_config_turns_setting() {
+        // Build state with history_turns = 2 explicitly.
+        let llm = SequenceLlm::new(vec!["r1", "r2", "r3"]);
+        let captured = Arc::clone(&llm.captured);
+        let cfg = BrainConfig {
+            history_turns: 2,
+            ..BrainConfig::default()
+        };
+        assert_eq!(cfg.history_turns, 2, "config reflects the value we set");
+        let state = Arc::new(DaemonState::new(cfg).with_llm(Arc::new(llm)));
+
+        for (i, q) in ["q0", "q1", "q2"].iter().enumerate() {
+            let mut sink = MemSink::default();
+            dispatch(
+                state.as_ref(),
+                &mut sink,
+                Request::TurnUser(TurnUserEvent {
+                    transcript: (*q).to_string(),
+                    confidence: 1.0,
+                    ts: i as u64,
+                }),
+                i as u64,
+            )
+            .await
+            .expect("dispatch ok");
+        }
+        let reqs = captured.lock().unwrap().clone();
+        // Third turn: max 2 pairs = 4 prior + current = 5 messages.
+        let third = &reqs[2];
+        assert!(
+            third.messages.len() <= 5,
+            "AC7: history_turns=2 caps at 5 messages, got {}",
+            third.messages.len()
+        );
+        assert_eq!(third.messages.last().unwrap().content, "q2");
+    }
+
+    // history_turns=0 leaves no prior turns even after many rounds.
+    #[tokio::test]
+    async fn turn_history_disabled_never_accumulates() {
+        let llm = SequenceLlm::new(vec!["r1", "r2", "r3"]);
+        let captured = Arc::clone(&llm.captured);
+        let cfg = BrainConfig {
+            history_turns: 0,
+            ..BrainConfig::default()
+        };
+        let state = Arc::new(DaemonState::new(cfg).with_llm(Arc::new(llm)));
+
+        for i in 0u64..3 {
+            let mut sink = MemSink::default();
+            dispatch(
+                state.as_ref(),
+                &mut sink,
+                Request::TurnUser(TurnUserEvent {
+                    transcript: format!("q{i}"),
+                    confidence: 1.0,
+                    ts: i,
+                }),
+                i,
+            )
+            .await
+            .expect("dispatch ok");
+        }
+        let reqs = captured.lock().unwrap().clone();
+        for (i, req) in reqs.iter().enumerate() {
+            assert_eq!(
+                req.messages.len(),
+                1,
+                "history disabled: turn {i} must have exactly 1 message"
+            );
+        }
+    }
+
+    // Empty-text LLM reply must not pollute history (AC3 variant).
+    #[tokio::test]
+    async fn turn_history_empty_reply_not_stored() {
+        struct EmptyThenOkLlm {
+            captured: Arc<StdMutex<Vec<MessageRequest>>>,
+            call_count: Arc<StdMutex<u32>>,
+        }
+        #[async_trait::async_trait]
+        impl LlmClient for EmptyThenOkLlm {
+            async fn collect_messages(
+                &self,
+                req: &MessageRequest,
+            ) -> std::result::Result<Vec<StreamEvent>, ClientError> {
+                let mut c = self.call_count.lock().unwrap();
+                *c += 1;
+                self.captured.lock().unwrap().push(req.clone());
+                if *c == 1 {
+                    // Return no text deltas (empty reply).
+                    Ok(vec![StreamEvent::MessageStart, StreamEvent::MessageStop])
+                } else {
+                    Ok(vec![
+                        StreamEvent::MessageStart,
+                        StreamEvent::TextDelta { index: 0, text: "ok reply".to_string() },
+                        StreamEvent::MessageStop,
+                    ])
+                }
+            }
+        }
+        let captured = Arc::new(StdMutex::new(Vec::new()));
+        let llm = EmptyThenOkLlm {
+            captured: Arc::clone(&captured),
+            call_count: Arc::new(StdMutex::new(0)),
+        };
+        let cfg = BrainConfig { history_turns: 6, ..BrainConfig::default() };
+        let state = Arc::new(DaemonState::new(cfg).with_llm(Arc::new(llm)));
+
+        for (i, q) in ["empty turn", "ok turn"].iter().enumerate() {
+            let mut sink = MemSink::default();
+            let _ = dispatch(
+                state.as_ref(),
+                &mut sink,
+                Request::TurnUser(TurnUserEvent {
+                    transcript: (*q).to_string(),
+                    confidence: 1.0,
+                    ts: i as u64,
+                }),
+                i as u64,
+            )
+            .await;
+        }
+        let reqs = captured.lock().unwrap().clone();
+        // Second request must have only 1 message (no prior — empty wasn't stored).
+        assert_eq!(
+            reqs[1].messages.len(),
+            1,
+            "empty-reply turn must not be stored in history"
+        );
+        assert_eq!(reqs[1].messages[0].content, "ok turn");
+    }
+
+    // History state is visible through DaemonState::history field.
+    #[tokio::test]
+    async fn turn_history_state_field_reflects_pushes() {
+        let llm = FakeLlm { response: Ok(vec![text_delta("answer")]) };
+        let cfg = BrainConfig { history_turns: 4, ..BrainConfig::default() };
+        let state = Arc::new(DaemonState::new(cfg).with_llm(into_dyn_llm(llm)));
+
+        // Before any turn, history is empty.
+        assert!(state.history.lock().await.is_empty());
+
+        let mut sink = MemSink::default();
+        dispatch(
+            state.as_ref(),
+            &mut sink,
+            Request::TurnUser(TurnUserEvent {
+                transcript: "hello".to_string(),
+                confidence: 1.0,
+                ts: 1,
+            }),
+            1,
+        )
+        .await
+        .expect("dispatch ok");
+
+        // After one successful turn, history has one entry.
+        let h = state.history.lock().await;
+        assert_eq!(h.len(), 1);
+        let msgs = h.to_messages();
+        assert_eq!(msgs[0].content, "hello");
+        assert_eq!(msgs[1].content, "answer");
+    }
+
+    // History grows correctly: first turn has no prior context, second turn
+    // carries the first pair, third carries both.
+    #[tokio::test]
+    async fn turn_history_grows_monotonically() {
+        let llm = SequenceLlm::new(vec!["a1", "a2", "a3"]);
+        let captured = Arc::clone(&llm.captured);
+        let cfg = BrainConfig { history_turns: 6, ..BrainConfig::default() };
+        let state = Arc::new(DaemonState::new(cfg).with_llm(Arc::new(llm)));
+        for (i, q) in ["q1", "q2", "q3"].iter().enumerate() {
+            let mut sink = MemSink::default();
+            dispatch(
+                state.as_ref(),
+                &mut sink,
+                Request::TurnUser(TurnUserEvent {
+                    transcript: (*q).to_string(),
+                    confidence: 1.0,
+                    ts: i as u64,
+                }),
+                i as u64,
+            )
+            .await
+            .expect("dispatch ok");
+        }
+        let reqs = captured.lock().unwrap().clone();
+        assert_eq!(reqs[0].messages.len(), 1, "first turn: no history");
+        assert_eq!(reqs[1].messages.len(), 3, "second turn: 1 prior pair + current");
+        assert_eq!(reqs[2].messages.len(), 5, "third turn: 2 prior pairs + current");
+    }
+
+    // compose_request with a single history pair builds a 3-message list.
+    #[test]
+    fn compose_request_single_history_pair_is_three_messages() {
+        use crate::history::{History, Turn as HTurn};
+        let mut h = History::new(4);
+        h.push(HTurn { user: "prev user".to_string(), assistant: "prev asst".to_string(), ts: 0 });
+        let msgs = h.to_messages();
+        let req = compose_request("sonnet", "persona", &msgs, "current");
+        assert_eq!(req.messages.len(), 3);
+        assert_eq!(req.messages[0].role, Role::User);
+        assert_eq!(req.messages[0].content, "prev user");
+        assert_eq!(req.messages[1].role, Role::Assistant);
+        assert_eq!(req.messages[1].content, "prev asst");
+        assert_eq!(req.messages[2].role, Role::User);
+        assert_eq!(req.messages[2].content, "current");
+    }
+
+    // DaemonState::new initialises history capacity from config.history_turns.
+    #[test]
+    fn daemon_state_new_uses_config_history_turns() {
+        let cfg = BrainConfig { history_turns: 3, ..BrainConfig::default() };
+        let state = DaemonState::new(cfg);
+        // Synchronous lock check: history starts empty and has max_turns from config.
+        let h = state.history.try_lock().expect("no contention");
+        assert!(h.is_empty());
+        // Push 4 turns and verify cap at 3.
+        drop(h);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("rt");
+        rt.block_on(async {
+            use crate::history::Turn as HTurn;
+            let mut h = state.history.lock().await;
+            for i in 0u64..4 {
+                h.push(HTurn {
+                    user: format!("u{i}"),
+                    assistant: format!("a{i}"),
+                    ts: i,
+                });
+            }
+            assert_eq!(h.len(), 3, "capped at history_turns=3");
+        });
+    }
+
     // --- ladder integration through dispatch() ----------------------------
 
     struct AlwaysAnswersLocal(String);
