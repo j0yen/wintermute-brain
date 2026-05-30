@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.6.0 — 2026-05-30
+
+feat(degrade): graceful-degradation phrase bank, aggregator, and health snapshot
+
+Adds src/degrade.rs with: phrase bank (9 error kinds + fallback), RateLimitState
+(30-s per-kind gate), HealthState (4 components), process_error_envelope aggregator.
+Wires error-topic subscriptions and health snapshot ticker (60 s) into daemon.rs.
++16 lib tests; 239 total pass.
+
 ## v0.5.1 — 2026-05-29
 
 PRD-wmd-turn-history: complete test coverage pass — add 10 new integration
