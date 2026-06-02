@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.12.0 — 2026-06-02
+
+hearth-persona-config: lift the companion's persona out of a hardcoded `const` into a configurable `[persona]` table in `brain.toml`.
+
+- New `PersonaConfig` + `Register` enum (WarmElder default, Plain, Brisk) in `lib.rs`; all fields `#[serde(default)]` so existing configs load unchanged.
+- `Register::compose_base` builds the persona prose with `{self_name}`/`{user_name}` substitution; WarmElder is calibrated for a non-technical elder (short sentences, no jargon), Plain reproduces the retained `DEFAULT_PERSONA` byte-for-byte.
+- Persona composed once at config load (`DaemonState::new`) so it stays a byte-stable prompt-cache prefix; per-turn recall/recap still layer after via `compose_persona`.
+- CLI: `wmd persona show` and `wmd persona set-register <warm-elder|plain|brisk>` (atomic-write, mirrors swap-model).
+- 9 new lib tests (deserialization defaults, per-field override, register→prose, name substitution, user-clause omission, cache-prefix stability, extra append, serde round-trip). 311 tests pass.
+
 ## v0.11.0 — 2026-06-02
 
 brain-backend-ladder: local-first tier ladder for wintermute-brain.
