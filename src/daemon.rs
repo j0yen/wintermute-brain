@@ -1076,13 +1076,17 @@ impl DaemonState {
             config.idle_gap_ms,
             config.session_end_phrases.clone(),
         );
+        // Compose the persona base once at config-load time so the
+        // string is byte-stable across turns (prompt-cache discipline,
+        // PRD-hearth-persona-config §2.3).
+        let persona_base = config.persona.compose_base(config.user_name.as_deref());
         Self {
             config: Mutex::new(config),
             config_path: None,
             llm: None,
             recall: Arc::new(NullRecall),
             tool_router: Arc::new(NoToolsRouter),
-            persona: DEFAULT_PERSONA.to_string(),
+            persona: persona_base,
             pending: Mutex::new(HashMap::new()),
             intent_counter: AtomicU64::new(0),
             ladder: None,
@@ -3640,7 +3644,16 @@ mod tests {
         assert_eq!(calls.len(), 1);
         let system = calls[0].system.as_deref().expect("system spliced");
         assert!(system.contains("She prefers chamomile tea."));
-        assert!(system.starts_with(DEFAULT_PERSONA));
+        // The default persona is now composed from PersonaConfig (WarmElder);
+        // verify the base appears at the start rather than hard-coding the
+        // old DEFAULT_PERSONA const (PRD-hearth-persona-config §2.3).
+        let expected_base = BrainConfig::default()
+            .persona
+            .compose_base(BrainConfig::default().user_name.as_deref());
+        assert!(
+            system.starts_with(&expected_base),
+            "system prompt should start with composed persona base"
+        );
         assert!(
             !system.contains(CHILD_LOCK_GUARD),
             "child-lock off in default config"
@@ -3701,8 +3714,13 @@ mod tests {
         assert_eq!(events[0].1["text"], "fallback reply");
         let calls = captured.lock().unwrap();
         let system = calls[0].system.as_deref().expect("system");
+        // The persona base is now composed from PersonaConfig; verify the
+        // default composed base is preserved on recall error.
+        let expected_base = BrainConfig::default()
+            .persona
+            .compose_base(BrainConfig::default().user_name.as_deref());
         assert!(
-            system.starts_with(DEFAULT_PERSONA),
+            system.starts_with(&expected_base),
             "persona base preserved on recall error"
         );
         assert!(
