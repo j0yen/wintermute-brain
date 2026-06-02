@@ -45,6 +45,7 @@ use crate::recall_client::{self, QueryArgs, QueryHit, RecallClient, TouchArgs};
 use crate::session::{AdvanceOutcome, CloseReason, SessionTracker};
 use crate::repair::{self, Repair};
 use crate::writeback::{ExtractorClient, WritebackGuard};
+use crate::router::{RouteEvent, RouteTier, apply_routing_policy, PolicyInputs, canned_phrase};
 use crate::{BrainConfig, PROFILE_SUBJECT, THREAD_SUBJECT_PREFIX, canonical_model};
 
 /// Default upper bound on tokens the daemon requests per turn.
@@ -1937,7 +1938,7 @@ async fn handle_turn_user_ladder(
     state: &DaemonState,
     publish: &mut dyn EventSink,
     model: &str,
-    tier: &str,
+    _tier: &str,
     child_lock: bool,
     turn: &TurnUserEvent,
     now_ms: u64,
@@ -1945,6 +1946,69 @@ async fn handle_turn_user_ladder(
     let Some(ladder) = state.ladder.as_ref() else {
         return Ok(());
     };
+
+    // --- Routing policy (PRD-wintermute-brain-routing §2.2) ---
+    //
+    // Compute the routing decision before the ladder runs. The decision
+    // supplies an *advisory* starting tier and a machine-readable reason for
+    // the `wm.brain.route` observability envelope.
+    let (routing_config, pending_tier_override, api_key_present) = {
+        let cfg = state.config.lock().await;
+        (
+            cfg.routing.clone(),
+            cfg.pending_tier.clone(),
+            !std::env::var(&cfg.api_key_env).unwrap_or_default().is_empty(),
+        )
+    };
+    // Reachability is currently derived from whether we have an API key and the
+    // ladder has an Anthropic client — a lightweight heuristic that avoids a
+    // blocking TCP probe on the hot path. A full TTL-cached probe is deferred
+    // to a later iteration.
+    let online = api_key_present;
+    let route_decision = apply_routing_policy(&PolicyInputs {
+        transcript: turn.transcript.clone(),
+        pending_tier_override,
+        api_key_present,
+        online,
+        prefer: routing_config.prefer,
+        command_max_words: routing_config.command_max_words,
+    });
+    // Advisory starting tier from routing policy; the ladder may escalate further.
+    let routing_start_tier = match route_decision.tier {
+        RouteTier::Local => crate::TIER_LOCAL_3B,
+        RouteTier::Cloud => crate::SHORT_MODEL_SONNET,
+        RouteTier::Canned => {
+            // Both backends are flagged unavailable by policy.
+            // Emit a canned phrase and publish route event.
+            let turn_count = state.intent_counter.load(Ordering::Relaxed);
+            #[allow(clippy::as_conversions, reason = "small counter index")]
+            let phrase_idx: usize = turn_count as usize;
+            let phrase = canned_phrase(phrase_idx);
+            let reply = ReplyEvent { text: phrase.to_string(), ts: now_ms, loudness: None };
+            publish
+                .publish(outgoing::REPLY, serde_json::to_value(&reply)?)
+                .await
+                .context("publish canned reply")?;
+            let route_evt = RouteEvent {
+                turn_id: now_ms,
+                tier: RouteTier::Canned,
+                reason: route_decision.reason.as_str().to_string(),
+                latency_ms: Some(0),
+                model: "canned".to_string(),
+                ts: now_ms,
+            };
+            if let Ok(v) = serde_json::to_value(&route_evt) {
+                if let Err(e) = publish.publish(outgoing::ROUTE, v).await {
+                    warn!(err = %e, "wm-brain: failed to publish route event (canned)");
+                }
+            }
+            return Ok(());
+        }
+    };
+    // The caller-supplied `tier` is the config default; the routing decision
+    // may override it (e.g. command → local-3b even when config default is sonnet).
+    let effective_tier = routing_start_tier;
+
     let hits = match state.recall.fetch(&turn.transcript).await {
         Ok(h) => h,
         Err(err) => {
@@ -1962,10 +2026,12 @@ async fn handle_turn_user_ladder(
     };
     let req = compose_request(model, &persona, &history_msgs, &turn.transcript);
 
+    let start_ms = crate::bus::now_unix_ms();
     let sink = crate::ladder::BufferingSink::default();
     let outcome = ladder
-        .run_turn_sticky(&turn.transcript, &req, tier, &sink, &state.session_floor)
+        .run_turn_sticky(&turn.transcript, &req, effective_tier, &sink, &state.session_floor)
         .await;
+    let latency_ms = crate::bus::now_unix_ms().saturating_sub(start_ms);
 
     // Publish any filler backchannels first (AC9), then the answer.
     for filler in sink.take_fillers() {
@@ -1984,7 +2050,26 @@ async fn handle_turn_user_ladder(
                 // Do NOT push empty-answer turns to history (AC3).
                 return Ok(());
             }
-            info!(tier = %served, "wm-brain ladder: turn served");
+            info!(
+                tier = %served,
+                reason = %route_decision.reason.as_str(),
+                latency_ms = latency_ms,
+                "wm-brain ladder: turn served"
+            );
+            // Publish wm.brain.route observability event (PRD §2.5).
+            let route_evt = RouteEvent {
+                turn_id: now_ms,
+                tier: route_decision.tier,
+                reason: route_decision.reason.as_str().to_string(),
+                latency_ms: Some(latency_ms),
+                model: served.clone(),
+                ts: now_ms,
+            };
+            if let Ok(v) = serde_json::to_value(&route_evt) {
+                if let Err(e) = publish.publish(outgoing::ROUTE, v).await {
+                    warn!(err = %e, "wm-brain: failed to publish route event");
+                }
+            }
             touch_recalled_hits(state.recall.as_ref(), &hits).await;
             if let Some((intent, spoken)) = parse_destructive_intent(&text) {
                 // Store the spoken prefix (AC5 — destructive turns store
@@ -2018,7 +2103,30 @@ async fn handle_turn_user_ladder(
         }
         crate::ladder::LadderOutcome::Degraded { reason } => {
             error!(reason = %reason, "wm-brain ladder: turn degraded (no tier could serve)");
-            publish_error_at(publish, "ladder", &reason, now_ms).await?;
+            // Publish a canned degrade phrase rather than going silent (AC7).
+            let turn_count = state.intent_counter.load(Ordering::Relaxed);
+            #[allow(clippy::as_conversions, reason = "small counter index")]
+            let phrase_idx: usize = turn_count as usize;
+            let phrase = canned_phrase(phrase_idx);
+            let reply = ReplyEvent { text: phrase.to_string(), ts: now_ms, loudness: None };
+            publish
+                .publish(outgoing::REPLY, serde_json::to_value(&reply)?)
+                .await
+                .context("publish canned degrade reply")?;
+            // Publish route event with canned tier.
+            let route_evt = RouteEvent {
+                turn_id: now_ms,
+                tier: RouteTier::Canned,
+                reason: crate::router::RouteReason::TotalFailure.as_str().to_string(),
+                latency_ms: Some(latency_ms),
+                model: "canned".to_string(),
+                ts: now_ms,
+            };
+            if let Ok(v) = serde_json::to_value(&route_evt) {
+                if let Err(e) = publish.publish(outgoing::ROUTE, v).await {
+                    warn!(err = %e, "wm-brain: failed to publish route event (degraded)");
+                }
+            }
             // Do NOT push degraded turns to history (AC3).
         }
     }
@@ -5377,12 +5485,22 @@ mod tests {
         .await
         .expect("dispatch ok");
         let events = sink.non_session_events();
-        assert_eq!(events.len(), 1, "exactly one reply published");
-        assert_eq!(events[0].0, outgoing::REPLY);
+        // A ladder turn now publishes wm.brain.reply + wm.brain.route (PRD-brain-routing §2.5).
+        let reply_events: Vec<_> = events
+            .iter()
+            .filter(|(t, _)| t == outgoing::REPLY)
+            .collect();
+        assert_eq!(reply_events.len(), 1, "exactly one reply published");
         assert_eq!(
-            events[0].1["text"],
+            reply_events[0].1["text"],
             "It's a calm, pleasant afternoon here."
         );
+        // A route event is also published.
+        let route_events: Vec<_> = events
+            .iter()
+            .filter(|(t, _)| t == outgoing::ROUTE)
+            .collect();
+        assert_eq!(route_events.len(), 1, "exactly one route event published");
     }
 
     // ── almanac-acknowledge integration tests (PRD-almanac-acknowledge) ────────

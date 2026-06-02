@@ -203,6 +203,7 @@ pub mod ladder;
 pub mod persist;
 pub mod recall_client;
 pub mod repair;
+pub mod router;
 pub mod session;
 pub mod writeback;
 pub use persist::default_config_path;
@@ -463,6 +464,12 @@ pub struct BrainConfig {
     /// PRD-hearth-persona-config §2.1.
     #[serde(default)]
     pub persona: PersonaConfig,
+    /// Routing policy configuration — tier preference, classifier tuning,
+    /// Ollama endpoint, cloud timeout.  All fields default so existing
+    /// `brain.toml` files without a `[routing]` section load fine.
+    /// PRD-wintermute-brain-routing §2.4.
+    #[serde(default)]
+    pub routing: crate::router::RoutingConfig,
 }
 
 impl Default for BrainConfig {
@@ -490,6 +497,7 @@ impl Default for BrainConfig {
             repair_repeat_phrases: Vec::new(),
             repair_louder_phrases: Vec::new(),
             persona: PersonaConfig::default(),
+            routing: crate::router::RoutingConfig::default(),
         }
     }
 }
@@ -760,6 +768,7 @@ impl BrainConfig {
             repair_repeat_phrases: Vec::new(),
             repair_louder_phrases: Vec::new(),
             persona: PersonaConfig::default(),
+            routing: crate::router::RoutingConfig::default(),
         })
     }
 
