@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.11.0 — 2026-06-02
+
+brain-backend-ladder: local-first tier ladder for wintermute-brain.
+
+Implements PRD-brain-backend-ladder: a 5-rung tier ladder (local-3b →
+local-8b → haiku → sonnet → opus) with LadderClient orchestrator,
+dual-signal escalation (hard LocalOutcome::Escalate + soft wm-verify
+reject), safety-override pre-route for high-stakes turns, conversational
+stickiness (SessionFloor), filler-while-escalating (ESCALATION_FILLER),
+key-gate relaxation (brain works with no Anthropic API key), and full
+config integration (default_tier, pending_tier, local_endpoint in
+brain.toml). Also fixes bus_smoke compile error: agorabus DaemonConfig
+gained drain_grace_ms/drain_resume_hint_ms fields.
+
+All 302+ tests green; no new clippy warnings beyond baseline.
+
 ## v0.9.0 — 2026-05-30
 
 Adds cross-session thread memory recall (wmd-session-recap): on session.start
