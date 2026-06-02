@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.15.0 — 2026-06-02
+
+brain-prompt-cache: make every brain turn pay for its prefix once.
+
+`wintermute-brain` previously re-sent and re-billed its entire stable prefix (persona, tool definitions, recall context, conversation history) at full input-token rate on every turn — the request carried no `cache_control` breakpoints. This version adds ephemeral `cache_control` breakpoints to the Anthropic request and restructures context composition so the stable persona prefix is cacheable and volatile per-turn recall context no longer busts the cache.
+
+- `MessageRequest`/`SystemField` now serialize `system` as a typed content-block array (`SystemBlock`) carrying optional `cache_control: {"type":"ephemeral"}`, with byte-identical plain-string fallback when no breakpoint is set.
+- Composition splits the cacheable persona prefix (base persona + child-lock + tool preamble, breakpoint on the last stable block) from the volatile recall/recap tail, which is positioned after the breakpoint so it never busts the cached prefix.
+- `cache_read_input_tokens` / `cache_creation_input_tokens` parsed from `message_start.usage` and emitted in a structured per-turn log line.
+- child-lock semantics unchanged (clause stays inside the cached prefix). 351 lib tests pass.
+
 ## v0.14.0 — 2026-06-02
 
 Add routing classifier and wm.brain.route observability to wintermute-brain.
