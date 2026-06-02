@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.13.0 — 2026-06-02
+
+Adds first-contact greeting module: GreetingMode (off/auto/first-ever-always), GreetingKind
+(FirstEver/Returning/Silent), RecallPresence probe struct, select_greeting_kind, compose_greeting,
+and GreetingGuard (greet-once). Extends PersonaConfig with `greeting` and `wake_word` fields.
+14 new lib tests cover all 6 automated ACs.
+
 ## v0.12.0 — 2026-06-02
 
 hearth-persona-config: lift the companion's persona out of a hardcoded `const` into a configurable `[persona]` table in `brain.toml`.
