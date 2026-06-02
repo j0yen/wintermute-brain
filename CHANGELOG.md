@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.15.1 — 2026-06-02
+
+brain-prompt-cache AC5: deterministic prompt-cache ratio test.
+
+Adds an in-process fake Anthropic client (CacheSimClient) that bills a request per the prompt-caching contract — the cache_control-terminated stable prefix is a write on turn 1 and a read on subsequent turns; volatile tail + messages are full-rate every turn. A new 50-turn fixture drives the real compose_request path and asserts sum(cache_read)/sum(input) >= 0.60, closing the PRD's AC5, which previously existed only as an #[ignore]-gated live-fleet test requiring a (currently exhausted) Anthropic API key. 352 lib tests pass.
+
 ## v0.15.0 — 2026-06-02
 
 brain-prompt-cache: make every brain turn pay for its prefix once.
