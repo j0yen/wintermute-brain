@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.14.0 — 2026-06-02
+
+Add routing classifier and wm.brain.route observability to wintermute-brain.
+
+New src/router.rs implements command-vs-conversational turn classification (deterministic, no model call on the hot path), a six-row routing policy table (PRD §2.2), RoutingConfig ([routing] brain.toml section), and a canned degrade phrase bank. The daemon now publishes wm.brain.route after every ladder turn with tier, reason, latency_ms, and model for operator observability. wmd gains `route status` and `route prefer` subcommands. 328 tests pass.
+
 ## v0.13.0 — 2026-06-02
 
 Adds first-contact greeting module: GreetingMode (off/auto/first-ever-always), GreetingKind
