@@ -14,15 +14,220 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+// ── PersonaConfig ─────────────────────────────────────────────────────────────
+
+/// Named register presets controlling the tone and vocabulary of the
+/// composed base persona.
+///
+/// `WarmElder` is the calibrated default — plain, warm prose tuned for a
+/// non-technical elder listener. `Plain` reproduces the original
+/// `DEFAULT_PERSONA` verbatim (no behaviour change). `Brisk` is a terse
+/// professional register for developer/power-user sessions.
+///
+/// PRD-hearth-persona-config §2.2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum Register {
+    /// Warm, patient prose with short sentences and plain words.
+    /// Calibrated for a non-technical elder listener (the target user).
+    #[default]
+    WarmElder,
+    /// Mirrors the original hard-coded `DEFAULT_PERSONA` const.
+    /// Byte-identical base; zero behaviour change when selected.
+    Plain,
+    /// Terse, direct prose for developer / power-user sessions.
+    Brisk,
+}
+
+impl Register {
+    /// Compose the register-specific base prose, substituting
+    /// `{self_name}` and `{user_name}` tokens.
+    ///
+    /// When `user_name` is `None` or `addresses_user` is `false`, the
+    /// user clause is omitted cleanly — no literal `{user_name}` leaks
+    /// into the result.
+    #[must_use]
+    pub fn compose_base(
+        self,
+        self_name: &str,
+        user_name: Option<&str>,
+        addresses_user: bool,
+        max_sentences: u8,
+    ) -> String {
+        match self {
+            Self::WarmElder => {
+                let user_clause = if addresses_user {
+                    user_name
+                        .filter(|n| !n.is_empty())
+                        .map(|n| format!(" who speaks with {n}"))
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                let brevity_clause = if max_sentences > 0 {
+                    format!(
+                        " Keep replies to {max_sentences} sentence{} or fewer unless asked for more.",
+                        if max_sentences == 1 { "" } else { "s" }
+                    )
+                } else {
+                    String::new()
+                };
+                format!(
+                    "You are {self_name}, a kind companion{user_clause} \
+aloud — never on a screen. Talk like a warm, patient person: short \
+sentences, plain everyday words, one thought at a time. Avoid all \
+computer or engineering jargon; if something is wrong, describe it \
+the way a caring friend would, not a technician.{brevity_clause} \
+No markdown, lists, code, or emoji — they do not speak well."
+                )
+            }
+            Self::Plain => {
+                // Byte-identical to the original DEFAULT_PERSONA (AC3).
+                // Ignores most persona fields so existing behaviour is
+                // fully preserved when this register is selected.
+                crate::daemon::DEFAULT_PERSONA.to_string()
+            }
+            Self::Brisk => {
+                let user_clause = if addresses_user {
+                    user_name
+                        .filter(|n| !n.is_empty())
+                        .map(|n| format!(" assisting {n}"))
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                let brevity_clause = if max_sentences > 0 {
+                    format!(
+                        " Limit replies to {max_sentences} sentence{} unless instructed otherwise.",
+                        if max_sentences == 1 { "" } else { "s" }
+                    )
+                } else {
+                    String::new()
+                };
+                format!(
+                    "You are {self_name}, a concise voice-first assistant{user_clause}. \
+Speak in plain prose — no markdown, bullets, or emoji.{brevity_clause}"
+                )
+            }
+        }
+    }
+}
+
+fn default_self_name() -> String {
+    "wintermute".to_string()
+}
+
+fn default_wake_word() -> String {
+    "hey wintermute".to_string()
+}
+
+const fn default_addresses_user() -> bool {
+    true
+}
+
+const fn default_max_sentences() -> u8 {
+    3
+}
+
+/// Configurable persona settings stored in the `[persona]` table of
+/// `brain.toml`.
+///
+/// All fields are `#[serde(default)]` so existing `brain.toml` files
+/// without a `[persona]` section deserialise cleanly to
+/// [`PersonaConfig::default`].
+///
+/// PRD-hearth-persona-config §2.1.
+/// PRD-hearth-first-contact-greeting §2.3 adds `greeting` + `wake_word`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersonaConfig {
+    /// What the companion calls herself out loud.
+    #[serde(default = "default_self_name")]
+    pub self_name: String,
+    /// Named tone/vocabulary preset. Default: [`Register::WarmElder`].
+    #[serde(default)]
+    pub register: Register,
+    /// When `true` (the default), the user's name is woven into the
+    /// composed base when `user_name` is set. Set `false` to omit.
+    #[serde(default = "default_addresses_user")]
+    pub addresses_user: bool,
+    /// Soft spoken-reply brevity ceiling. `0` means no ceiling.
+    #[serde(default = "default_max_sentences")]
+    pub max_sentences: u8,
+    /// Free-form text appended verbatim to the composed base persona.
+    /// Useful for operator-specific instructions that don't fit a named
+    /// register.
+    #[serde(default)]
+    pub extra: String,
+    /// Controls whether (and when) the daemon emits a proactive boot
+    /// greeting before the user's first turn. Default:
+    /// [`greeting::GreetingMode::Off`] (conservative — no proactive
+    /// speech unless the deployment opts in).
+    ///
+    /// PRD-hearth-first-contact-greeting §2.3.
+    #[serde(default)]
+    pub greeting: greeting::GreetingMode,
+    /// The voice wake word surfaced in the
+    /// [`greeting::GreetingKind::FirstEver`] teaching block.
+    /// Defaults to `"hey wintermute"`. The deployment should override
+    /// this when the wake word differs.
+    ///
+    /// PRD-hearth-first-contact-greeting §2.2.
+    #[serde(default = "default_wake_word")]
+    pub wake_word: String,
+}
+
+impl Default for PersonaConfig {
+    fn default() -> Self {
+        Self {
+            self_name: default_self_name(),
+            register: Register::default(),
+            addresses_user: default_addresses_user(),
+            max_sentences: default_max_sentences(),
+            extra: String::new(),
+            greeting: greeting::GreetingMode::default(),
+            wake_word: default_wake_word(),
+        }
+    }
+}
+
+impl PersonaConfig {
+    /// Compose the stable persona base from this config and an optional
+    /// `user_name` (pulled from [`BrainConfig::user_name`] by the caller).
+    ///
+    /// The returned string is the **stable cache prefix** — it must be
+    /// byte-stable across consecutive calls with the same config so prompt
+    /// caching is effective (PRD §2.3).
+    ///
+    /// The per-turn recall/recap context is spliced *after* this prefix by
+    /// [`crate::daemon::compose_persona`].
+    #[must_use]
+    pub fn compose_base(&self, user_name: Option<&str>) -> String {
+        let mut base = self.register.compose_base(
+            &self.self_name,
+            user_name,
+            self.addresses_user,
+            self.max_sentences,
+        );
+        if !self.extra.is_empty() {
+            base.push_str("\n\n");
+            base.push_str(&self.extra);
+        }
+        base
+    }
+}
+
 pub mod almanac;
 pub mod anthropic;
 pub mod bus;
 pub mod daemon;
 pub mod degrade;
+pub mod greeting;
 pub mod history;
 pub mod ladder;
 pub mod persist;
 pub mod recall_client;
+pub mod repair;
+pub mod router;
 pub mod session;
 pub mod writeback;
 pub use persist::default_config_path;
@@ -168,6 +373,11 @@ pub const TRUSTED_CLOUD_TIER_NAME: &str = SHORT_MODEL_SONNET;
 ///
 /// `PartialEq` is derived; `Eq` is not (f64 fields prevent it).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "BrainConfig fields are independent feature gates that map naturally to bools; \
+              grouping them into bitfields or enums would obscure their meaning and serde shape"
+)]
 pub struct BrainConfig {
     /// Default model id used when no per-turn override is in effect.
     /// Must be in [`ALLOWED_MODEL_NAMES`].
@@ -249,6 +459,41 @@ pub struct BrainConfig {
     /// PRD-wmd-session-boundary §2.2.
     #[serde(default = "default_session_end_phrases")]
     pub session_end_phrases: Vec<String>,
+    /// Upper bound on thread memories injected at session start.
+    /// Most-recent first. `0` disables recap injection entirely.
+    /// PRD-wmd-session-recap §2.1.
+    #[serde(default = "default_recap_max_memories")]
+    pub recap_max_memories: usize,
+    /// When `true`, wmd publishes a proactive `wm.brain.reply` before
+    /// the user's first turn, opening with a continuity greeting drawn
+    /// from the recap context. Default `false` (conservative; see PRD §2.3).
+    /// PRD-wmd-session-recap §2.3.
+    #[serde(default)]
+    pub recap_opener: bool,
+    /// Phrases that trigger verbatim replay of the last assistant turn without
+    /// a new LLM call. Matched case-insensitively with punctuation stripped.
+    /// An empty list uses [`crate::repair::DEFAULT_REPEAT_PHRASES`].
+    /// PRD-wmd-repair-affordances §2.1.
+    #[serde(default)]
+    pub repair_repeat_phrases: Vec<String>,
+    /// Phrases that trigger verbatim replay of the last assistant turn with a
+    /// `loudness = "loud"` hint on the emitted [`crate::bus::ReplyEvent`].
+    /// Matched case-insensitively with punctuation stripped.
+    /// An empty list uses [`crate::repair::DEFAULT_LOUDER_PHRASES`].
+    /// PRD-wmd-repair-affordances §2.1.
+    #[serde(default)]
+    pub repair_louder_phrases: Vec<String>,
+    /// Configurable persona — tone, name, brevity.  All fields default so
+    /// existing `brain.toml` files without a `[persona]` section load fine.
+    /// PRD-hearth-persona-config §2.1.
+    #[serde(default)]
+    pub persona: PersonaConfig,
+    /// Routing policy configuration — tier preference, classifier tuning,
+    /// Ollama endpoint, cloud timeout.  All fields default so existing
+    /// `brain.toml` files without a `[routing]` section load fine.
+    /// PRD-wintermute-brain-routing §2.4.
+    #[serde(default)]
+    pub routing: crate::router::RoutingConfig,
 }
 
 impl Default for BrainConfig {
@@ -271,6 +516,12 @@ impl Default for BrainConfig {
             writeback_confidence_floor: default_writeback_confidence_floor(),
             idle_gap_ms: default_idle_gap_ms(),
             session_end_phrases: default_session_end_phrases(),
+            recap_max_memories: default_recap_max_memories(),
+            recap_opener: false,
+            repair_repeat_phrases: Vec::new(),
+            repair_louder_phrases: Vec::new(),
+            persona: PersonaConfig::default(),
+            routing: crate::router::RoutingConfig::default(),
         }
     }
 }
@@ -312,6 +563,15 @@ fn default_session_end_phrases() -> Vec<String> {
         .iter()
         .map(|s| (*s).to_string())
         .collect()
+}
+
+/// Default upper bound on thread memories injected at session start.
+///
+/// PRD-wmd-session-recap §2.1: 5 is conservative for prompt-cache stability.
+pub const DEFAULT_RECAP_MAX_MEMORIES: usize = 5;
+
+const fn default_recap_max_memories() -> usize {
+    DEFAULT_RECAP_MAX_MEMORIES
 }
 
 fn default_api_key_env() -> String {
@@ -496,6 +756,19 @@ impl BrainConfig {
             None => default_idle_gap_ms(),
         };
 
+        let recap_max_memories = match env_string("WM_BRAIN_RECAP_MAX_MEMORIES") {
+            Some(raw) => raw.trim().parse::<usize>().map_err(|e| BrainError::InvalidEnv {
+                var: "WM_BRAIN_RECAP_MAX_MEMORIES",
+                value: raw.clone(),
+                reason: e.to_string(),
+            })?,
+            None => default_recap_max_memories(),
+        };
+        let recap_opener = match env_string("WM_BRAIN_RECAP_OPENER") {
+            Some(raw) => parse_bool_env("WM_BRAIN_RECAP_OPENER", &raw)?,
+            None => false,
+        };
+
         Ok(Self {
             default_model,
             pending_model: None,
@@ -514,6 +787,12 @@ impl BrainConfig {
             writeback_confidence_floor,
             idle_gap_ms,
             session_end_phrases: default_session_end_phrases(),
+            recap_max_memories,
+            recap_opener,
+            repair_repeat_phrases: Vec::new(),
+            repair_louder_phrases: Vec::new(),
+            persona: PersonaConfig::default(),
+            routing: crate::router::RoutingConfig::default(),
         })
     }
 
@@ -844,5 +1123,138 @@ mod tests {
         assert!(!parsed_false);
         let parsed_true = parse_bool_env("WM_BRAIN_ALMANAC_SPEAK", "1").expect("parses");
         assert!(parsed_true);
+    }
+
+    // ── PersonaConfig tests (PRD-hearth-persona-config AC1–AC7) ─────────────
+
+    #[test]
+    fn persona_default_deserialises_from_empty_toml() {
+        // AC2: a brain.toml without a [persona] section loads to defaults.
+        let cfg: BrainConfig = toml::from_str("default_model = \"sonnet\"\n")
+            .expect("deserialise");
+        assert_eq!(cfg.persona, PersonaConfig::default());
+        assert_eq!(cfg.persona.register, Register::WarmElder);
+        assert_eq!(cfg.persona.self_name, "wintermute");
+        assert!(cfg.persona.addresses_user);
+        assert_eq!(cfg.persona.max_sentences, 3);
+        assert!(cfg.persona.extra.is_empty());
+    }
+
+    #[test]
+    fn persona_per_field_override() {
+        // AC1: explicit [persona] fields override defaults.
+        let toml_str = r#"
+[persona]
+self_name = "Ada"
+register = "brisk"
+addresses_user = false
+max_sentences = 2
+extra = "Always end with a friendly greeting."
+"#;
+        let cfg: BrainConfig = toml::from_str(toml_str).expect("deserialise");
+        assert_eq!(cfg.persona.self_name, "Ada");
+        assert_eq!(cfg.persona.register, Register::Brisk);
+        assert!(!cfg.persona.addresses_user);
+        assert_eq!(cfg.persona.max_sentences, 2);
+        assert_eq!(cfg.persona.extra, "Always end with a friendly greeting.");
+    }
+
+    #[test]
+    fn persona_register_plain_produces_default_persona() {
+        // AC3: Plain register → byte-identical to DEFAULT_PERSONA const.
+        use crate::daemon::DEFAULT_PERSONA;
+        let p = PersonaConfig {
+            register: Register::Plain,
+            ..PersonaConfig::default()
+        };
+        let base = p.compose_base(None);
+        assert_eq!(base, DEFAULT_PERSONA);
+    }
+
+    #[test]
+    fn persona_warm_elder_contains_required_phrases() {
+        // AC3: WarmElder contains "short sentences" and lacks "daemon"/"API"/"config".
+        let p = PersonaConfig {
+            register: Register::WarmElder,
+            ..PersonaConfig::default()
+        };
+        let base = p.compose_base(None);
+        assert!(base.contains("short sentences"), "WarmElder must mention short sentences");
+        assert!(!base.contains("daemon"), "WarmElder must not say 'daemon'");
+        assert!(!base.contains("API"), "WarmElder must not say 'API'");
+        assert!(!base.contains("config"), "WarmElder must not say 'config'");
+    }
+
+    #[test]
+    fn persona_name_substitution() {
+        // AC4: {self_name}/{user_name} replaced; no literal braces.
+        let p = PersonaConfig {
+            self_name: "Ada".to_string(),
+            register: Register::WarmElder,
+            addresses_user: true,
+            ..PersonaConfig::default()
+        };
+        let base = p.compose_base(Some("Mum"));
+        assert!(base.contains("Ada"), "self_name substituted");
+        assert!(base.contains("Mum"), "user_name substituted");
+        assert!(!base.contains("{self_name}"), "no literal placeholder");
+        assert!(!base.contains("{user_name}"), "no literal placeholder");
+    }
+
+    #[test]
+    fn persona_user_clause_omitted_when_unset() {
+        // AC4: when user_name is None, user clause omitted cleanly.
+        let p = PersonaConfig {
+            register: Register::WarmElder,
+            ..PersonaConfig::default()
+        };
+        let base_no_user = p.compose_base(None);
+        let base_with_user = p.compose_base(Some("Alice"));
+        assert!(base_with_user.contains("Alice"));
+        assert!(!base_no_user.contains("{user_name}"));
+    }
+
+    #[test]
+    fn persona_cache_prefix_stable() {
+        // AC5: two compose_base calls with the same config yield identical strings.
+        let p = PersonaConfig {
+            self_name: "Ada".to_string(),
+            register: Register::WarmElder,
+            addresses_user: true,
+            max_sentences: 2,
+            extra: "Be concise.".to_string(),
+            ..PersonaConfig::default()
+        };
+        let a = p.compose_base(Some("Mum"));
+        let b = p.compose_base(Some("Mum"));
+        assert_eq!(a, b, "compose_base must be byte-stable (cache prefix)");
+    }
+
+    #[test]
+    fn persona_extra_appended_to_base() {
+        // AC1 / §2.1: extra text is appended after the register prose.
+        let p = PersonaConfig {
+            register: Register::Brisk,
+            extra: "Always greet warmly.".to_string(),
+            ..PersonaConfig::default()
+        };
+        let base = p.compose_base(None);
+        assert!(base.ends_with("Always greet warmly."));
+    }
+
+    #[test]
+    fn persona_round_trips_through_serde() {
+        // AC1: PersonaConfig serialises and deserialises cleanly.
+        let original = PersonaConfig {
+            self_name: "Ada".to_string(),
+            register: Register::Brisk,
+            addresses_user: false,
+            max_sentences: 1,
+            extra: "Extra note.".to_string(),
+            ..PersonaConfig::default()
+        };
+        let v = serde_json::to_value(&original).expect("serialises");
+        let back: PersonaConfig = serde_json::from_value(v).expect("round-trips");
+        assert_eq!(original, back);
     }
 }

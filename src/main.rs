@@ -16,7 +16,9 @@ use clap::{Parser, Subcommand};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 use wintermute_brain::{
-    BrainConfig, BrainError, DEFAULT_API_KEY_ENV, daemon, default_config_path, validate_model_name,
+    BrainConfig, BrainError, DEFAULT_API_KEY_ENV, Register, daemon,
+    default_config_path, validate_model_name,
+    router::RoutePrefer,
 };
 
 #[derive(Parser, Debug)]
@@ -67,6 +69,42 @@ enum Command {
     /// Print the resolved configuration as JSON and exit. Useful for
     /// integration tests + ops debugging.
     Status,
+    /// Inspect or tune the persona without recompiling.
+    /// PRD-hearth-persona-config §2.4.
+    Persona {
+        #[command(subcommand)]
+        cmd: PersonaCommand,
+    },
+    /// Inspect or change the routing configuration.
+    /// PRD-wintermute-brain-routing §2.4.
+    Route {
+        #[command(subcommand)]
+        cmd: RouteCommand,
+    },
+}
+
+/// Sub-commands for `wmd persona`.
+#[derive(Subcommand, Debug)]
+enum PersonaCommand {
+    /// Print the composed persona base (what the model actually receives).
+    Show,
+    /// Atomically set the register in `brain.toml` and exit.
+    SetRegister {
+        /// Register name: `warm-elder`, `plain`, or `brisk`.
+        register: String,
+    },
+}
+
+/// Sub-commands for `wmd route`.
+#[derive(Subcommand, Debug)]
+enum RouteCommand {
+    /// Print the effective routing configuration as JSON and exit.
+    Status,
+    /// Persist the deployment-wide tier preference in `brain.toml`.
+    Prefer {
+        /// `auto`, `local-only`, or `cloud-only`.
+        preference: String,
+    },
 }
 
 fn init_tracing() {
@@ -102,6 +140,34 @@ fn main() -> ExitCode {
             Err(err) => {
                 error!(error = %err, "wmd status: config load failed");
                 ExitCode::from(1)
+            }
+        },
+        Command::Persona { cmd } => match cmd {
+            PersonaCommand::Show => {
+                match load_effective(&config_path, cli.recall_sock, &cli.api_key_env) {
+                    Ok(cfg) => run_persona_show(&cfg),
+                    Err(err) => {
+                        error!(error = %err, "wmd persona show: config load failed");
+                        ExitCode::from(1)
+                    }
+                }
+            }
+            PersonaCommand::SetRegister { register } => {
+                run_persona_set_register(&config_path, &register)
+            }
+        },
+        Command::Route { cmd } => match cmd {
+            RouteCommand::Status => {
+                match load_effective(&config_path, cli.recall_sock, &cli.api_key_env) {
+                    Ok(cfg) => run_route_status(&cfg, &config_path),
+                    Err(err) => {
+                        error!(error = %err, "wmd route status: config load failed");
+                        ExitCode::from(1)
+                    }
+                }
+            }
+            RouteCommand::Prefer { preference } => {
+                run_route_prefer(&config_path, &preference)
             }
         },
     }
@@ -239,6 +305,104 @@ fn run_status(cfg: &BrainConfig, path: &std::path::Path) -> ExitCode {
             error!(error = %err, "wmd status: failed to serialise config");
             ExitCode::from(1)
         }
+    }
+}
+
+/// Print the composed persona base (the stable system-prompt prefix).
+/// PRD-hearth-persona-config §2.4 / AC6.
+fn run_persona_show(cfg: &BrainConfig) -> ExitCode {
+    let base = cfg.persona.compose_base(cfg.user_name.as_deref());
+    info!(persona = %base, "wmd persona show");
+    ExitCode::SUCCESS
+}
+
+/// Parse a register name from the CLI and persist it atomically.
+/// PRD-hearth-persona-config §2.4 / AC6.
+#[allow(clippy::cognitive_complexity, reason = "parse -> load -> mutate -> save shell")]
+fn run_persona_set_register(path: &std::path::Path, register: &str) -> ExitCode {
+    let reg = parse_register(register);
+    let Some(reg) = reg else {
+        error!(
+            register = %register,
+            "wmd persona set-register: unknown register; expected warm-elder, plain, or brisk"
+        );
+        return ExitCode::from(1);
+    };
+    let mut cfg = match BrainConfig::load_from_file(path) {
+        Ok(c) => c,
+        Err(err) => {
+            error!(error = %err, "wmd persona set-register: load failed");
+            return ExitCode::from(1);
+        }
+    };
+    cfg.persona.register = reg;
+    if let Err(err) = cfg.save_to_file(path) {
+        error!(error = %err, "wmd persona set-register: save failed");
+        return ExitCode::from(1);
+    }
+    info!(
+        register = %register,
+        path = %path.display(),
+        "wmd persona set-register: persisted"
+    );
+    ExitCode::SUCCESS
+}
+
+/// Print the effective routing configuration as JSON.
+/// PRD-wintermute-brain-routing §2.4 / `wmd route status`.
+fn run_route_status(cfg: &BrainConfig, path: &std::path::Path) -> ExitCode {
+    match serde_json::to_string_pretty(&cfg.routing) {
+        Ok(s) => {
+            info!(routing = %s, config_path = %path.display(), "wmd route status");
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            error!(error = %err, "wmd route status: failed to serialise routing config");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// Persist the deployment-wide routing preference atomically.
+/// PRD-wintermute-brain-routing §2.4 / `wmd route prefer`.
+#[allow(clippy::cognitive_complexity, reason = "parse -> load -> mutate -> save shell")]
+fn run_route_prefer(path: &std::path::Path, preference: &str) -> ExitCode {
+    let Some(pref) = RoutePrefer::parse(preference) else {
+        error!(
+            preference = %preference,
+            "wmd route prefer: unknown preference; expected auto, local-only, or cloud-only"
+        );
+        return ExitCode::from(1);
+    };
+    let mut cfg = match BrainConfig::load_from_file(path) {
+        Ok(c) => c,
+        Err(err) => {
+            error!(error = %err, "wmd route prefer: load failed");
+            return ExitCode::from(1);
+        }
+    };
+    cfg.routing.prefer = pref;
+    if let Err(err) = cfg.save_to_file(path) {
+        error!(error = %err, "wmd route prefer: save failed");
+        return ExitCode::from(1);
+    }
+    info!(
+        preference = %preference,
+        path = %path.display(),
+        "wmd route prefer: persisted"
+    );
+    ExitCode::SUCCESS
+}
+
+/// Parse a register name string into a [`Register`] variant.
+///
+/// Accepts the kebab-case names defined by the serde `rename_all` rule.
+fn parse_register(s: &str) -> Option<Register> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "warm-elder" => Some(Register::WarmElder),
+        "plain" => Some(Register::Plain),
+        "brisk" => Some(Register::Brisk),
+        _ => None,
     }
 }
 

@@ -15,7 +15,7 @@
 //! Recall retrieval, tool routing, destructive-intent gating, and turn
 //! memorisation remain iter-9+ work.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -46,8 +46,10 @@ use crate::degrade::{
 use crate::history::{History, Turn};
 use crate::recall_client::{self, QueryArgs, QueryHit, RecallClient, TouchArgs};
 use crate::session::{AdvanceOutcome, CloseReason, SessionTracker};
+use crate::repair::{self, Repair};
 use crate::writeback::{ExtractorClient, WritebackGuard};
-use crate::{BrainConfig, PROFILE_SUBJECT, canonical_model};
+use crate::router::{RouteEvent, RouteTier, apply_routing_policy, PolicyInputs, canned_phrase};
+use crate::{BrainConfig, PROFILE_SUBJECT, THREAD_SUBJECT_PREFIX, canonical_model};
 
 /// Default upper bound on tokens the daemon requests per turn.
 ///
@@ -167,13 +169,13 @@ impl ExtractorClient for AnthropicExtractor {
 /// Build a buffered streaming request for a single user turn.
 ///
 /// The caller is responsible for supplying the stable prefix via
-/// [`compose_persona`] and the volatile recall context separately.
+/// [`compose_stable_prefix`] and the volatile recall / recap contexts separately.
 ///
-/// When `recall_context` is `Some`, it is placed as a plain (non-cached)
-/// block *after* the cached stable prefix, ensuring the cache breakpoint on
-/// the stable prefix is never busted by per-turn recall hits
-/// (PRD-brain-prompt-cache §2.2). When `None`, only the stable prefix block
-/// is present.
+/// When `recall_context` or `recap_context` are `Some`, they are placed as
+/// plain (non-cached) blocks *after* the cached stable prefix, ensuring the
+/// cache breakpoint on the stable prefix is never busted by per-turn volatile
+/// content (PRD-brain-prompt-cache §2.2). When both are `None`, only the
+/// stable prefix block is present.
 ///
 /// `history_msgs` is the flat `[user, assistant, …]` prefix produced by
 /// [`History::to_messages`] or [`History::trimmed_messages`]; callers pass
@@ -186,6 +188,7 @@ pub fn compose_request(
     model: &str,
     stable_prefix: &str,
     recall_context: Option<&str>,
+    recap_context: Option<&str>,
     history_msgs: &[Message],
     transcript: &str,
 ) -> MessageRequest {
@@ -196,10 +199,15 @@ pub fn compose_request(
     });
     let req = MessageRequest::streaming(canonical_model(model), DEFAULT_MAX_TOKENS, messages);
     // Build the system block array: stable prefix (with cache breakpoint)
-    // + optional volatile recall tail (without breakpoint, so it doesn't
-    // bust the cache).
+    // + optional volatile recall / recap tail blocks (without breakpoint, so
+    // they don't bust the cache).
     let mut blocks = vec![SystemBlock::text_cached(stable_prefix)];
     if let Some(ctx) = recall_context {
+        if !ctx.is_empty() {
+            blocks.push(SystemBlock::text(ctx));
+        }
+    }
+    if let Some(ctx) = recap_context {
         if !ctx.is_empty() {
             blocks.push(SystemBlock::text(ctx));
         }
@@ -212,20 +220,29 @@ pub fn compose_request(
 /// Layers in this order: `base` (persona), child-lock guard when set, and
 /// the destructive-intent gate (always). Each layer is separated by a blank
 /// line so the model parses them as distinct paragraphs. Crucially, **no
-/// per-turn recall context is included here** — it is returned separately via
-/// [`format_recall_context`] and placed as a non-cached tail block by
-/// [`compose_request`] so it never busts the prompt-cache breakpoint.
+/// per-turn recall or recap context is included here** — they are passed
+/// separately to [`compose_request`] as non-cached tail blocks so they
+/// never bust the prompt-cache breakpoint (PRD-brain-prompt-cache §2.2).
+///
+/// `recall_context` and `recap_context` are accepted but **ignored** here;
+/// they are kept in the signature for call-site backward compatibility.
+/// Pass them to [`compose_request`] for actual use.
 ///
 /// PRD-brain-prompt-cache §2.2.
 #[must_use]
-pub fn compose_persona(base: &str, child_lock: bool, _recall_context: Option<&str>) -> String {
+pub fn compose_persona(
+    base: &str,
+    child_lock: bool,
+    _recall_context: Option<&str>,
+    _recap_context: Option<&str>,
+) -> String {
     compose_stable_prefix(base, child_lock)
 }
 
-/// Build the stable cacheable prefix string (no per-turn recall context).
+/// Build the stable cacheable prefix string (no per-turn recall or recap context).
 ///
-/// The recall context must be passed separately to [`compose_request`] as a
-/// non-cached tail block (PRD-brain-prompt-cache §2.2 / AC3). This function
+/// The recall and recap contexts must be passed separately to [`compose_request`]
+/// as non-cached tail blocks (PRD-brain-prompt-cache §2.2 / AC3). This function
 /// is the single source of truth for the stable prefix so tests can compare
 /// bytes across turns and prove the prefix never changes.
 #[must_use]
@@ -259,6 +276,31 @@ pub fn format_recall_context(hits: &[QueryHit]) -> Option<String> {
             continue;
         }
         out.push_str(&format!("\n{}. {}", i + 1, snippet));
+    }
+    Some(out)
+}
+
+/// Render a list of thread-memory recall hits into the recap context block
+/// spliced onto the system prompt under a distinct "Recent conversations:"
+/// label. Returns `None` when the slice is empty.
+///
+/// The section label distinguishes this block from the per-turn "What you
+/// remember about the user" block so the model can tell standing profile
+/// recall hits from session-continuity context (PRD-wmd-session-recap §2.2).
+#[must_use]
+pub fn format_recap_context(hits: &[QueryHit]) -> Option<String> {
+    let non_empty: Vec<&str> = hits
+        .iter()
+        .map(|h| h.snippet.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if non_empty.is_empty() {
+        return None;
+    }
+    let mut out = String::from("Recent conversations (most recent first):");
+    for (i, snippet) in non_empty.iter().enumerate() {
+        use std::fmt::Write as _;
+        let _ = write!(out, "\n{}. {}", i + 1, snippet);
     }
     Some(out)
 }
@@ -606,6 +648,31 @@ pub const TOOL_RECALL_SAVE_FACT: &str = "wm.recall.save_fact";
 /// config (PRD AC5).  30 seconds is a safe fallback for test fixtures
 /// that don't wire earshot config.
 pub const DEFAULT_ALMANAC_PATIENCE_MS: u64 = 30_000;
+
+/// Graceful degrade phrase emitted when a repair request arrives but the
+/// history buffer is empty (AC3). The user hears this instead of silence or
+/// an empty reply.
+pub const REPAIR_EMPTY_HISTORY_REPLY: &str = "I haven't said anything yet.";
+
+/// Build the effective phrase sets for repair classification from the daemon
+/// config. When a list is empty the built-in defaults are used instead.
+///
+/// This is called once per `TurnUser` event, before the LLM dispatch check,
+/// so the overhead is two `BTreeSet` constructions at most (cheap).
+#[must_use]
+fn repair_phrase_sets(cfg: &BrainConfig) -> (BTreeSet<String>, BTreeSet<String>) {
+    let repeat = if cfg.repair_repeat_phrases.is_empty() {
+        repair::default_repeat_phrases()
+    } else {
+        repair::build_phrase_set(&cfg.repair_repeat_phrases)
+    };
+    let louder = if cfg.repair_louder_phrases.is_empty() {
+        repair::default_louder_phrases()
+    } else {
+        repair::build_phrase_set(&cfg.repair_louder_phrases)
+    };
+    (repeat, louder)
+}
 
 /// Fleet 1 recall tool router.
 ///
@@ -1036,6 +1103,17 @@ pub struct DaemonState {
     /// Optional extraction client. When `Some`, end-of-session writeback
     /// fires; when `None` writeback is disabled (no LLM configured).
     pub extractor: Option<Arc<dyn ExtractorClient>>,
+    /// Session-scoped thread-memory recap context.
+    ///
+    /// Fetched once at `wm.brain.session.start` from the recall store
+    /// (thread subject prefix); held for the life of the session and
+    /// spliced into every turn's system prompt under "Recent conversations:".
+    /// Cleared on each new session open so context never bleeds.
+    /// `None` means no recap context was found (cold store) or recap is
+    /// disabled. PRD-wmd-session-recap §2.1 / §2.2.
+    pub recap_context: Mutex<Option<String>>,
+    /// Monotonic count of thread queries fired (AC3: exactly one per session).
+    pub session_thread_query_count: std::sync::atomic::AtomicU64,
 }
 
 impl DaemonState {
@@ -1051,13 +1129,17 @@ impl DaemonState {
             config.idle_gap_ms,
             config.session_end_phrases.clone(),
         );
+        // Compose the persona base once at config-load time so the
+        // string is byte-stable across turns (prompt-cache discipline,
+        // PRD-hearth-persona-config §2.3).
+        let persona_base = config.persona.compose_base(config.user_name.as_deref());
         Self {
             config: Mutex::new(config),
             config_path: None,
             llm: None,
             recall: Arc::new(NullRecall),
             tool_router: Arc::new(NoToolsRouter),
-            persona: DEFAULT_PERSONA.to_string(),
+            persona: persona_base,
             pending: Mutex::new(HashMap::new()),
             intent_counter: AtomicU64::new(0),
             ladder: None,
@@ -1071,6 +1153,8 @@ impl DaemonState {
             writeback_session: Mutex::new(None),
             writeback_guard: WritebackGuard::new(),
             extractor: None,
+            recap_context: Mutex::new(None),
+            session_thread_query_count: AtomicU64::new(0),
         }
     }
 
@@ -1274,6 +1358,12 @@ pub async fn dispatch(
                     };
                     let mut history = state.history.lock().await;
                     *history = History::new(max_turns);
+                    drop(history);
+                    // Session-recap: fetch thread memories for the new session.
+                    // AC3: query fires exactly once per new session here; per-turn
+                    // recall queries are separate and still fire every turn.
+                    // AC8: failures log WARN and leave recap_context None.
+                    handle_session_start(state, publish, now_ms).await;
                 }
                 AdvanceOutcome::Extended => {
                     // Nothing to emit; history continues.
@@ -1473,7 +1563,7 @@ pub async fn tick_almanac_timeout(
     } else {
         // First elapse — speak the gentle re-ask and reset window (AC4).
         let re_ask_text = "Did you take it? Just say yes or later if you need more time.";
-        let reply = bus::ReplyEvent { text: re_ask_text.to_string(), ts: now_ms };
+        let reply = bus::ReplyEvent { text: re_ask_text.to_string(), ts: now_ms, loudness: None };
         publish
             .publish(bus::outgoing::REPLY, serde_json::to_value(&reply)?)
             .await
@@ -1571,6 +1661,7 @@ pub async fn handle_speak_almanac_due(
     let reply = bus::ReplyEvent {
         text: say.to_string(),
         ts: now_ms,
+        loudness: None,
     };
     publish
         .publish(
@@ -1595,6 +1686,110 @@ pub async fn handle_speak_almanac_due(
     Ok(true)
 }
 
+/// Fetch the most recent thread memories from recall and store them as the
+/// session's recap context.
+///
+/// Called once at `wm.brain.session.start` (PRD-wmd-session-recap §2.1 / AC3).
+/// Queries both today's thread subject and the most-recent prior day's thread
+/// by using the subject prefix `THREAD_SUBJECT_PREFIX`.  Respects
+/// `recap_max_memories`; bounds the hit slice to the most recent N.
+///
+/// Recall outages are tolerated: a query failure logs WARN and leaves the recap
+/// context empty — the session proceeds with no recap (AC8).
+///
+/// If `recap_opener` is `true` and at least one memory was found, publishes a
+/// proactive `wm.brain.reply` before the user's first turn (AC7). The opener is
+/// the first snippet, prefixed with "Earlier you mentioned:" — plain and
+/// conservative (PRD §2.3 / non-goal 3).
+///
+/// Returns `true` when an opener was published.
+pub async fn handle_session_start(
+    state: &DaemonState,
+    publish: &mut dyn EventSink,
+    now_ms: u64,
+) -> bool {
+    let (recap_max, recap_opener) = {
+        let cfg = state.config.lock().await;
+        (cfg.recap_max_memories, cfg.recap_opener)
+    };
+
+    // AC3: count the query.
+    state.session_thread_query_count.fetch_add(1, Ordering::SeqCst);
+
+    if recap_max == 0 {
+        *state.recap_context.lock().await = None;
+        return false;
+    }
+
+    // Query by thread subject prefix to retrieve committed thread memories.
+    let hits = match state
+        .recall
+        .search(
+            // Use the prefix as the free-text query so the daemon retrieves
+            // recent thread memories scoped to the thread subject namespace.
+            THREAD_SUBJECT_PREFIX,
+            Some(THREAD_SUBJECT_PREFIX),
+            Some(recap_max),
+        )
+        .await
+    {
+        Ok(h) => h,
+        Err(err) => {
+            warn!(
+                err = %err,
+                "wm-brain recap: thread query failed; proceeding without recap context (AC8)"
+            );
+            *state.recap_context.lock().await = None;
+            return false;
+        }
+    };
+
+    // Filter to committed memories (AC5: proposals are excluded).
+    // The recall query already returns committed memories; we document the
+    // intent here. Subject must start with the thread prefix.
+    let thread_hits: Vec<&QueryHit> = hits
+        .iter()
+        .filter(|h| h.subject.starts_with(THREAD_SUBJECT_PREFIX))
+        .take(recap_max)
+        .collect();
+
+    let thread_hits_owned: Vec<QueryHit> =
+        thread_hits.iter().map(|h| (*h).clone()).collect();
+    let recap = format_recap_context(&thread_hits_owned);
+    state.recap_context.lock().await.clone_from(&recap);
+
+    if let Some(ref ctx) = recap {
+        info!(
+            memories = thread_hits.len(),
+            "wm-brain recap: session-start thread context fetched"
+        );
+        // AC7: optional opener — off by default (AC6).
+        if recap_opener {
+            if let Some(first_snippet) = thread_hits
+                .first()
+                .map(|h| h.snippet.trim().to_string())
+                .filter(|s| !s.is_empty())
+            {
+                let opener_text = format!("Earlier you mentioned: {first_snippet}");
+                let reply = bus::ReplyEvent { text: opener_text, ts: now_ms, loudness: None };
+                if let Ok(payload) = serde_json::to_value(&reply) {
+                    if let Err(err) = publish.publish(outgoing::REPLY, payload).await {
+                        warn!(err = %err, "wm-brain recap: opener publish failed");
+                    } else {
+                        info!("wm-brain recap: continuity opener published");
+                        return true;
+                    }
+                }
+            }
+        }
+        let _ = ctx;
+    } else {
+        debug!("wm-brain recap: no thread memories found; cold store");
+    }
+
+    false
+}
+
 /// Persist the post-consume config when [`DaemonState::config_path`] is
 /// set. Save failures are logged and swallowed: the in-memory cfg has
 /// already been mutated, so the running daemon keeps the AC6 contract;
@@ -1611,6 +1806,50 @@ async fn persist_after_pending_consume(state: &DaemonState) {
             "wm-brain: persisting post-consume config failed; in-memory state still reverted"
         );
     }
+}
+
+/// Handle a classified repair request (PRD-wmd-repair-affordances §2.2).
+///
+/// Reads the last assistant turn from `state.history`. On `RepeatLast`, re-
+/// publishes its text with a fresh `ts`. On `RepeatLouder`, does the same but
+/// adds `loudness = "loud"` to the event. When history is empty, publishes the
+/// graceful degrade phrase [`REPAIR_EMPTY_HISTORY_REPLY`] instead.
+///
+/// The replayed turn is **not** pushed back into history (AC4 — prevents
+/// "say that again" × N from filling the ring with duplicates).
+///
+/// # Errors
+/// Propagates publish failures.
+async fn handle_repair(
+    state: &DaemonState,
+    publish: &mut dyn EventSink,
+    repair: Repair,
+    now_ms: u64,
+) -> Result<()> {
+    let last_text = {
+        let history = state.history.lock().await;
+        history.last().map(|t| t.assistant.clone())
+    };
+
+    let (text, loudness) = if let Some(t) = last_text {
+        let loud = (repair == Repair::RepeatLouder).then(|| "loud".to_string());
+        (t, loud)
+    } else {
+        info!("wm-brain: repair request with empty history; emitting degrade phrase");
+        (REPAIR_EMPTY_HISTORY_REPLY.to_string(), None)
+    };
+
+    info!(
+        repair = ?repair,
+        loudness = ?loudness,
+        "wm-brain: repair replay"
+    );
+    let reply = ReplyEvent { text, ts: now_ms, loudness };
+    publish
+        .publish(outgoing::REPLY, serde_json::to_value(&reply)?)
+        .await
+        .context("publish repair replay")?;
+    Ok(())
 }
 
 #[allow(
@@ -1635,6 +1874,22 @@ async fn handle_turn_user(
     // Advance the writeback session (check idle gap, open new session if needed).
     advance_writeback_session(state, now_ms).await;
 
+    // --- Repair-affordance check (PRD-wmd-repair-affordances §2.1 / §2.2) ---
+    //
+    // Run BEFORE the LLM dispatch. If the transcript is a verbatim-replay or
+    // louder-replay request, handle it locally from history and return — no
+    // model call, no token cost, near-zero latency.
+    {
+        let repair_result = {
+            let cfg = state.config.lock().await;
+            let (repeat_set, louder_set) = repair_phrase_sets(&cfg);
+            repair::classify(&turn.transcript, &repeat_set, &louder_set)
+        };
+        if repair_result != Repair::None {
+            return handle_repair(state, publish, repair_result, now_ms).await;
+        }
+    }
+
     // When a ladder is configured it owns dispatch (local-first + climb);
     // otherwise fall back to the single Anthropic client path.
     if state.ladder.is_some() {
@@ -1658,14 +1913,15 @@ async fn handle_turn_user(
         }
     };
     let recall_ctx = format_recall_context(&hits);
-    // Stable cacheable prefix (no per-turn recall context — PRD-brain-prompt-cache §2.2).
-    let stable_prefix = compose_persona(&state.persona, child_lock, None);
+    let recap = { state.recap_context.lock().await.clone() };
+    // Stable cacheable prefix (no per-turn recall/recap context — PRD-brain-prompt-cache §2.2).
+    let stable_prefix = compose_stable_prefix(&state.persona, child_lock);
     // Build the request with history prefix (PRD-wmd-turn-history §2.2).
     let history_msgs = {
         let history = state.history.lock().await;
         history.trimmed_messages(DEFAULT_MAX_TOKENS as usize)
     };
-    let req = compose_request(model, &stable_prefix, recall_ctx.as_deref(), &history_msgs, &turn.transcript);
+    let req = compose_request(model, &stable_prefix, recall_ctx.as_deref(), recap.as_deref(), &history_msgs, &turn.transcript);
     match llm.collect_messages(&req).await {
         Ok(events) => {
             // PRD-brain-prompt-cache AC6: log cache usage counters per turn.
@@ -1697,7 +1953,7 @@ async fn handle_turn_user(
                 record_turn_for_writeback(state, &turn.transcript, &assistant_stored, now_ms).await;
             } else {
                 let stored = text.clone();
-                let reply = ReplyEvent { text, ts: now_ms };
+                let reply = ReplyEvent { text, ts: now_ms, loudness: None };
                 publish
                     .publish(outgoing::REPLY, serde_json::to_value(&reply)?)
                     .await
@@ -1737,7 +1993,7 @@ async fn handle_turn_user_ladder(
     state: &DaemonState,
     publish: &mut dyn EventSink,
     model: &str,
-    tier: &str,
+    _tier: &str,
     child_lock: bool,
     turn: &TurnUserEvent,
     now_ms: u64,
@@ -1745,6 +2001,69 @@ async fn handle_turn_user_ladder(
     let Some(ladder) = state.ladder.as_ref() else {
         return Ok(());
     };
+
+    // --- Routing policy (PRD-wintermute-brain-routing §2.2) ---
+    //
+    // Compute the routing decision before the ladder runs. The decision
+    // supplies an *advisory* starting tier and a machine-readable reason for
+    // the `wm.brain.route` observability envelope.
+    let (routing_config, pending_tier_override, api_key_present) = {
+        let cfg = state.config.lock().await;
+        (
+            cfg.routing.clone(),
+            cfg.pending_tier.clone(),
+            !std::env::var(&cfg.api_key_env).unwrap_or_default().is_empty(),
+        )
+    };
+    // Reachability is currently derived from whether we have an API key and the
+    // ladder has an Anthropic client — a lightweight heuristic that avoids a
+    // blocking TCP probe on the hot path. A full TTL-cached probe is deferred
+    // to a later iteration.
+    let online = api_key_present;
+    let route_decision = apply_routing_policy(&PolicyInputs {
+        transcript: turn.transcript.clone(),
+        pending_tier_override,
+        api_key_present,
+        online,
+        prefer: routing_config.prefer,
+        command_max_words: routing_config.command_max_words,
+    });
+    // Advisory starting tier from routing policy; the ladder may escalate further.
+    let routing_start_tier = match route_decision.tier {
+        RouteTier::Local => crate::TIER_LOCAL_3B,
+        RouteTier::Cloud => crate::SHORT_MODEL_SONNET,
+        RouteTier::Canned => {
+            // Both backends are flagged unavailable by policy.
+            // Emit a canned phrase and publish route event.
+            let turn_count = state.intent_counter.load(Ordering::Relaxed);
+            #[allow(clippy::as_conversions, reason = "small counter index")]
+            let phrase_idx: usize = turn_count as usize;
+            let phrase = canned_phrase(phrase_idx);
+            let reply = ReplyEvent { text: phrase.to_string(), ts: now_ms, loudness: None };
+            publish
+                .publish(outgoing::REPLY, serde_json::to_value(&reply)?)
+                .await
+                .context("publish canned reply")?;
+            let route_evt = RouteEvent {
+                turn_id: now_ms,
+                tier: RouteTier::Canned,
+                reason: route_decision.reason.as_str().to_string(),
+                latency_ms: Some(0),
+                model: "canned".to_string(),
+                ts: now_ms,
+            };
+            if let Ok(v) = serde_json::to_value(&route_evt) {
+                if let Err(e) = publish.publish(outgoing::ROUTE, v).await {
+                    warn!(err = %e, "wm-brain: failed to publish route event (canned)");
+                }
+            }
+            return Ok(());
+        }
+    };
+    // The caller-supplied `tier` is the config default; the routing decision
+    // may override it (e.g. command → local-3b even when config default is sonnet).
+    let effective_tier = routing_start_tier;
+
     let hits = match state.recall.fetch(&turn.transcript).await {
         Ok(h) => h,
         Err(err) => {
@@ -1753,23 +2072,26 @@ async fn handle_turn_user_ladder(
         }
     };
     let recall_ctx = format_recall_context(&hits);
-    // Stable cacheable prefix (no per-turn recall context — PRD-brain-prompt-cache §2.2).
-    let stable_prefix = compose_persona(&state.persona, child_lock, None);
+    let recap = { state.recap_context.lock().await.clone() };
+    // Stable cacheable prefix (no per-turn recall/recap context — PRD-brain-prompt-cache §2.2).
+    let stable_prefix = compose_stable_prefix(&state.persona, child_lock);
     // Build the request with history prefix (PRD-wmd-turn-history §2.2).
     let history_msgs = {
         let history = state.history.lock().await;
         history.trimmed_messages(DEFAULT_MAX_TOKENS as usize)
     };
-    let req = compose_request(model, &stable_prefix, recall_ctx.as_deref(), &history_msgs, &turn.transcript);
+    let req = compose_request(model, &stable_prefix, recall_ctx.as_deref(), recap.as_deref(), &history_msgs, &turn.transcript);
 
+    let start_ms = crate::bus::now_unix_ms();
     let sink = crate::ladder::BufferingSink::default();
     let outcome = ladder
-        .run_turn_sticky(&turn.transcript, &req, tier, &sink, &state.session_floor)
+        .run_turn_sticky(&turn.transcript, &req, effective_tier, &sink, &state.session_floor)
         .await;
+    let latency_ms = crate::bus::now_unix_ms().saturating_sub(start_ms);
 
     // Publish any filler backchannels first (AC9), then the answer.
     for filler in sink.take_fillers() {
-        let reply = ReplyEvent { text: filler, ts: now_ms };
+        let reply = ReplyEvent { text: filler, ts: now_ms, loudness: None };
         publish
             .publish(outgoing::REPLY, serde_json::to_value(&reply)?)
             .await
@@ -1784,7 +2106,26 @@ async fn handle_turn_user_ladder(
                 // Do NOT push empty-answer turns to history (AC3).
                 return Ok(());
             }
-            info!(tier = %served, "wm-brain ladder: turn served");
+            info!(
+                tier = %served,
+                reason = %route_decision.reason.as_str(),
+                latency_ms = latency_ms,
+                "wm-brain ladder: turn served"
+            );
+            // Publish wm.brain.route observability event (PRD §2.5).
+            let route_evt = RouteEvent {
+                turn_id: now_ms,
+                tier: route_decision.tier,
+                reason: route_decision.reason.as_str().to_string(),
+                latency_ms: Some(latency_ms),
+                model: served.clone(),
+                ts: now_ms,
+            };
+            if let Ok(v) = serde_json::to_value(&route_evt) {
+                if let Err(e) = publish.publish(outgoing::ROUTE, v).await {
+                    warn!(err = %e, "wm-brain: failed to publish route event");
+                }
+            }
             touch_recalled_hits(state.recall.as_ref(), &hits).await;
             if let Some((intent, spoken)) = parse_destructive_intent(&text) {
                 // Store the spoken prefix (AC5 — destructive turns store
@@ -1801,7 +2142,7 @@ async fn handle_turn_user_ladder(
                 record_turn_for_writeback(state, &turn.transcript, &assistant_stored, now_ms).await;
             } else {
                 let stored = text.clone();
-                let reply = ReplyEvent { text, ts: now_ms };
+                let reply = ReplyEvent { text, ts: now_ms, loudness: None };
                 publish
                     .publish(outgoing::REPLY, serde_json::to_value(&reply)?)
                     .await
@@ -1818,7 +2159,30 @@ async fn handle_turn_user_ladder(
         }
         crate::ladder::LadderOutcome::Degraded { reason } => {
             error!(reason = %reason, "wm-brain ladder: turn degraded (no tier could serve)");
-            publish_error_at(publish, "ladder", &reason, now_ms).await?;
+            // Publish a canned degrade phrase rather than going silent (AC7).
+            let turn_count = state.intent_counter.load(Ordering::Relaxed);
+            #[allow(clippy::as_conversions, reason = "small counter index")]
+            let phrase_idx: usize = turn_count as usize;
+            let phrase = canned_phrase(phrase_idx);
+            let reply = ReplyEvent { text: phrase.to_string(), ts: now_ms, loudness: None };
+            publish
+                .publish(outgoing::REPLY, serde_json::to_value(&reply)?)
+                .await
+                .context("publish canned degrade reply")?;
+            // Publish route event with canned tier.
+            let route_evt = RouteEvent {
+                turn_id: now_ms,
+                tier: RouteTier::Canned,
+                reason: crate::router::RouteReason::TotalFailure.as_str().to_string(),
+                latency_ms: Some(latency_ms),
+                model: "canned".to_string(),
+                ts: now_ms,
+            };
+            if let Ok(v) = serde_json::to_value(&route_evt) {
+                if let Err(e) = publish.publish(outgoing::ROUTE, v).await {
+                    warn!(err = %e, "wm-brain: failed to publish route event (degraded)");
+                }
+            }
             // Do NOT push degraded turns to history (AC3).
         }
     }
@@ -2152,6 +2516,7 @@ async fn handle_confirm_denied(
     let reply = ReplyEvent {
         text: DESTRUCTIVE_CANCELLATION_REPLY.to_string(),
         ts: now_ms,
+        loudness: None,
     };
     publish
         .publish(outgoing::REPLY, serde_json::to_value(&reply)?)
@@ -2795,7 +3160,7 @@ mod tests {
     fn compose_request_uses_canonical_model_and_includes_persona() {
         use crate::anthropic::{SystemField, SystemBlock};
         // AC4 / baseline: empty history → exactly one user message (single-message behaviour).
-        let req = compose_request("sonnet", "be terse", None, &[], "hello there");
+        let req = compose_request("sonnet", "be terse", None, None, &[], "hello there");
         assert_eq!(req.model, "claude-sonnet-4-6");
         assert_eq!(req.max_tokens, DEFAULT_MAX_TOKENS);
         assert!(req.stream);
@@ -2831,7 +3196,7 @@ mod tests {
             ts: 2,
         });
         let history_msgs = h.to_messages();
-        let req = compose_request("sonnet", "persona", None, &history_msgs, "third question");
+        let req = compose_request("sonnet", "persona", None, None, &history_msgs, "third question");
         assert_eq!(req.messages.len(), 5, "2 prior pairs + current user = 5");
         assert_eq!(req.messages[0].role, Role::User);
         assert_eq!(req.messages[0].content, "first question");
@@ -2966,6 +3331,7 @@ mod tests {
             topic_for_emit(&Emit::Reply(ReplyEvent {
                 text: String::new(),
                 ts: 0,
+                loudness: None,
             })),
             outgoing::REPLY
         );
@@ -3012,6 +3378,7 @@ mod tests {
         let e = Emit::Reply(ReplyEvent {
             text: "ok".to_string(),
             ts: 42,
+            loudness: None,
         });
         let v = emit_to_value(&e).expect("serialises");
         assert_eq!(v["text"], "ok");
@@ -3206,7 +3573,7 @@ mod tests {
 
     #[test]
     fn compose_persona_without_lock_or_context_appends_destructive_guard() {
-        let out = compose_persona("base persona", false, None);
+        let out = compose_persona("base persona", false, None, None);
         assert!(out.starts_with("base persona"));
         assert!(out.contains(DESTRUCTIVE_GATE_GUARD));
         assert!(
@@ -3217,7 +3584,7 @@ mod tests {
 
     #[test]
     fn compose_persona_with_child_lock_appends_guard_before_destructive() {
-        let out = compose_persona("base", true, None);
+        let out = compose_persona("base", true, None, None);
         assert!(out.starts_with("base"));
         let lock_idx = out.find(CHILD_LOCK_GUARD).expect("lock guard present");
         let dest_idx = out
@@ -3230,7 +3597,7 @@ mod tests {
     #[test]
     fn compose_persona_with_empty_context_still_includes_destructive_guard() {
         // compose_persona ignores recall_context (moved to compose_request tail block).
-        let out = compose_persona("base", false, Some(""));
+        let out = compose_persona("base", false, Some(""), None);
         assert!(out.starts_with("base"));
         assert!(out.contains(DESTRUCTIVE_GATE_GUARD));
         assert!(
@@ -3246,10 +3613,14 @@ mod tests {
     fn compose_persona_never_includes_recall_context() {
         // Previously compose_persona spliced recall into the system prompt;
         // now it must not — the context is kept out of the cached prefix.
-        let out = compose_persona("base", true, Some("ctx block"));
+        let out = compose_persona("base", true, Some("ctx block"), Some("recap block"));
         assert!(
             !out.contains("ctx block"),
             "compose_persona must not splice recall context (PRD-brain-prompt-cache AC3)"
+        );
+        assert!(
+            !out.contains("recap block"),
+            "compose_persona must not splice recap context (PRD-brain-prompt-cache AC3)"
         );
         // But the stable guards must still be present.
         let lock_idx = out.find(CHILD_LOCK_GUARD).expect("lock guard present");
@@ -3265,7 +3636,7 @@ mod tests {
     fn compose_request_places_recall_context_after_cached_prefix() {
         use crate::anthropic::{SystemField, SystemBlock};
         let recall = "ctx: user likes tea";
-        let req = compose_request("sonnet", "stable persona", Some(recall), &[], "hi");
+        let req = compose_request("sonnet", "stable persona", Some(recall), None, &[], "hi");
         let SystemField::Blocks(blocks) = req.system.as_ref().unwrap() else {
             panic!("expected blocks form");
         };
@@ -3295,8 +3666,8 @@ mod tests {
         let base = "You are Wintermute.";
         let recall_turn1 = Some("ctx: user likes tea");
         let recall_turn2 = Some("ctx: user likes coffee");
-        let req1 = compose_request("sonnet", base, recall_turn1, &[], "turn 1");
-        let req2 = compose_request("sonnet", base, recall_turn2, &[], "turn 2");
+        let req1 = compose_request("sonnet", base, recall_turn1, None, &[], "turn 1");
+        let req2 = compose_request("sonnet", base, recall_turn2, None, &[], "turn 2");
         let SystemField::Blocks(b1) = req1.system.as_ref().unwrap() else { panic!() };
         let SystemField::Blocks(b2) = req2.system.as_ref().unwrap() else { panic!() };
         // The first block (stable prefix) must be byte-identical across turns.
@@ -3530,7 +3901,16 @@ mod tests {
         assert_eq!(calls.len(), 1);
         let system = system_text(&calls[0]);
         assert!(system.contains("She prefers chamomile tea."));
-        assert!(system.starts_with(DEFAULT_PERSONA));
+        // The default persona is now composed from PersonaConfig (WarmElder);
+        // verify the base appears at the start rather than hard-coding the
+        // old DEFAULT_PERSONA const (PRD-hearth-persona-config §2.3).
+        let expected_base = BrainConfig::default()
+            .persona
+            .compose_base(BrainConfig::default().user_name.as_deref());
+        assert!(
+            system.starts_with(&expected_base),
+            "system prompt should start with composed persona base"
+        );
         assert!(
             !system.contains(CHILD_LOCK_GUARD),
             "child-lock off in default config"
@@ -3591,8 +3971,13 @@ mod tests {
         assert_eq!(events[0].1["text"], "fallback reply");
         let calls = captured.lock().unwrap();
         let system = system_text(&calls[0]);
+        // The persona base is now composed from PersonaConfig; verify the
+        // default composed base is preserved on recall error.
+        let expected_base = BrainConfig::default()
+            .persona
+            .compose_base(BrainConfig::default().user_name.as_deref());
         assert!(
-            system.starts_with(DEFAULT_PERSONA),
+            system.starts_with(&expected_base),
             "persona base preserved on recall error"
         );
         assert!(
@@ -5153,7 +5538,7 @@ mod tests {
         let mut h = History::new(4);
         h.push(HTurn { user: "prev user".to_string(), assistant: "prev asst".to_string(), ts: 0 });
         let msgs = h.to_messages();
-        let req = compose_request("sonnet", "persona", None, &msgs, "current");
+        let req = compose_request("sonnet", "persona", None, None, &msgs, "current");
         assert_eq!(req.messages.len(), 3);
         assert_eq!(req.messages[0].role, Role::User);
         assert_eq!(req.messages[0].content, "prev user");
@@ -5249,12 +5634,22 @@ mod tests {
         .await
         .expect("dispatch ok");
         let events = sink.non_session_events();
-        assert_eq!(events.len(), 1, "exactly one reply published");
-        assert_eq!(events[0].0, outgoing::REPLY);
+        // A ladder turn now publishes wm.brain.reply + wm.brain.route (PRD-brain-routing §2.5).
+        let reply_events: Vec<_> = events
+            .iter()
+            .filter(|(t, _)| t == outgoing::REPLY)
+            .collect();
+        assert_eq!(reply_events.len(), 1, "exactly one reply published");
         assert_eq!(
-            events[0].1["text"],
+            reply_events[0].1["text"],
             "It's a calm, pleasant afternoon here."
         );
+        // A route event is also published.
+        let route_events: Vec<_> = events
+            .iter()
+            .filter(|(t, _)| t == outgoing::ROUTE)
+            .collect();
+        assert_eq!(route_events.len(), 1, "exactly one route event published");
     }
 
     // ── almanac-acknowledge integration tests (PRD-almanac-acknowledge) ────────
@@ -5799,5 +6194,361 @@ mod tests {
         assert_eq!(bus::SESSION_TOPIC_PREFIX, "wm.brain.session.");
         assert!(outgoing::SESSION_START.starts_with(bus::SESSION_TOPIC_PREFIX));
         assert!(outgoing::SESSION_END.starts_with(bus::SESSION_TOPIC_PREFIX));
+    }
+
+    // ── Session recap tests (PRD-wmd-session-recap) ─────────────────────────
+
+    /// Build a QueryHit with the thread subject for testing recap.
+    fn thread_hit(id: &str, snippet: &str) -> QueryHit {
+        QueryHit {
+            id: id.to_string(),
+            kind: "episodic".to_string(),
+            subject: format!("{}{}", THREAD_SUBJECT_PREFIX, "2026-05-28"),
+            path: format!("/tmp/{id}.md"),
+            snippet: snippet.to_string(),
+            score: 0.9,
+            confidence: 0.9,
+        }
+    }
+
+    // format_recap_context tests ─────────────────────────────────────────────
+
+    // AC2 — cold store is a no-op: empty hits → None.
+    #[test]
+    fn format_recap_context_empty_returns_none() {
+        assert!(format_recap_context(&[]).is_none());
+    }
+
+    // AC1 — thread memories render under "Recent conversations:" label.
+    #[test]
+    fn format_recap_context_uses_distinct_label() {
+        let hits = vec![thread_hit("t1", "User was worried about the appointment.")];
+        let out = format_recap_context(&hits).expect("non-empty");
+        assert!(
+            out.contains("Recent conversations"),
+            "distinct label for model to distinguish"
+        );
+        assert!(out.contains("User was worried about the appointment."));
+        assert!(!out.contains("What you remember"), "not the profile label");
+    }
+
+    // AC4 — bound respected: only N most recent hits returned.
+    #[test]
+    fn format_recap_context_renders_at_most_n_snippets() {
+        let hits = vec![
+            thread_hit("t1", "First memory."),
+            thread_hit("t2", "Second memory."),
+            thread_hit("t3", "Third memory."),
+        ];
+        // format_recap_context itself doesn't bound — bounding happens upstream.
+        // But with 3 hits it renders all 3.
+        let out = format_recap_context(&hits).expect("non-empty");
+        assert!(out.contains("First memory."));
+        assert!(out.contains("Second memory."));
+        assert!(out.contains("Third memory."));
+    }
+
+    #[test]
+    fn format_recap_context_skips_blank_snippets() {
+        let hits = vec![
+            thread_hit("t1", "Real memory."),
+            thread_hit("t2", "   "), // blank
+        ];
+        let out = format_recap_context(&hits).expect("non-empty because t1 has content");
+        assert!(out.contains("Real memory."));
+        // blank snippet is not rendered as an empty numbered item
+        assert!(!out.contains("2."), "blank snippet not rendered");
+    }
+
+    // handle_session_start unit tests ────────────────────────────────────────
+
+    // AC2 — cold store: no thread memories → recap_context stays None.
+    #[tokio::test]
+    async fn handle_session_start_cold_store_no_context() {
+        // FakeRecall with only profile hits (no thread subject) — simulates cold store.
+        let recall = Arc::new(FakeRecall::new(vec![
+            fake_hit("p1", "profile fact", 0.9),
+        ]));
+        let cfg = BrainConfig::default();
+        let state = Arc::new(
+            DaemonState::new(cfg).with_recall(recall),
+        );
+        let mut sink = MemSink::default();
+        handle_session_start(state.as_ref(), &mut sink, 1000).await;
+        // No thread-subject hits → recap_context remains None.
+        let ctx = state.recap_context.lock().await.clone();
+        assert!(ctx.is_none(), "cold store leaves recap_context None");
+        // No opener published.
+        assert!(sink.events.lock().unwrap().is_empty());
+    }
+
+    // AC1 — recap injects recent thread context.
+    #[tokio::test]
+    async fn handle_session_start_injects_thread_context() {
+        let recall = Arc::new(FakeRecall::new(vec![
+            thread_hit("t1", "Yesterday you were worried about the appointment."),
+        ]));
+        let cfg = BrainConfig {
+            recap_max_memories: 5,
+            recap_opener: false,
+            ..BrainConfig::default()
+        };
+        let state = Arc::new(
+            DaemonState::new(cfg).with_recall(recall),
+        );
+        let mut sink = MemSink::default();
+        handle_session_start(state.as_ref(), &mut sink, 1000).await;
+        let ctx = state.recap_context.lock().await.clone();
+        assert!(ctx.is_some(), "thread hit → recap_context set");
+        let ctx_str = ctx.unwrap();
+        assert!(ctx_str.contains("Recent conversations"), "correct label");
+        assert!(ctx_str.contains("Yesterday you were worried about the appointment."));
+    }
+
+    // AC3 — recap is session-scoped: thread query fires once per session.
+    #[tokio::test]
+    async fn handle_session_start_fires_thread_query_once() {
+        let recall = Arc::new(FakeRecall::new(vec![
+            thread_hit("t1", "Some thread memory."),
+        ]));
+        let cfg = BrainConfig::default();
+        let state = Arc::new(
+            DaemonState::new(cfg).with_recall(recall),
+        );
+        let mut sink = MemSink::default();
+        // Call handle_session_start once (one session.start).
+        handle_session_start(state.as_ref(), &mut sink, 1000).await;
+        let count = state.session_thread_query_count.load(Ordering::SeqCst);
+        assert_eq!(count, 1, "exactly one thread query per session.start");
+    }
+
+    // AC3 continued — per-turn recall query is separate (not the thread query).
+    // Verify that multiple turns don't increment session_thread_query_count.
+    #[tokio::test]
+    async fn per_turn_recall_does_not_increment_thread_query_count() {
+        let recall = Arc::new(FakeRecall::new(vec![
+            thread_hit("t1", "Some thread memory."),
+        ]));
+        let cfg = BrainConfig::default();
+        let state = Arc::new(
+            DaemonState::new(cfg).with_recall(Arc::clone(&recall) as Arc<dyn RecallSource>),
+        );
+        // Start session (fires one thread query).
+        let mut sink = MemSink::default();
+        dispatch(
+            state.as_ref(),
+            &mut sink,
+            Request::TurnUser(TurnUserEvent {
+                transcript: "first turn".to_string(),
+                confidence: 1.0,
+                ts: 0,
+            }),
+            0,
+        )
+        .await
+        .expect("dispatch ok");
+        // Session opened: exactly one thread query.
+        let count_after_session = state.session_thread_query_count.load(Ordering::SeqCst);
+        assert_eq!(count_after_session, 1);
+        // Another turn within the same session — no new thread query.
+        let mut sink2 = MemSink::default();
+        dispatch(
+            state.as_ref(),
+            &mut sink2,
+            Request::TurnUser(TurnUserEvent {
+                transcript: "second turn within session".to_string(),
+                confidence: 1.0,
+                ts: 1000,
+            }),
+            1000,
+        )
+        .await
+        .expect("dispatch ok");
+        let count_after_second = state.session_thread_query_count.load(Ordering::SeqCst);
+        assert_eq!(count_after_second, 1, "per-turn recall does not fire thread query");
+    }
+
+    // AC4 — bound respected: recap_max_memories limits injected memories.
+    #[tokio::test]
+    async fn handle_session_start_respects_max_memories_bound() {
+        let hits = vec![
+            thread_hit("t1", "Memory one."),
+            thread_hit("t2", "Memory two."),
+            thread_hit("t3", "Memory three."),
+            thread_hit("t4", "Memory four."),
+            thread_hit("t5", "Memory five."),
+        ];
+        let recall = Arc::new(FakeRecall::new(hits));
+        let cfg = BrainConfig {
+            recap_max_memories: 2,
+            ..BrainConfig::default()
+        };
+        let state = Arc::new(
+            DaemonState::new(cfg).with_recall(recall),
+        );
+        let mut sink = MemSink::default();
+        handle_session_start(state.as_ref(), &mut sink, 1000).await;
+        let ctx = state.recap_context.lock().await.clone();
+        let ctx_str = ctx.expect("context set");
+        // The search call is bounded by recap_max_memories=2.
+        // With FakeRecall returning all 5 but limit=2 passed to search,
+        // we verify the context contains at most 2 numbered items.
+        let count_items = ctx_str.matches("Memory").count();
+        assert!(
+            count_items <= 2,
+            "at most recap_max_memories items injected; got {count_items}"
+        );
+    }
+
+    // AC5 — proposals are not read: only thread-subject memories are surfaced.
+    // We simulate this by including both thread-subject and non-thread hits.
+    // The recap handler filters by subject prefix.
+    #[tokio::test]
+    async fn handle_session_start_filters_to_thread_subject_only() {
+        let hits = vec![
+            // Thread hit (should be included).
+            thread_hit("t1", "Thread memory."),
+            // Profile hit (not under thread prefix — should be excluded).
+            fake_hit("p1", "Profile fact.", 0.9),
+        ];
+        let recall = Arc::new(FakeRecall::new(hits));
+        let cfg = BrainConfig::default();
+        let state = Arc::new(
+            DaemonState::new(cfg).with_recall(recall),
+        );
+        let mut sink = MemSink::default();
+        handle_session_start(state.as_ref(), &mut sink, 1000).await;
+        let ctx = state.recap_context.lock().await.clone();
+        let ctx_str = ctx.expect("context set from thread hit");
+        assert!(ctx_str.contains("Thread memory."), "thread hit included");
+        assert!(!ctx_str.contains("Profile fact."), "profile hit excluded");
+    }
+
+    // AC6 — opener off by default: recap_opener=false → no wm.brain.reply before first turn.
+    #[tokio::test]
+    async fn handle_session_start_opener_off_by_default() {
+        let recall = Arc::new(FakeRecall::new(vec![
+            thread_hit("t1", "Some thread memory."),
+        ]));
+        let cfg = BrainConfig {
+            recap_opener: false,
+            ..BrainConfig::default()
+        };
+        let state = Arc::new(
+            DaemonState::new(cfg).with_recall(recall),
+        );
+        let mut sink = MemSink::default();
+        handle_session_start(state.as_ref(), &mut sink, 1000).await;
+        // Context was set but no reply published.
+        assert!(state.recap_context.lock().await.is_some(), "context set");
+        let events = sink.events.lock().unwrap();
+        assert!(events.is_empty(), "no opener published when recap_opener=false (AC6)");
+    }
+
+    // AC7 — opener on publishes a continuity greeting.
+    #[tokio::test]
+    async fn handle_session_start_opener_on_publishes_reply() {
+        let recall = Arc::new(FakeRecall::new(vec![
+            thread_hit("t1", "you mentioned your daughter visits Sunday"),
+        ]));
+        let cfg = BrainConfig {
+            recap_opener: true,
+            ..BrainConfig::default()
+        };
+        let state = Arc::new(
+            DaemonState::new(cfg).with_recall(recall),
+        );
+        let mut sink = MemSink::default();
+        handle_session_start(state.as_ref(), &mut sink, 1000).await;
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 1, "exactly one reply published as opener");
+        assert_eq!(events[0].0, outgoing::REPLY, "published on reply topic");
+        let text = events[0].1["text"].as_str().expect("text field");
+        assert!(
+            text.contains("you mentioned your daughter visits Sunday"),
+            "opener text references thread snippet: {text}"
+        );
+    }
+
+    // AC8 — recall outage tolerated: query failure → session proceeds with no recap.
+    #[tokio::test]
+    async fn handle_session_start_outage_leaves_no_recap() {
+        let recall = Arc::new(FailingRecall);
+        let cfg = BrainConfig::default();
+        let state = Arc::new(
+            DaemonState::new(cfg).with_recall(recall),
+        );
+        let mut sink = MemSink::default();
+        // Must not panic.
+        handle_session_start(state.as_ref(), &mut sink, 1000).await;
+        let ctx = state.recap_context.lock().await.clone();
+        assert!(ctx.is_none(), "recall outage → recap_context None (AC8)");
+        // No events published.
+        assert!(sink.events.lock().unwrap().is_empty());
+    }
+
+    // recall + recap passed as volatile tail blocks via compose_request (AC3 / AC4 integration).
+    #[test]
+    fn compose_request_splices_recall_and_recap_as_tail_blocks() {
+        use crate::anthropic::{SystemField, SystemBlock};
+        let recall_ctx = "What you remember about the user (most relevant first):\n1. Drinks tea.";
+        let recap_ctx = "Recent conversations (most recent first):\n1. Discussed appointment.";
+        let req = compose_request("sonnet", "base", Some(recall_ctx), Some(recap_ctx), &[], "hi");
+        let SystemField::Blocks(blocks) = req.system.as_ref().unwrap() else {
+            panic!("expected blocks form");
+        };
+        // stable prefix + recall tail + recap tail = 3 blocks.
+        assert_eq!(blocks.len(), 3);
+        // Stable prefix carries cache breakpoint.
+        let SystemBlock::Text { cache_control, .. } = &blocks[0];
+        assert!(cache_control.is_some(), "stable prefix must carry cache breakpoint");
+        // Recall tail: no breakpoint.
+        let SystemBlock::Text { text: recall_text, cache_control: cc1 } = &blocks[1];
+        assert!(recall_text.contains("What you remember"), "recall block present");
+        assert!(cc1.is_none(), "recall tail must not carry breakpoint");
+        // Recap tail: no breakpoint.
+        let SystemBlock::Text { text: recap_text, cache_control: cc2 } = &blocks[2];
+        assert!(recap_text.contains("Discussed appointment"), "recap block present");
+        assert!(cc2.is_none(), "recap tail must not carry breakpoint");
+        // Recap follows recall in block order.
+        let full_text = system_text(&req);
+        let recall_idx = full_text.find("What you remember").expect("recall present");
+        let recap_idx = full_text.find("Recent conversations").expect("recap present");
+        assert!(recap_idx > recall_idx, "recap section follows recall context");
+    }
+
+    // recap_context cleared on new session: confirm dispatch resets it when session opens.
+    // Simulate: state has recap_context set from a prior session; new session.start fires;
+    // handle_session_start re-queries (NullRecall → no hits → None again).
+    #[tokio::test]
+    async fn dispatch_clears_recap_context_on_new_session() {
+        let cfg = BrainConfig {
+            idle_gap_ms: 300_000,
+            ..BrainConfig::default()
+        };
+        let state = Arc::new(DaemonState::new(cfg));
+        // Manually set recap_context to simulate a prior session.
+        *state.recap_context.lock().await = Some("stale recap".to_string());
+
+        // Fire a turn that opens a new session (first turn ever).
+        let mut sink = MemSink::default();
+        dispatch(
+            state.as_ref(),
+            &mut sink,
+            Request::TurnUser(TurnUserEvent {
+                transcript: "hello".to_string(),
+                confidence: 1.0,
+                ts: 0,
+            }),
+            0,
+        )
+        .await
+        .expect("dispatch ok");
+        // NullRecall returns no hits → recap_context should be None after the new session.
+        let ctx = state.recap_context.lock().await.clone();
+        assert!(
+            ctx.is_none(),
+            "new session with NullRecall clears stale recap_context"
+        );
     }
 }

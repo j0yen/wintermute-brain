@@ -80,6 +80,15 @@ impl History {
         self.turns.is_empty()
     }
 
+    /// Return the most-recently-pushed turn, or `None` when the ring is empty.
+    ///
+    /// Used by the repair-affordance replay path to fetch the last assistant
+    /// text without an LLM call (PRD-wmd-repair-affordances §2.2).
+    #[must_use]
+    pub fn last(&self) -> Option<&Turn> {
+        self.turns.back()
+    }
+
     /// Convert history into a flat `[user, assistant, …]` message list
     /// (without the current-user turn). Oldest pair is first.
     ///

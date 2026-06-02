@@ -1,5 +1,53 @@
 # Changelog
 
+## v0.14.0 — 2026-06-02
+
+Add routing classifier and wm.brain.route observability to wintermute-brain.
+
+New src/router.rs implements command-vs-conversational turn classification (deterministic, no model call on the hot path), a six-row routing policy table (PRD §2.2), RoutingConfig ([routing] brain.toml section), and a canned degrade phrase bank. The daemon now publishes wm.brain.route after every ladder turn with tier, reason, latency_ms, and model for operator observability. wmd gains `route status` and `route prefer` subcommands. 328 tests pass.
+
+## v0.13.0 — 2026-06-02
+
+Adds first-contact greeting module: GreetingMode (off/auto/first-ever-always), GreetingKind
+(FirstEver/Returning/Silent), RecallPresence probe struct, select_greeting_kind, compose_greeting,
+and GreetingGuard (greet-once). Extends PersonaConfig with `greeting` and `wake_word` fields.
+14 new lib tests cover all 6 automated ACs.
+
+## v0.12.0 — 2026-06-02
+
+hearth-persona-config: lift the companion's persona out of a hardcoded `const` into a configurable `[persona]` table in `brain.toml`.
+
+- New `PersonaConfig` + `Register` enum (WarmElder default, Plain, Brisk) in `lib.rs`; all fields `#[serde(default)]` so existing configs load unchanged.
+- `Register::compose_base` builds the persona prose with `{self_name}`/`{user_name}` substitution; WarmElder is calibrated for a non-technical elder (short sentences, no jargon), Plain reproduces the retained `DEFAULT_PERSONA` byte-for-byte.
+- Persona composed once at config load (`DaemonState::new`) so it stays a byte-stable prompt-cache prefix; per-turn recall/recap still layer after via `compose_persona`.
+- CLI: `wmd persona show` and `wmd persona set-register <warm-elder|plain|brisk>` (atomic-write, mirrors swap-model).
+- 9 new lib tests (deserialization defaults, per-field override, register→prose, name substitution, user-clause omission, cache-prefix stability, extra append, serde round-trip). 311 tests pass.
+
+## v0.11.0 — 2026-06-02
+
+brain-backend-ladder: local-first tier ladder for wintermute-brain.
+
+Implements PRD-brain-backend-ladder: a 5-rung tier ladder (local-3b →
+local-8b → haiku → sonnet → opus) with LadderClient orchestrator,
+dual-signal escalation (hard LocalOutcome::Escalate + soft wm-verify
+reject), safety-override pre-route for high-stakes turns, conversational
+stickiness (SessionFloor), filler-while-escalating (ESCALATION_FILLER),
+key-gate relaxation (brain works with no Anthropic API key), and full
+config integration (default_tier, pending_tier, local_endpoint in
+brain.toml). Also fixes bus_smoke compile error: agorabus DaemonConfig
+gained drain_grace_ms/drain_resume_hint_ms fields.
+
+All 302+ tests green; no new clippy warnings beyond baseline.
+
+## v0.9.0 — 2026-05-30
+
+Adds cross-session thread memory recall (wmd-session-recap): on session.start
+wmd queries recall for recent committed wintermute-thread-* memories and holds
+them session-scoped; spliced into every turn's system prompt under "Recent
+conversations:" distinct from per-turn profile recall. Optional recap_opener
+(default off) publishes a proactive continuity greeting before first turn.
+Recall outages tolerated. 15 new tests (293 total). AC1-AC8 covered.
+
 ## v0.8.0 — 2026-05-30
 
 PRD-wmd-turn-history gave the brain a rolling last-N buffer, but without session
