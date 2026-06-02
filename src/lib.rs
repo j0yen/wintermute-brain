@@ -117,6 +117,10 @@ fn default_self_name() -> String {
     "wintermute".to_string()
 }
 
+fn default_wake_word() -> String {
+    "hey wintermute".to_string()
+}
+
 const fn default_addresses_user() -> bool {
     true
 }
@@ -133,6 +137,7 @@ const fn default_max_sentences() -> u8 {
 /// [`PersonaConfig::default`].
 ///
 /// PRD-hearth-persona-config §2.1.
+/// PRD-hearth-first-contact-greeting §2.3 adds `greeting` + `wake_word`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PersonaConfig {
     /// What the companion calls herself out loud.
@@ -153,6 +158,22 @@ pub struct PersonaConfig {
     /// register.
     #[serde(default)]
     pub extra: String,
+    /// Controls whether (and when) the daemon emits a proactive boot
+    /// greeting before the user's first turn. Default:
+    /// [`greeting::GreetingMode::Off`] (conservative — no proactive
+    /// speech unless the deployment opts in).
+    ///
+    /// PRD-hearth-first-contact-greeting §2.3.
+    #[serde(default)]
+    pub greeting: greeting::GreetingMode,
+    /// The voice wake word surfaced in the
+    /// [`greeting::GreetingKind::FirstEver`] teaching block.
+    /// Defaults to `"hey wintermute"`. The deployment should override
+    /// this when the wake word differs.
+    ///
+    /// PRD-hearth-first-contact-greeting §2.2.
+    #[serde(default = "default_wake_word")]
+    pub wake_word: String,
 }
 
 impl Default for PersonaConfig {
@@ -163,6 +184,8 @@ impl Default for PersonaConfig {
             addresses_user: default_addresses_user(),
             max_sentences: default_max_sentences(),
             extra: String::new(),
+            greeting: greeting::GreetingMode::default(),
+            wake_word: default_wake_word(),
         }
     }
 }
@@ -198,6 +221,7 @@ pub mod anthropic;
 pub mod bus;
 pub mod daemon;
 pub mod degrade;
+pub mod greeting;
 pub mod history;
 pub mod ladder;
 pub mod persist;
@@ -1190,6 +1214,7 @@ extra = "Always end with a friendly greeting."
             addresses_user: true,
             max_sentences: 2,
             extra: "Be concise.".to_string(),
+            ..PersonaConfig::default()
         };
         let a = p.compose_base(Some("Mum"));
         let b = p.compose_base(Some("Mum"));
@@ -1217,6 +1242,7 @@ extra = "Always end with a friendly greeting."
             addresses_user: false,
             max_sentences: 1,
             extra: "Extra note.".to_string(),
+            ..PersonaConfig::default()
         };
         let v = serde_json::to_value(&original).expect("serialises");
         let back: PersonaConfig = serde_json::from_value(v).expect("round-trips");
