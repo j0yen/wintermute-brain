@@ -18,6 +18,7 @@ use tracing_subscriber::EnvFilter;
 use wintermute_brain::{
     BrainConfig, BrainError, DEFAULT_API_KEY_ENV, Register, daemon,
     default_config_path, validate_model_name,
+    router::RoutePrefer,
 };
 
 #[derive(Parser, Debug)]
@@ -74,6 +75,12 @@ enum Command {
         #[command(subcommand)]
         cmd: PersonaCommand,
     },
+    /// Inspect or change the routing configuration.
+    /// PRD-wintermute-brain-routing §2.4.
+    Route {
+        #[command(subcommand)]
+        cmd: RouteCommand,
+    },
 }
 
 /// Sub-commands for `wmd persona`.
@@ -85,6 +92,18 @@ enum PersonaCommand {
     SetRegister {
         /// Register name: `warm-elder`, `plain`, or `brisk`.
         register: String,
+    },
+}
+
+/// Sub-commands for `wmd route`.
+#[derive(Subcommand, Debug)]
+enum RouteCommand {
+    /// Print the effective routing configuration as JSON and exit.
+    Status,
+    /// Persist the deployment-wide tier preference in `brain.toml`.
+    Prefer {
+        /// `auto`, `local-only`, or `cloud-only`.
+        preference: String,
     },
 }
 
@@ -135,6 +154,20 @@ fn main() -> ExitCode {
             }
             PersonaCommand::SetRegister { register } => {
                 run_persona_set_register(&config_path, &register)
+            }
+        },
+        Command::Route { cmd } => match cmd {
+            RouteCommand::Status => {
+                match load_effective(&config_path, cli.recall_sock, &cli.api_key_env) {
+                    Ok(cfg) => run_route_status(&cfg, &config_path),
+                    Err(err) => {
+                        error!(error = %err, "wmd route status: config load failed");
+                        ExitCode::from(1)
+                    }
+                }
+            }
+            RouteCommand::Prefer { preference } => {
+                run_route_prefer(&config_path, &preference)
             }
         },
     }
@@ -311,6 +344,52 @@ fn run_persona_set_register(path: &std::path::Path, register: &str) -> ExitCode 
         register = %register,
         path = %path.display(),
         "wmd persona set-register: persisted"
+    );
+    ExitCode::SUCCESS
+}
+
+/// Print the effective routing configuration as JSON.
+/// PRD-wintermute-brain-routing §2.4 / `wmd route status`.
+fn run_route_status(cfg: &BrainConfig, path: &std::path::Path) -> ExitCode {
+    match serde_json::to_string_pretty(&cfg.routing) {
+        Ok(s) => {
+            info!(routing = %s, config_path = %path.display(), "wmd route status");
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            error!(error = %err, "wmd route status: failed to serialise routing config");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// Persist the deployment-wide routing preference atomically.
+/// PRD-wintermute-brain-routing §2.4 / `wmd route prefer`.
+#[allow(clippy::cognitive_complexity, reason = "parse -> load -> mutate -> save shell")]
+fn run_route_prefer(path: &std::path::Path, preference: &str) -> ExitCode {
+    let Some(pref) = RoutePrefer::parse(preference) else {
+        error!(
+            preference = %preference,
+            "wmd route prefer: unknown preference; expected auto, local-only, or cloud-only"
+        );
+        return ExitCode::from(1);
+    };
+    let mut cfg = match BrainConfig::load_from_file(path) {
+        Ok(c) => c,
+        Err(err) => {
+            error!(error = %err, "wmd route prefer: load failed");
+            return ExitCode::from(1);
+        }
+    };
+    cfg.routing.prefer = pref;
+    if let Err(err) = cfg.save_to_file(path) {
+        error!(error = %err, "wmd route prefer: save failed");
+        return ExitCode::from(1);
+    }
+    info!(
+        preference = %preference,
+        path = %path.display(),
+        "wmd route prefer: persisted"
     );
     ExitCode::SUCCESS
 }

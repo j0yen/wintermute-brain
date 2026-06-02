@@ -51,7 +51,15 @@ pub mod outgoing {
     /// Session closed — payload: `{ session_id, ts, turn_count, reason }`.
     /// PRD-wmd-session-boundary §2.3.
     pub const SESSION_END: &str = "wm.brain.session.end";
+    /// Per-turn routing decision — `{ turn_id, tier, reason, latency_ms, model, ts }`.
+    /// PRD-wintermute-brain-routing §2.5.
+    pub const ROUTE: &str = "wm.brain.route";
 }
+
+/// Self-emitted `wm.brain.route` topic.  The daemon's subscribe-loop
+/// allow-list includes this so the bus does not reject self-published route
+/// events (PRD-wintermute-brain-routing §2.5).
+pub const ROUTE_TOPIC: &str = "wm.brain.route";
 
 /// The `wm.brain.session.*` topic prefix. The brain subscribes to
 /// `wm.dialog.*` inbound; it also publishes to this prefix. The self-emit
