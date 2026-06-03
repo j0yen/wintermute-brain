@@ -56,6 +56,32 @@ gained drain_grace_ms/drain_resume_hint_ms fields.
 
 All 302+ tests green; no new clippy warnings beyond baseline.
 
+## v0.10.0 — 2026-05-30
+
+wmd-repair-affordances: local-replay repair path — "say that again, louder."
+
+Once the history ring (v0.3.0) is in place, verbatim repair requests become
+near-free: no model round-trip, no token cost, no latency. Matches "say that
+again", "what did you say", "louder", "speak up" (and related) brain-side
+and replays the last assistant turn from the ring.
+
+- New `src/repair.rs`: `Repair` enum + `classify()` + phrase normalisation;
+  config-driven phrase sets with built-in defaults (12 repeat phrases, 10
+  louder phrases); word-count ambiguity guard (≤5 words) prevents long
+  sentences containing a keyword from being mis-classified (AC5).
+- `src/bus.rs`: `ReplyEvent` gains optional `loudness: Option<String>` field
+  (`#[serde(skip_serializing_if = "Option::is_none")]` — backward-compatible;
+  AC6).
+- `src/lib.rs`: `BrainConfig` gains `repair_repeat_phrases` /
+  `repair_louder_phrases` `Vec<String>` (empty = use defaults; AC7).
+- `src/history.rs`: `History::last()` accessor for repair replay path.
+- `src/daemon.rs`: repair check runs before LLM dispatch in
+  `handle_turn_user()`; `handle_repair()` publishes replay with optional
+  loudness hint; empty history degrades to "I haven't said anything yet"
+  (AC3). Replayed turns are not pushed back into history (AC4).
+
+302 lib tests (was 293), +9 new. `cargo deny check bans licenses sources` clean.
+
 ## v0.9.0 — 2026-05-30
 
 Adds cross-session thread memory recall (wmd-session-recap): on session.start
