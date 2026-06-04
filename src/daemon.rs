@@ -2031,7 +2031,9 @@ async fn handle_turn_user_ladder(
     // Advisory starting tier from routing policy; the ladder may escalate further.
     let routing_start_tier = match route_decision.tier {
         RouteTier::Local => crate::TIER_LOCAL_3B,
-        RouteTier::Cloud => crate::SHORT_MODEL_SONNET,
+        // Cloud routes start at HAIKU (fast + cheap) for snappy voice latency
+        // (~1-2s) instead of sonnet; the ladder can still escalate if needed.
+        RouteTier::Cloud => crate::SHORT_MODEL_HAIKU,
         RouteTier::Canned => {
             // Both backends are flagged unavailable by policy.
             // Emit a canned phrase and publish route event.
