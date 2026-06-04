@@ -2557,12 +2557,55 @@ fn into_dyn_llm<T: LlmClient + 'static>(client: T) -> Arc<dyn LlmClient> {
 /// (optional) Anthropic client. The brain stays up even with no API key —
 /// local tiers serve, cloud tiers degrade. Stakes come from a keyword+rules
 /// router; recall liveness drives the recall-down safe posture.
+/// The default ladder, optionally CAPPED at the rung named by the
+/// `WM_BRAIN_MAX_TIER` env var (inclusive). Unset/empty → full ladder.
+/// Unknown name → full ladder (warns). Example: `WM_BRAIN_MAX_TIER=local-3b`
+/// keeps every turn on the local 3B model — never escalating to the 8B or to
+/// the cloud tiers (the single-rung ladder is safe: start_index clamps via
+/// first_cloud_index→last rung, and a hard escalate at_top degrades instead
+/// of climbing — see ladder.rs AC5: never a panic, never a hang).
+fn capped_ladder() -> Vec<crate::Tier> {
+    let mut tiers = crate::default_ladder();
+    // Optional CEILING: WM_BRAIN_MAX_TIER truncates the ladder at the named
+    // rung (inclusive). Unset/empty/unknown → no truncation.
+    if let Ok(cap) = std::env::var("WM_BRAIN_MAX_TIER") {
+        let cap = cap.trim();
+        if !cap.is_empty() {
+            match tiers.iter().position(|t| t.name == cap) {
+                Some(pos) => {
+                    tiers.truncate(pos + 1);
+                    info!(max_tier = cap, "wm-brain: tier ladder CAPPED at rung");
+                }
+                None => warn!(max_tier = cap, "wm-brain: WM_BRAIN_MAX_TIER names no known rung; ignoring"),
+            }
+        }
+    }
+    // Optional EXCLUSIONS: WM_BRAIN_SKIP_TIERS removes the named rungs (comma
+    // separated) while keeping the rest of the ladder intact. e.g.
+    // WM_BRAIN_SKIP_TIERS=local-8b skips the 8B model but still allows the
+    // local 3B AND the cloud rungs (haiku/sonnet/opus).
+    if let Ok(skip) = std::env::var("WM_BRAIN_SKIP_TIERS") {
+        let skip: Vec<String> = skip
+            .split(',')
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !skip.is_empty() {
+            tiers.retain(|t| !skip.iter().any(|s| s == &t.name));
+            info!(skip = ?skip, "wm-brain: tier ladder rungs EXCLUDED");
+        }
+    }
+    tiers
+}
+
 fn build_ladder(
     cfg: &BrainConfig,
     llm: Option<&Arc<dyn LlmClient>>,
 ) -> Arc<crate::ladder::LadderClient> {
+    let tiers = capped_ladder();
+    let rung_names: Vec<String> = tiers.iter().map(|t| t.name.clone()).collect();
     let ladder = Arc::new(crate::ladder::LadderClient::new(
-        crate::default_ladder(),
+        tiers,
         Arc::new(crate::ladder::LiveLocalBackend::new(cfg.local_endpoint.clone())),
         llm.cloned(),
         Arc::new(crate::ladder::RouterStakes::new()),
@@ -2572,6 +2615,7 @@ fn build_ladder(
         default_tier = %cfg.resolved_default_tier(),
         local_endpoint = %cfg.local_endpoint,
         has_api_key = llm.is_some(),
+        rungs = ?rung_names,
         "wm-brain: tier ladder wired (local-first; cloud tiers gated on api key)"
     );
     ladder
