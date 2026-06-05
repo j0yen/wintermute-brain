@@ -1,0 +1,61 @@
+# llama-server.service — dedicated llama.cpp server for the Ryzen 7 5700U node.
+#
+# PRD-constellation-brain-local §2:
+#   - Serves qwen2.5-8B-Instruct Q4_K_M (+ optional 3B routing model) on :8080.
+#   - Host-only via Tailscale mesh (ACL enforced at network layer; 0.0.0.0 bind
+#     so Tailscale IP is reachable from other fleet nodes).
+#   - Resource-isolated in its own systemd slice so the model process keeps its
+#     cores+RAM; build jobs are NEVER dispatched to this host.
+#   - Explicitly NOT ROCm; uses Vulkan (RADV) or CPU as selected by detect-backend.sh.
+#   - Expected throughput: ~8-10 tok/s for 8B Q4, ~18-28 tok/s for 3B Q4.
+#   - This is the privacy/offline/cheap-default tier — NOT the sub-2s latency brain.
+#     The Anthropic API stays the latency brain.
+
+[Unit]
+Description=llama.cpp server — constellation local-llm node (5700U APU)
+Documentation=https://github.com/ggerganov/llama.cpp
+After=network.target tailscaled.service
+Wants=tailscaled.service
+
+[Service]
+# Run in the dedicated brain-local slice for resource isolation (AC4).
+Slice=brain-local.slice
+
+Type=simple
+Restart=on-failure
+RestartSec=10s
+
+# The model path and API key come from EnvironmentFile, not hardcoded (AC7).
+EnvironmentFile=-/etc/wintermute/brain-local.env
+EnvironmentFile=-%h/.config/wintermute/brain-local.env
+
+# Backend flags are written by detect-backend.sh during the install/Ansible step.
+# Default: CPU (safe on any host). Override via LLAMA_EXTRA_FLAGS in the env file.
+Environment="LLAMA_EXTRA_FLAGS="
+
+ExecStart=/usr/local/bin/llama-server \
+    --model ${LLAMA_MODEL_PATH} \
+    --host 0.0.0.0 \
+    --port 8080 \
+    --ctx-size 4096 \
+    --threads 8 \
+    --api-key ${LLAMA_API_KEY} \
+    --log-prefix \
+    ${LLAMA_EXTRA_FLAGS}
+
+# Keep the model resident — do not swap it out between requests.
+# systemd OOM killer is disabled for this unit (the model is the whole point).
+OOMPolicy=continue
+MemorySwapMax=0
+
+# Do not register as a build worker. This unit runs on the dedicated LLM node;
+# constellation-cloud-build routing ensures build jobs never land here (AC4).
+# The marker file is checked by the worker-registration script.
+ExecStartPost=/bin/sh -c 'mkdir -p /run/wintermute && echo "no-build-worker" > /run/wintermute/role'
+
+# Graceful shutdown: let the model finish the current inference before stopping.
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target
