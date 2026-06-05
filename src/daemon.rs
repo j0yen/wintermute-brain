@@ -1563,7 +1563,7 @@ pub async fn tick_almanac_timeout(
     } else {
         // First elapse — speak the gentle re-ask and reset window (AC4).
         let re_ask_text = "Did you take it? Just say yes or later if you need more time.";
-        let reply = bus::ReplyEvent { text: re_ask_text.to_string(), ts: now_ms, loudness: None };
+        let reply = bus::ReplyEvent { text: re_ask_text.to_string(), ts: now_ms, loudness: None, turn_id: None };
         publish
             .publish(bus::outgoing::REPLY, serde_json::to_value(&reply)?)
             .await
@@ -1662,6 +1662,7 @@ pub async fn handle_speak_almanac_due(
         text: say.to_string(),
         ts: now_ms,
         loudness: None,
+        turn_id: None,
     };
     publish
         .publish(
@@ -1771,7 +1772,7 @@ pub async fn handle_session_start(
                 .filter(|s| !s.is_empty())
             {
                 let opener_text = format!("Earlier you mentioned: {first_snippet}");
-                let reply = bus::ReplyEvent { text: opener_text, ts: now_ms, loudness: None };
+                let reply = bus::ReplyEvent { text: opener_text, ts: now_ms, loudness: None, turn_id: None };
                 if let Ok(payload) = serde_json::to_value(&reply) {
                     if let Err(err) = publish.publish(outgoing::REPLY, payload).await {
                         warn!(err = %err, "wm-brain recap: opener publish failed");
@@ -1844,7 +1845,7 @@ async fn handle_repair(
         loudness = ?loudness,
         "wm-brain: repair replay"
     );
-    let reply = ReplyEvent { text, ts: now_ms, loudness };
+    let reply = ReplyEvent { text, ts: now_ms, loudness, turn_id: None };
     publish
         .publish(outgoing::REPLY, serde_json::to_value(&reply)?)
         .await
@@ -1922,6 +1923,9 @@ async fn handle_turn_user(
         history.trimmed_messages(DEFAULT_MAX_TOKENS as usize)
     };
     let req = compose_request(model, &stable_prefix, recall_ctx.as_deref(), recap.as_deref(), &history_msgs, &turn.transcript);
+    // Cross-daemon turn correlation id (PRD lucid-turn-id, AC4 + AC3-brain):
+    // adopt inbound, else mint a `gen-`-flagged id.
+    let turn_corr = crate::bus::resolve_turn_id(turn.turn_id.as_deref());
     // Publish injected-context digest (PRD-build-lucid-mind-brain-context §2, AC1-AC4).
     publish_context_event(publish, &hits, child_lock, history_msgs.len() / 2, now_ms).await;
     match llm.collect_messages(&req).await {
@@ -1943,7 +1947,7 @@ async fn handle_turn_user(
                 // fence, so the companion hears the right text on replay
                 // (PRD-wmd-turn-history §2.1 + AC5).
                 let assistant_stored = spoken.clone();
-                publish_destructive(state, publish, intent, spoken, now_ms).await?;
+                publish_destructive(state, publish, intent, spoken, now_ms, Some(turn_corr.clone())).await?;
                 // Push the stored spoken text as the assistant turn.
                 let mut history = state.history.lock().await;
                 history.push(Turn {
@@ -1955,7 +1959,12 @@ async fn handle_turn_user(
                 record_turn_for_writeback(state, &turn.transcript, &assistant_stored, now_ms).await;
             } else {
                 let stored = text.clone();
-                let reply = ReplyEvent { text, ts: now_ms, loudness: None };
+                let reply = ReplyEvent {
+                    text,
+                    ts: now_ms,
+                    loudness: None,
+                    turn_id: Some(turn_corr.clone()),
+                };
                 publish
                     .publish(outgoing::REPLY, serde_json::to_value(&reply)?)
                     .await
@@ -2004,6 +2013,12 @@ async fn handle_turn_user_ladder(
         return Ok(());
     };
 
+    // Cross-daemon turn correlation id (PRD lucid-turn-id, AC4 + AC3-brain):
+    // adopt the inbound turn_id minted at wake, or mint a `gen-`-flagged one
+    // for system-injected / pre-PRD turns. Threaded onto every outbound
+    // wm.brain.* envelope this turn so downstream (wm-tts) can copy it.
+    let turn_corr = crate::bus::resolve_turn_id(turn.turn_id.as_deref());
+
     // --- Routing policy (PRD-wintermute-brain-routing §2.2) ---
     //
     // Compute the routing decision before the ladder runs. The decision
@@ -2043,13 +2058,19 @@ async fn handle_turn_user_ladder(
             #[allow(clippy::as_conversions, reason = "small counter index")]
             let phrase_idx: usize = turn_count as usize;
             let phrase = canned_phrase(phrase_idx);
-            let reply = ReplyEvent { text: phrase.to_string(), ts: now_ms, loudness: None };
+            let reply = ReplyEvent {
+                text: phrase.to_string(),
+                ts: now_ms,
+                loudness: None,
+                turn_id: Some(turn_corr.clone()),
+            };
             publish
                 .publish(outgoing::REPLY, serde_json::to_value(&reply)?)
                 .await
                 .context("publish canned reply")?;
             let route_evt = RouteEvent {
                 turn_id: now_ms,
+                turn_corr: Some(turn_corr.clone()),
                 tier: RouteTier::Canned,
                 reason: route_decision.reason.as_str().to_string(),
                 latency_ms: Some(0),
@@ -2099,7 +2120,12 @@ async fn handle_turn_user_ladder(
 
     // Publish any filler backchannels first (AC9), then the answer.
     for filler in sink.take_fillers() {
-        let reply = ReplyEvent { text: filler, ts: now_ms, loudness: None };
+        let reply = ReplyEvent {
+            text: filler,
+            ts: now_ms,
+            loudness: None,
+            turn_id: Some(turn_corr.clone()),
+        };
         publish
             .publish(outgoing::REPLY, serde_json::to_value(&reply)?)
             .await
@@ -2123,6 +2149,7 @@ async fn handle_turn_user_ladder(
             // Publish wm.brain.route observability event (PRD §2.5).
             let route_evt = RouteEvent {
                 turn_id: now_ms,
+                turn_corr: Some(turn_corr.clone()),
                 tier: route_decision.tier,
                 reason: route_decision.reason.as_str().to_string(),
                 latency_ms: Some(latency_ms),
@@ -2139,7 +2166,7 @@ async fn handle_turn_user_ladder(
                 // Store the spoken prefix (AC5 — destructive turns store
                 // what the user heard, not the JSON fence).
                 let assistant_stored = spoken.clone();
-                publish_destructive(state, publish, intent, spoken, now_ms).await?;
+                publish_destructive(state, publish, intent, spoken, now_ms, Some(turn_corr.clone())).await?;
                 let mut history = state.history.lock().await;
                 history.push(Turn {
                     user: turn.transcript.clone(),
@@ -2150,7 +2177,12 @@ async fn handle_turn_user_ladder(
                 record_turn_for_writeback(state, &turn.transcript, &assistant_stored, now_ms).await;
             } else {
                 let stored = text.clone();
-                let reply = ReplyEvent { text, ts: now_ms, loudness: None };
+                let reply = ReplyEvent {
+                    text,
+                    ts: now_ms,
+                    loudness: None,
+                    turn_id: Some(turn_corr.clone()),
+                };
                 publish
                     .publish(outgoing::REPLY, serde_json::to_value(&reply)?)
                     .await
@@ -2172,7 +2204,12 @@ async fn handle_turn_user_ladder(
             #[allow(clippy::as_conversions, reason = "small counter index")]
             let phrase_idx: usize = turn_count as usize;
             let phrase = canned_phrase(phrase_idx);
-            let reply = ReplyEvent { text: phrase.to_string(), ts: now_ms, loudness: None };
+            let reply = ReplyEvent {
+                text: phrase.to_string(),
+                ts: now_ms,
+                loudness: None,
+                turn_id: Some(turn_corr.clone()),
+            };
             publish
                 .publish(outgoing::REPLY, serde_json::to_value(&reply)?)
                 .await
@@ -2180,6 +2217,7 @@ async fn handle_turn_user_ladder(
             // Publish route event with canned tier.
             let route_evt = RouteEvent {
                 turn_id: now_ms,
+                turn_corr: Some(turn_corr.clone()),
                 tier: RouteTier::Canned,
                 reason: crate::router::RouteReason::TotalFailure.as_str().to_string(),
                 latency_ms: Some(latency_ms),
@@ -2423,6 +2461,7 @@ async fn publish_destructive(
     intent: DestructiveIntent,
     spoken: String,
     now_ms: u64,
+    turn_id: Option<String>,
 ) -> Result<()> {
     let intent_id = state.mint_intent_id(now_ms);
     let action = json!({
@@ -2453,6 +2492,7 @@ async fn publish_destructive(
         confirm_keyword,
         action,
         ts: now_ms,
+        turn_id,
     };
     publish
         .publish(outgoing::REPLY_DESTRUCTIVE, serde_json::to_value(&event)?)
@@ -2487,6 +2527,7 @@ async fn handle_confirm_granted(
         tool: tool.clone(),
         args: args.clone(),
         ts: now_ms,
+        turn_id: None,
     };
     publish
         .publish(outgoing::TOOL_CALL, serde_json::to_value(&call)?)
@@ -2498,6 +2539,7 @@ async fn handle_confirm_granted(
         ok: result.ok,
         body: result.body,
         ts: now_ms,
+        turn_id: None,
     };
     publish
         .publish(outgoing::TOOL_RESULT, serde_json::to_value(&result_event)?)
@@ -2525,6 +2567,7 @@ async fn handle_confirm_denied(
         text: DESTRUCTIVE_CANCELLATION_REPLY.to_string(),
         ts: now_ms,
         loudness: None,
+        turn_id: None,
     };
     publish
         .publish(outgoing::REPLY, serde_json::to_value(&reply)?)
@@ -3233,6 +3276,7 @@ mod tests {
             transcript: "hello".to_string(),
             confidence: 0.9,
             ts: 1,
+            turn_id: None,
         });
         dispatch(state.as_ref(), &mut sink, req, 1)
             .await
@@ -3378,6 +3422,7 @@ mod tests {
             transcript: "hi".to_string(),
             confidence: 1.0,
             ts: 1,
+            turn_id: None,
         });
         dispatch(state.as_ref(), &mut sink, req, 7777)
             .await
@@ -3400,6 +3445,7 @@ mod tests {
             transcript: "hi".to_string(),
             confidence: 1.0,
             ts: 1,
+            turn_id: None,
         });
         dispatch(state.as_ref(), &mut sink, req, 4242)
             .await
@@ -3435,6 +3481,7 @@ mod tests {
             transcript: "hi".to_string(),
             confidence: 1.0,
             ts: 1,
+            turn_id: None,
         });
         dispatch(state.as_ref(), &mut sink, req, 9001)
             .await
@@ -3461,6 +3508,7 @@ mod tests {
                 text: String::new(),
                 ts: 0,
                 loudness: None,
+                turn_id: None,
             })),
             outgoing::REPLY
         );
@@ -3472,6 +3520,7 @@ mod tests {
                 confirm_keyword: String::new(),
                 action: json!({}),
                 ts: 0,
+                turn_id: None,
             })),
             outgoing::REPLY_DESTRUCTIVE
         );
@@ -3480,6 +3529,7 @@ mod tests {
                 tool: String::new(),
                 args: json!({}),
                 ts: 0,
+                turn_id: None,
             })),
             outgoing::TOOL_CALL
         );
@@ -3489,6 +3539,7 @@ mod tests {
                 ok: true,
                 body: json!({}),
                 ts: 0,
+                turn_id: None,
             })),
             outgoing::TOOL_RESULT
         );
@@ -3508,6 +3559,7 @@ mod tests {
             text: "ok".to_string(),
             ts: 42,
             loudness: None,
+            turn_id: None,
         });
         let v = emit_to_value(&e).expect("serialises");
         assert_eq!(v["text"], "ok");
@@ -3523,6 +3575,7 @@ mod tests {
             confirm_keyword: "delete".to_string(),
             action: json!({ "tool": "wm.fs.rm" }),
             ts: 7,
+            turn_id: None,
         });
         let v = emit_to_value(&e).expect("serialises");
         assert_eq!(v["intent_id"], "01abc");
@@ -4022,6 +4075,7 @@ mod tests {
             transcript: "what should I drink?".to_string(),
             confidence: 1.0,
             ts: 1,
+            turn_id: None,
         });
         dispatch(state.as_ref(), &mut sink, req, 7)
             .await
@@ -4063,6 +4117,7 @@ mod tests {
             transcript: "tell me a joke".to_string(),
             confidence: 1.0,
             ts: 1,
+            turn_id: None,
         });
         dispatch(state.as_ref(), &mut sink, req, 11)
             .await
@@ -4090,6 +4145,7 @@ mod tests {
             transcript: "anything".to_string(),
             confidence: 1.0,
             ts: 1,
+            turn_id: None,
         });
         dispatch(state.as_ref(), &mut sink, req, 13)
             .await
@@ -4257,6 +4313,7 @@ mod tests {
             transcript: "what should I drink?".to_string(),
             confidence: 1.0,
             ts: 1,
+            turn_id: None,
         });
         dispatch(state.as_ref(), &mut sink, req, 7)
             .await
@@ -4286,6 +4343,7 @@ mod tests {
             transcript: "hi".to_string(),
             confidence: 1.0,
             ts: 1,
+            turn_id: None,
         });
         dispatch(state.as_ref(), &mut sink, req, 7)
             .await
@@ -4317,6 +4375,7 @@ mod tests {
             transcript: "hi".to_string(),
             confidence: 1.0,
             ts: 1,
+            turn_id: None,
         });
         dispatch(state.as_ref(), &mut sink, req, 7)
             .await
@@ -4344,6 +4403,7 @@ mod tests {
             transcript: "hi".to_string(),
             confidence: 1.0,
             ts: 1,
+            turn_id: None,
         });
         dispatch(state.as_ref(), &mut sink, req, 7)
             .await
@@ -4375,6 +4435,7 @@ mod tests {
             transcript: "delete that".to_string(),
             confidence: 1.0,
             ts: 1,
+            turn_id: None,
         });
         dispatch(state.as_ref(), &mut sink, req, 7)
             .await
@@ -4405,6 +4466,7 @@ mod tests {
             transcript: "hi".to_string(),
             confidence: 1.0,
             ts: 1,
+            turn_id: None,
         });
         dispatch(state.as_ref(), &mut sink, req, 7)
             .await
@@ -4515,6 +4577,7 @@ mod tests {
             transcript: "remove /tmp/x".to_string(),
             confidence: 1.0,
             ts: 1,
+            turn_id: None,
         });
         dispatch(state.as_ref(), &mut sink, req, 5555)
             .await
@@ -4552,6 +4615,7 @@ mod tests {
             transcript: "rm".to_string(),
             confidence: 1.0,
             ts: 1,
+            turn_id: None,
         });
         dispatch(state.as_ref(), &mut sink, req, 1)
             .await
@@ -4573,6 +4637,7 @@ mod tests {
             transcript: "hi".to_string(),
             confidence: 1.0,
             ts: 1,
+            turn_id: None,
         });
         dispatch(state.as_ref(), &mut sink, req, 9)
             .await
@@ -4805,6 +4870,7 @@ mod tests {
                     transcript: (*utterance).to_string(),
                     confidence: 1.0,
                     ts: 1_000 + idx,
+                    turn_id: None,
                 }),
                 turn_now,
             )
@@ -4969,6 +5035,7 @@ mod tests {
                 transcript: "hi".to_string(),
                 confidence: 1.0,
                 ts: 1,
+                turn_id: None,
             }),
             1,
         )
@@ -4999,6 +5066,7 @@ mod tests {
                 transcript: "hi".to_string(),
                 confidence: 1.0,
                 ts: 1,
+                turn_id: None,
             }),
             1,
         )
@@ -5036,6 +5104,7 @@ mod tests {
                 transcript: "hi".to_string(),
                 confidence: 1.0,
                 ts: 1,
+                turn_id: None,
             }),
             1,
         )
@@ -5070,6 +5139,7 @@ mod tests {
                 transcript: "one".to_string(),
                 confidence: 1.0,
                 ts: 1,
+                turn_id: None,
             }),
             1,
         )
@@ -5082,6 +5152,7 @@ mod tests {
                 transcript: "two".to_string(),
                 confidence: 1.0,
                 ts: 2,
+                turn_id: None,
             }),
             2,
         )
@@ -5163,6 +5234,7 @@ mod tests {
                     transcript: (*t).to_string(),
                     confidence: 1.0,
                     ts: i as u64 + 1,
+                    turn_id: None,
                 }),
                 i as u64 + 1,
             )
@@ -5223,6 +5295,7 @@ mod tests {
                     transcript: format!("q{i}"),
                     confidence: 1.0,
                     ts: i,
+                    turn_id: None,
                 }),
                 i,
             )
@@ -5300,6 +5373,7 @@ mod tests {
                     transcript: (*t).to_string(),
                     confidence: 1.0,
                     ts: i as u64,
+                    turn_id: None,
                 }),
                 i as u64,
             )
@@ -5345,6 +5419,7 @@ mod tests {
                     transcript: format!("q{i}"),
                     confidence: 1.0,
                     ts: i,
+                    turn_id: None,
                 }),
                 i,
             )
@@ -5420,6 +5495,7 @@ mod tests {
                     transcript: "delete that file".to_string(),
                     confidence: 1.0,
                     ts: 1,
+                    turn_id: None,
                 }),
                 1,
             )
@@ -5436,6 +5512,7 @@ mod tests {
                     transcript: "what else?".to_string(),
                     confidence: 1.0,
                     ts: 2,
+                    turn_id: None,
                 }),
                 2,
             )
@@ -5486,6 +5563,7 @@ mod tests {
                     transcript: (*q).to_string(),
                     confidence: 1.0,
                     ts: i as u64,
+                    turn_id: None,
                 }),
                 i as u64,
             )
@@ -5523,6 +5601,7 @@ mod tests {
                     transcript: format!("q{i}"),
                     confidence: 1.0,
                     ts: i,
+                    turn_id: None,
                 }),
                 i,
             )
@@ -5584,6 +5663,7 @@ mod tests {
                     transcript: (*q).to_string(),
                     confidence: 1.0,
                     ts: i as u64,
+                    turn_id: None,
                 }),
                 i as u64,
             )
@@ -5617,6 +5697,7 @@ mod tests {
                 transcript: "hello".to_string(),
                 confidence: 1.0,
                 ts: 1,
+                turn_id: None,
             }),
             1,
         )
@@ -5648,6 +5729,7 @@ mod tests {
                     transcript: (*q).to_string(),
                     confidence: 1.0,
                     ts: i as u64,
+                    turn_id: None,
                 }),
                 i as u64,
             )
@@ -5757,6 +5839,7 @@ mod tests {
                 transcript: "tell me about your afternoon".to_string(),
                 confidence: 1.0,
                 ts: 7,
+                turn_id: None,
             }),
             7,
         )
@@ -5779,6 +5862,98 @@ mod tests {
             .filter(|(t, _)| t == outgoing::ROUTE)
             .collect();
         assert_eq!(route_events.len(), 1, "exactly one route event published");
+    }
+
+    // ── turn_id adoption tests (PRD lucid-turn-id, AC4 + AC3-brain) ──────────────
+
+    /// AC4: when the inbound `wm.dialog.turn.user` carries a `turn_id`, the brain
+    /// adopts it verbatim onto the outbound `wm.brain.reply` and `wm.brain.route`
+    /// (`turn_corr`) — the correlation id is the inbound one, NOT a fresh now_ms.
+    #[tokio::test]
+    async fn ladder_adopts_inbound_turn_id_onto_reply_and_route() {
+        let ladder = Arc::new(crate::ladder::LadderClient::new(
+            crate::default_ladder(),
+            Arc::new(AlwaysAnswersLocal("adopted-id answer".to_string())),
+            None,
+            Arc::new(FixedStakes(wm_router::Stakes::Ordinary)),
+            Arc::new(RecallUp(true)),
+        ));
+        let state = Arc::new(DaemonState::new(BrainConfig::default()).with_ladder(ladder));
+        let mut sink = MemSink::default();
+        let inbound_id = "0000018f1c2d3e40-0007";
+        dispatch(
+            state.as_ref(),
+            &mut sink,
+            Request::TurnUser(TurnUserEvent {
+                transcript: "carry my id please".to_string(),
+                confidence: 1.0,
+                ts: 7,
+                turn_id: Some(inbound_id.to_string()),
+            }),
+            7,
+        )
+        .await
+        .expect("dispatch ok");
+        let events = sink.non_session_events();
+        let reply = events
+            .iter()
+            .find(|(t, _)| t == outgoing::REPLY)
+            .expect("a reply was published");
+        assert_eq!(
+            reply.1["turn_id"], inbound_id,
+            "reply.turn_id must equal the inbound turn_id (in-id == out-id, AC4)"
+        );
+        let route = events
+            .iter()
+            .find(|(t, _)| t == outgoing::ROUTE)
+            .expect("a route event was published");
+        assert_eq!(
+            route.1["turn_corr"], inbound_id,
+            "route.turn_corr must equal the inbound turn_id (AC4)"
+        );
+    }
+
+    /// AC3-brain + AC5: when NO inbound `turn_id` is present (system-injected /
+    /// pre-PRD turn), the brain mints a freshly-flagged `gen-`-prefixed id rather
+    /// than reusing now_ms, so consumers can tell it was synthesized.
+    #[tokio::test]
+    async fn ladder_mints_flagged_turn_id_when_inbound_absent() {
+        let ladder = Arc::new(crate::ladder::LadderClient::new(
+            crate::default_ladder(),
+            Arc::new(AlwaysAnswersLocal("fallback id answer".to_string())),
+            None,
+            Arc::new(FixedStakes(wm_router::Stakes::Ordinary)),
+            Arc::new(RecallUp(true)),
+        ));
+        let state = Arc::new(DaemonState::new(BrainConfig::default()).with_ladder(ladder));
+        let mut sink = MemSink::default();
+        dispatch(
+            state.as_ref(),
+            &mut sink,
+            Request::TurnUser(TurnUserEvent {
+                transcript: "no id on this turn".to_string(),
+                confidence: 1.0,
+                ts: 11,
+                turn_id: None,
+            }),
+            11,
+        )
+        .await
+        .expect("dispatch ok");
+        let events = sink.non_session_events();
+        let reply = events
+            .iter()
+            .find(|(t, _)| t == outgoing::REPLY)
+            .expect("a reply was published");
+        let id = reply.1["turn_id"]
+            .as_str()
+            .expect("reply.turn_id present even with no inbound id");
+        assert!(
+            id.starts_with("gen-"),
+            "synthesized id must be flagged with a gen- prefix, got {id:?}"
+        );
+        // And it must NOT be the bare now_ms the brain used to mint.
+        assert_ne!(id, "11", "must not reuse now_ms as the turn id");
     }
 
     // ── wm.brain.context event tests (PRD-build-lucid-mind-brain-context) ────────
@@ -5804,6 +5979,7 @@ mod tests {
                 transcript: "context test".to_string(),
                 confidence: 1.0,
                 ts: now_ms,
+                turn_id: None,
             }),
             now_ms,
         )
@@ -5852,6 +6028,7 @@ mod tests {
                 transcript: "hi".to_string(),
                 confidence: 1.0,
                 ts: 42,
+                turn_id: None,
             }),
             42,
         )
@@ -6246,6 +6423,7 @@ mod tests {
                 transcript: "first turn".to_string(),
                 confidence: 1.0,
                 ts: 0,
+                turn_id: None,
             }),
             0,
         )
@@ -6269,6 +6447,7 @@ mod tests {
                 transcript: "second turn after gap".to_string(),
                 confidence: 1.0,
                 ts: six_min_ms,
+                turn_id: None,
             }),
             six_min_ms,
         )
@@ -6312,6 +6491,7 @@ mod tests {
                     transcript: "a turn".to_string(),
                     confidence: 1.0,
                     ts,
+                    turn_id: None,
                 }),
                 ts,
             )
@@ -6353,6 +6533,7 @@ mod tests {
                 transcript: "hello".to_string(),
                 confidence: 1.0,
                 ts: 1000,
+                turn_id: None,
             }),
             1000,
         )
@@ -6374,6 +6555,7 @@ mod tests {
                 transcript: "goodbye".to_string(),
                 confidence: 1.0,
                 ts: 2000,
+                turn_id: None,
             }),
             2000,
         )
@@ -6396,6 +6578,7 @@ mod tests {
                 transcript: "good morning".to_string(),
                 confidence: 1.0,
                 ts: 3000,
+                turn_id: None,
             }),
             3000,
         )
@@ -6563,6 +6746,7 @@ mod tests {
                 transcript: "first turn".to_string(),
                 confidence: 1.0,
                 ts: 0,
+                turn_id: None,
             }),
             0,
         )
@@ -6580,6 +6764,7 @@ mod tests {
                 transcript: "second turn within session".to_string(),
                 confidence: 1.0,
                 ts: 1000,
+                turn_id: None,
             }),
             1000,
         )
@@ -6760,6 +6945,7 @@ mod tests {
                 transcript: "hello".to_string(),
                 confidence: 1.0,
                 ts: 0,
+                turn_id: None,
             }),
             0,
         )

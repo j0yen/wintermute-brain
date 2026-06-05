@@ -2,6 +2,20 @@
 
 ## v0.18.0 — 2026-06-05
 
+### lucid-turn-id: adopt inbound turn_id for brain.route/reply (AC4 + AC3-brain)
+
+The brain now adopts the cross-daemon `turn_id` minted at wake by `wm-audio` and
+threaded through stt → dialog, instead of minting `now_ms` locally. The inbound
+`wm.dialog.turn.user.turn_id` (optional `String`) is propagated onto
+`wm.brain.reply` (`turn_id`), `wm.brain.route` (`turn_corr`), and the
+tool/destructive envelopes, so a whole spoken turn shares one correlation id
+end-to-end (`wm-tts` will copy `reply.turn_id` in a later tick). When no inbound
+id is present (system-injected / pre-PRD turns), a freshly-minted, `gen-`-flagged
+id is used so consumers can tell it was synthesized. Fully additive and
+backward-compatible (AC5): the legacy numeric `route.turn_id` (u64) is retained
+for lucid-mind's route⇄context join, and pre-PRD envelopes with no `turn_id`
+still deserialize. One repo of the multi-repo lucid-turn-id PRD.
+
 ### constellation-brain-local: local-llm tier for 5700U APU node
 
 Added `local-llm` tier to the brain ladder — a dedicated qwen2.5-8B Q4_K_M

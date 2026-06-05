@@ -502,9 +502,16 @@ pub fn canned_phrase(index: usize) -> &'static str {
 /// `wm.brain.route` bus envelope published on every turn (PRD §2.5).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteEvent {
-    /// Stable turn id (if available; the brain doesn't mint turn ids today,
-    /// so this mirrors `ts` as a proxy).
+    /// Legacy numeric turn id (`ts` proxy). Retained for lucid-mind's
+    /// `wm.brain.route` ⇄ `wm.brain.context` join (AC2 of that PRD), which
+    /// keys on this `u64`. Do NOT remove without migrating that consumer.
     pub turn_id: u64,
+    /// Cross-daemon string turn correlation id (PRD lucid-turn-id, AC4):
+    /// the inbound `wm.dialog.turn.user` `turn_id`, or a freshly-minted
+    /// `gen-`-flagged id when none was supplied. Optional for backward
+    /// compat (AC5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_corr: Option<String>,
     /// The tier that was recommended for this turn.
     pub tier: RouteTier,
     /// Machine-readable reason.

@@ -92,6 +92,15 @@ pub struct TurnUserEvent {
     pub confidence: f32,
     /// Unix milliseconds when the turn was finalised by `wm-dialog`.
     pub ts: u64,
+    /// Cross-daemon turn correlation id, minted by `wm-audio` at wake and
+    /// threaded through stt → dialog → brain → tts (PRD lucid-turn-id, AC4).
+    ///
+    /// Format is `<unix_ms_hex>-<seq_hex>` (see [`resolve_turn_id`]). Optional
+    /// for backward compatibility (AC5): pre-PRD `dialog.turn.user` envelopes
+    /// carry no `turn_id` and must still deserialize; the brain then falls back
+    /// to a freshly-minted, `gen-`-flagged id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
 }
 
 /// `wm.dialog.confirm.granted` payload.
@@ -146,6 +155,11 @@ pub struct ReplyEvent {
     /// (backward-compatible — `#[serde(skip_serializing_if = "Option::is_none")]`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub loudness: Option<String>,
+    /// Cross-daemon turn correlation id, adopted from the inbound
+    /// `wm.dialog.turn.user` (PRD lucid-turn-id, AC4). `wm-tts` copies this
+    /// onto `wm.tts.*` in a later tick. Optional for backward compat (AC5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
 }
 
 /// Outbound `wm.brain.reply.destructive` payload.
@@ -165,6 +179,9 @@ pub struct ReplyDestructiveEvent {
     pub action: Value,
     /// Unix milliseconds at emission.
     pub ts: u64,
+    /// Cross-daemon turn correlation id (PRD lucid-turn-id, AC4). Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
 }
 
 /// Outbound `wm.brain.tool.call` payload.
@@ -176,6 +193,9 @@ pub struct ToolCallEvent {
     pub args: Value,
     /// Unix milliseconds at emission.
     pub ts: u64,
+    /// Cross-daemon turn correlation id (PRD lucid-turn-id, AC4). Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
 }
 
 /// Outbound `wm.brain.tool.result` payload.
@@ -189,6 +209,9 @@ pub struct ToolResultEvent {
     pub body: Value,
     /// Unix milliseconds at emission.
     pub ts: u64,
+    /// Cross-daemon turn correlation id (PRD lucid-turn-id, AC4). Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
 }
 
 /// Outbound `wm.brain.error` payload.
@@ -265,6 +288,34 @@ pub fn decode_request(topic: &str, data: &Value) -> Result<Request, DecodeError>
             data.clone(),
         )?)),
         other => Err(DecodeError::UnknownTopic(other.to_string())),
+    }
+}
+
+/// Process-global monotone counter for same-millisecond collision
+/// avoidance in synthesized (`gen-`) turn ids.
+static GEN_TURN_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Resolve the turn correlation id to attach to outbound `wm.brain.*`
+/// envelopes for a given inbound `wm.dialog.turn.user` (PRD lucid-turn-id,
+/// AC4 + AC3-brain).
+///
+/// * If the inbound turn carried a `turn_id` (minted upstream by `wm-audio`
+///   at wake and threaded through stt → dialog), it is **adopted verbatim**
+///   so the whole spoken turn shares one id end-to-end.
+/// * Otherwise (system-injected turns, or pre-PRD envelopes — AC5), a fresh
+///   id is minted and **flagged with a `gen-` prefix** so consumers can tell
+///   it was synthesized by the brain rather than originating at wake. The
+///   minted body matches `wm-audio`'s `<unix_ms_hex>-<seq_hex>` shape.
+#[must_use]
+pub fn resolve_turn_id(inbound: Option<&str>) -> String {
+    match inbound {
+        Some(id) if !id.is_empty() => id.to_owned(),
+        _ => {
+            use std::sync::atomic::Ordering;
+            let ms = now_unix_ms();
+            let seq = GEN_TURN_SEQ.fetch_add(1, Ordering::Relaxed);
+            format!("gen-{ms:013x}-{seq:04x}")
+        }
     }
 }
 
@@ -365,6 +416,7 @@ mod tests {
             text: "hello".to_string(),
             ts: 17,
             loudness: None,
+            turn_id: None,
         };
         let v = serde_json::to_value(&r).expect("serialises");
         let back: ReplyEvent = serde_json::from_value(v).expect("round-trips");
@@ -379,6 +431,7 @@ mod tests {
             text: "Hello!".to_string(),
             ts: 42,
             loudness: Some("loud".to_string()),
+            turn_id: None,
         };
         let v = serde_json::to_value(&r_loud).expect("serialises");
         // The serialised form includes the loudness key.
@@ -401,6 +454,7 @@ mod tests {
             confirm_keyword: "delete".to_string(),
             action: json!({ "tool": "wm.fs.rm", "args": { "path": "/tmp/foo" } }),
             ts: 100,
+            turn_id: None,
         };
         let v = serde_json::to_value(&d).expect("serialises");
         let back: ReplyDestructiveEvent = serde_json::from_value(v).expect("round-trips");
@@ -413,6 +467,7 @@ mod tests {
             tool: "wm.time.now".to_string(),
             args: json!({}),
             ts: 11,
+            turn_id: None,
         };
         let v = serde_json::to_value(&t).expect("serialises");
         let back: ToolCallEvent = serde_json::from_value(v).expect("round-trips");
@@ -426,6 +481,7 @@ mod tests {
             ok: true,
             body: json!({ "iso": "2026-05-26T23:00:00Z" }),
             ts: 12,
+            turn_id: None,
         };
         let v = serde_json::to_value(&r).expect("serialises");
         let back: ToolResultEvent = serde_json::from_value(v).expect("round-trips");
@@ -548,5 +604,40 @@ mod tests {
                 "{topic} not covered by subscribe prefix"
             );
         }
+    }
+
+    // ── resolve_turn_id (PRD lucid-turn-id, AC4 + AC3-brain) ────────────────────
+
+    #[test]
+    fn resolve_turn_id_adopts_inbound_verbatim() {
+        let inbound = "0000018f1c2d3e40-0007";
+        assert_eq!(resolve_turn_id(Some(inbound)), inbound);
+    }
+
+    #[test]
+    fn resolve_turn_id_mints_flagged_when_absent() {
+        let a = resolve_turn_id(None);
+        assert!(a.starts_with("gen-"), "synthesized id must be gen-flagged: {a}");
+        // Empty inbound is treated as absent → also flagged.
+        let b = resolve_turn_id(Some(""));
+        assert!(b.starts_with("gen-"), "empty inbound must fall back: {b}");
+        // Two mints differ (same-ms collision avoidance via the seq counter).
+        assert_ne!(resolve_turn_id(None), resolve_turn_id(None));
+    }
+
+    #[test]
+    fn turn_user_event_deserializes_without_turn_id() {
+        // AC5: a pre-PRD dialog.turn.user (no turn_id) must still decode.
+        let v = serde_json::json!({ "transcript": "hi", "confidence": 0.9, "ts": 1 });
+        let e: TurnUserEvent = serde_json::from_value(v).expect("legacy turn decodes");
+        assert!(e.turn_id.is_none(), "absent turn_id maps to None");
+    }
+
+    #[test]
+    fn reply_event_turn_id_absent_from_json_when_none() {
+        // Backward compat: None turn_id must not appear in serialized payload.
+        let r = ReplyEvent { text: "x".into(), ts: 1, loudness: None, turn_id: None };
+        let v = serde_json::to_value(&r).expect("serialize");
+        assert!(v.get("turn_id").is_none(), "None turn_id must be omitted");
     }
 }
