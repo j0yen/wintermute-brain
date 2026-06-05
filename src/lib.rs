@@ -284,6 +284,7 @@ pub const ALLOWED_MODEL_NAMES: &[&str] = &[
     TIER_LOCAL_3B,
     TIER_LOCAL_8B,
     TIER_LOCAL_GPU,
+    TIER_LOCAL_LLM,
 ];
 
 /// Built-in tier names, lowest→highest rung. PRD-brain-backend-ladder §2.1.
@@ -300,6 +301,19 @@ pub const TIER_LOCAL_8B: &str = "local-8b";
 /// PRD-constellation-brain-gpu AC5 / AC6.
 pub const TIER_LOCAL_GPU: &str = "local-gpu";
 
+/// The dedicated local-LLM tier (Ryzen 7 5700U node running llama-server).
+///
+/// Sits between `local-8b` and the cloud tiers, adjacent to (or in place
+/// of) `local-gpu`. Enabled only when `WM_BRAIN_LOCAL_LLM_ENDPOINT` is set;
+/// otherwise the tier is absent from the ladder and the brain falls through
+/// to cloud exactly as today (graceful absence, AC6 pattern).
+///
+/// This is the privacy/offline/zero-marginal-cost tier — a dedicated
+/// qwen2.5-8B node on the fleet. It is honestly *not* the latency brain
+/// (~8–10 tok/s on a 5700U APU vs sub-2s from cloud); the Anthropic API
+/// stays the latency brain. PRD-constellation-brain-local AC5/AC6.
+pub const TIER_LOCAL_LLM: &str = "local-llm";
+
 /// Default ollama model id for the `local-3b` tier. Config-overridable.
 pub const DEFAULT_LOCAL_3B_MODEL: &str = "qwen2.5:3b";
 /// Default ollama model id for the `local-8b` tier. Config-overridable.
@@ -310,6 +324,15 @@ pub const DEFAULT_LOCAL_8B_MODEL: &str = "qwen3:8b";
 /// ≥8 GB VRAM; 14B variants are selectable for ≥12 GB VRAM hosts.
 /// PRD-constellation-brain-gpu §2.
 pub const DEFAULT_LOCAL_GPU_MODEL: &str = "qwen2.5-7b-instruct:Q4_K_M";
+
+/// Default model id served by the `local-llm` node's `llama-server`
+/// (the Ryzen 7 5700U APU, no discrete GPU).
+///
+/// qwen2.5-8B-Instruct Q4_K_M fits in the ~20 GB headroom after the OS
+/// and is expected to produce ~8–10 tok/s on this CPU-only box.
+/// Overridable via `WM_BRAIN_LOCAL_LLM_MODEL`.
+/// PRD-constellation-brain-local §2.
+pub const DEFAULT_LOCAL_LLM_MODEL: &str = "qwen2.5-8b-instruct:Q4_K_M";
 
 /// Default OpenAI-compatible endpoint for the local backend (ollama on
 /// loopback). PRD-brain-backend-ladder §2.1.
@@ -432,6 +455,45 @@ pub fn ladder_with_gpu(gpu_endpoint: Option<&str>, gpu_model: &str) -> Vec<Tier>
     tiers
 }
 
+/// Build the tier ladder, optionally inserting a `local-llm` rung.
+///
+/// When `local_llm_endpoint` is `Some`, a [`TIER_LOCAL_LLM`] rung is inserted
+/// between `local-8b` (or `local-gpu` when present) and the cloud tiers.
+/// When `None` (the env var is unset or empty), the ladder is identical to
+/// its input.
+///
+/// This function composes with [`ladder_with_gpu`]: call `ladder_with_gpu`
+/// first, then pass the result to this function (or compose in either order —
+/// the insertion logic finds the first Anthropic rung and inserts before it).
+///
+/// Graceful absence: if the local-llm endpoint is unreachable at turn time,
+/// [`crate::ladder::LiveLocalBackend`] maps the failure to
+/// [`wm_local_llm::LocalOutcome::Escalate`] and the ladder climbs to the next
+/// rung without any turn failure. PRD-constellation-brain-local AC6.
+#[must_use]
+pub fn ladder_with_local_llm(
+    base: Vec<Tier>,
+    local_llm_endpoint: Option<&str>,
+    local_llm_model: &str,
+) -> Vec<Tier> {
+    let mut tiers = base;
+    if let Some(endpoint) = local_llm_endpoint {
+        if !endpoint.is_empty() {
+            // Insert before the first Anthropic (cloud) rung, so local-llm
+            // sits after all local rungs (3b, 8b, gpu if present) and before haiku.
+            let insert_pos = tiers
+                .iter()
+                .position(|t| t.backend == Backend::Anthropic)
+                .unwrap_or(tiers.len());
+            tiers.insert(
+                insert_pos,
+                Tier::with_endpoint(TIER_LOCAL_LLM, Backend::Local, local_llm_model, endpoint),
+            );
+        }
+    }
+    tiers
+}
+
 /// The lowest *cloud* (Anthropic) tier name in the default ladder.
 ///
 /// Used as the recall-down safe floor for `Ordinary` turns: when recall is
@@ -508,6 +570,23 @@ pub struct BrainConfig {
     /// PRD-constellation-brain-gpu §2.
     #[serde(default = "default_gpu_model")]
     pub gpu_model: String,
+    /// Optional OpenAI-compatible endpoint for the dedicated `local-llm` tier
+    /// (the Ryzen 7 5700U node running llama-server). When set (or env var
+    /// `WM_BRAIN_LOCAL_LLM_ENDPOINT` is set), a `local-llm` rung is inserted
+    /// between `local-8b` and the cloud tiers (and after `local-gpu` when that
+    /// is also present). When absent, the tier is not present and the ladder
+    /// falls through to cloud exactly as today (graceful absence).
+    ///
+    /// This tier is the privacy/offline/cheap-default brain — NOT the latency
+    /// brain (~8–10 tok/s on the APU). PRD-constellation-brain-local §2 / AC5/AC6.
+    #[serde(default)]
+    pub local_llm_endpoint: Option<String>,
+    /// Model id served by the `local-llm` node's llama-server. Defaults to
+    /// [`DEFAULT_LOCAL_LLM_MODEL`]. Override via `WM_BRAIN_LOCAL_LLM_MODEL`
+    /// or `brain.toml` `local_llm_model = "…"`.
+    /// PRD-constellation-brain-local §2.
+    #[serde(default = "default_local_llm_model")]
+    pub local_llm_model: String,
     /// Number of recent `(user, assistant)` turn pairs retained in the
     /// in-memory rolling history ring. `0` disables history (restores
     /// single-message behaviour). Persisted through `brain.toml`.
@@ -600,6 +679,8 @@ impl Default for BrainConfig {
             local_endpoint: default_local_endpoint(),
             gpu_endpoint: None,
             gpu_model: default_gpu_model(),
+            local_llm_endpoint: None,
+            local_llm_model: default_local_llm_model(),
             history_turns: default_history_turns(),
             almanac_speak: default_almanac_speak(),
             writeback_auto_commit: false,
@@ -631,6 +712,10 @@ fn default_local_endpoint() -> String {
 
 fn default_gpu_model() -> String {
     DEFAULT_LOCAL_GPU_MODEL.to_string()
+}
+
+fn default_local_llm_model() -> String {
+    DEFAULT_LOCAL_LLM_MODEL.to_string()
 }
 
 fn default_history_turns() -> usize {
@@ -835,6 +920,11 @@ impl BrainConfig {
         let gpu_endpoint = env_string("WM_BRAIN_GPU_ENDPOINT");
         let gpu_model =
             env_string("WM_BRAIN_GPU_MODEL").unwrap_or_else(default_gpu_model);
+        // Local-LLM tier — optional; absent means local-llm is not in the ladder.
+        // This is the dedicated Ryzen 7 5700U APU node (constellation-brain-local).
+        let local_llm_endpoint = env_string("WM_BRAIN_LOCAL_LLM_ENDPOINT");
+        let local_llm_model =
+            env_string("WM_BRAIN_LOCAL_LLM_MODEL").unwrap_or_else(default_local_llm_model);
 
         let writeback_auto_commit = match env_string("WM_BRAIN_WRITEBACK_AUTO_COMMIT") {
             Some(raw) => parse_bool_env("WM_BRAIN_WRITEBACK_AUTO_COMMIT", &raw)?,
@@ -887,6 +977,8 @@ impl BrainConfig {
             local_endpoint,
             gpu_endpoint,
             gpu_model,
+            local_llm_endpoint,
+            local_llm_model,
             history_turns: default_history_turns(),
             writeback_auto_commit,
             writeback_model,
@@ -1197,6 +1289,124 @@ mod tests {
         // AC7: the local-gpu tier name must be accepted by validate_model_name
         // so `wmd swap-model local-gpu` works.
         validate_model_name(TIER_LOCAL_GPU).expect("local-gpu must be in ALLOWED_MODEL_NAMES");
+    }
+
+    // ── local-llm tier (PRD-constellation-brain-local) ───────────────────────
+
+    #[test]
+    fn ladder_with_local_llm_inserts_before_cloud() {
+        // AC5: when local_llm_endpoint is Some, local-llm is inserted between
+        // the last local rung and the first cloud rung.
+        let base = default_ladder();
+        let ladder = ladder_with_local_llm(
+            base,
+            Some("http://5700u:8080/v1"),
+            DEFAULT_LOCAL_LLM_MODEL,
+        );
+        let names: Vec<&str> = ladder.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                TIER_LOCAL_3B,
+                TIER_LOCAL_8B,
+                TIER_LOCAL_LLM,
+                SHORT_MODEL_HAIKU,
+                SHORT_MODEL_SONNET,
+                SHORT_MODEL_OPUS,
+            ],
+            "local-llm must sit between local-8b and haiku"
+        );
+        let llm = ladder.iter().find(|t| t.name == TIER_LOCAL_LLM).unwrap();
+        assert_eq!(
+            llm.endpoint_override.as_deref(),
+            Some("http://5700u:8080/v1"),
+            "local-llm tier must carry the endpoint override"
+        );
+        assert_eq!(llm.backend, Backend::Local, "local-llm is a Local backend");
+        assert_eq!(llm.model, DEFAULT_LOCAL_LLM_MODEL);
+    }
+
+    #[test]
+    fn ladder_with_local_llm_absent_when_endpoint_none() {
+        // AC6: when local_llm_endpoint is None the ladder is unchanged.
+        let base = default_ladder();
+        let without = ladder_with_local_llm(base, None, DEFAULT_LOCAL_LLM_MODEL);
+        let default = default_ladder();
+        let names_w: Vec<&str> = without.iter().map(|t| t.name.as_str()).collect();
+        let names_d: Vec<&str> = default.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names_w, names_d, "no local_llm_endpoint → ladder unchanged");
+        assert!(
+            without.iter().all(|t| t.name != TIER_LOCAL_LLM),
+            "local-llm must not appear when endpoint is absent"
+        );
+    }
+
+    #[test]
+    fn ladder_with_local_llm_absent_when_endpoint_empty() {
+        // An empty string is treated as absent (consistent with env-var handling).
+        let base = default_ladder();
+        let without = ladder_with_local_llm(base, Some(""), DEFAULT_LOCAL_LLM_MODEL);
+        assert!(
+            without.iter().all(|t| t.name != TIER_LOCAL_LLM),
+            "empty local_llm_endpoint → local-llm absent"
+        );
+    }
+
+    #[test]
+    fn ladder_with_gpu_and_local_llm_both_present() {
+        // Both GPU and local-llm endpoints set: local-gpu and local-llm both
+        // appear before the cloud tiers, local-gpu first (inserted first, then
+        // local-llm inserted at the Anthropic boundary which is now after gpu).
+        let base = default_ladder();
+        let with_gpu = ladder_with_gpu(Some("http://desktop:8080/v1"), DEFAULT_LOCAL_GPU_MODEL);
+        let with_both = ladder_with_local_llm(
+            with_gpu,
+            Some("http://5700u:8080/v1"),
+            DEFAULT_LOCAL_LLM_MODEL,
+        );
+        let names: Vec<&str> = with_both.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                TIER_LOCAL_3B,
+                TIER_LOCAL_8B,
+                TIER_LOCAL_GPU,
+                TIER_LOCAL_LLM,
+                SHORT_MODEL_HAIKU,
+                SHORT_MODEL_SONNET,
+                SHORT_MODEL_OPUS,
+            ],
+            "both local-gpu and local-llm sit between local-8b and haiku, gpu first"
+        );
+    }
+
+    #[test]
+    fn local_llm_in_allowed_model_names() {
+        // AC7 pattern: the local-llm tier name must be accepted by validate_model_name
+        // so `wmd swap-model local-llm` works.
+        validate_model_name(TIER_LOCAL_LLM).expect("local-llm must be in ALLOWED_MODEL_NAMES");
+    }
+
+    #[test]
+    fn brain_config_local_llm_fields_default() {
+        // BrainConfig defaults: local_llm_endpoint is None, model is the default.
+        let cfg = BrainConfig::default();
+        assert!(cfg.local_llm_endpoint.is_none(), "local_llm_endpoint defaults to None");
+        assert_eq!(cfg.local_llm_model, DEFAULT_LOCAL_LLM_MODEL);
+    }
+
+    #[test]
+    fn brain_config_local_llm_round_trips_serde() {
+        // local_llm_endpoint and local_llm_model serialise/deserialise cleanly.
+        let cfg = BrainConfig {
+            local_llm_endpoint: Some("http://5700u:8080/v1".to_string()),
+            local_llm_model: "qwen2.5-3b-instruct:Q4_K_M".to_string(),
+            ..BrainConfig::default()
+        };
+        let v = serde_json::to_value(&cfg).expect("serialises");
+        let back: BrainConfig = serde_json::from_value(v).expect("round-trips");
+        assert_eq!(cfg.local_llm_endpoint, back.local_llm_endpoint);
+        assert_eq!(cfg.local_llm_model, back.local_llm_model);
     }
 
     #[test]

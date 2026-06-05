@@ -1,0 +1,27 @@
+# brain-local.slice — cgroup resource reservation for the local-llm node.
+#
+# PRD-constellation-brain-local §2 (AC4):
+#   Reserves cores and RAM for the model process. The 5700U has 8c/16t and
+#   32 GB shared DDR4. qwen2.5-8B Q4_K_M needs ~5-6 GB; the OS + daemon
+#   overhead is ~2-4 GB; 22+ GB headroom remains. The slice reserves 20 GB
+#   for the model process so the kernel cannot swap it mid-inference.
+#
+# Drop this file to /etc/systemd/system/brain-local.slice and run:
+#   systemctl daemon-reload && systemctl start brain-local.slice
+
+[Unit]
+Description=brain-local resource slice — llama-server isolation (constellation)
+Before=slices.target
+
+[Slice]
+# Reserve at least 6 of the 16 hardware threads for the model.
+CPUWeight=512
+AllowedCPUs=0-15
+
+# 20 GB soft reservation for the model; hard limit at 28 GB (leaves 4 GB for OS).
+MemoryMin=6G
+MemoryHigh=20G
+MemoryMax=28G
+
+# Disable swap for this slice — model weights must stay resident.
+MemorySwapMax=0
