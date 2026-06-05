@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.16.0 — 2026-06-04
+
+lucid-mind-brain-context: publish `wm.brain.context` digest per turn so lucid-mind can show injected recall context.
+
+Adds `BrainContextEvent` (`turn_id`, `recall_hits: [{id, subject}]`, `persona_tier`, `history_turns`, `ts`) published once per turn right before the LLM call on both the ladder path and the single-client path. `turn_id` matches `wm.brain.route` so lucid-mind joins the two events without extra wiring (AC2). `recall_hits` carries only id+subject — no body text — keeping the payload privacy-light (AC3). New unit tests verify serde round-trip (AC4) and no body-field leakage (AC3). Two daemon integration tests verify exactly-once-per-turn (AC1) and turn_id alignment (AC2). AC6 (runtime lucid-mind render) deferred per PRD.
+
 ## v0.15.1 — 2026-06-02
 
 brain-prompt-cache AC5: deterministic prompt-cache ratio test.

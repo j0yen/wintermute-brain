@@ -63,12 +63,15 @@ async fn run_bus_smoke() -> Result<(), String> {
     // 1. Spawn an in-process agorabus on a unique temp socket.
     let bus_sock = tmp_path("bus", "sock");
     let _ = std::fs::remove_file(&bus_sock);
+    let bus_state_file = tmp_path("bus_state", "json");
     let bus_cfg = DaemonConfig {
         socket_path: bus_sock.clone(),
         heartbeat_timeout: Duration::from_secs(60),
         broadcast_capacity: 1024,
         drain_grace_ms: agorabus::DEFAULT_DRAIN_GRACE_MS,
         drain_resume_hint_ms: agorabus::DEFAULT_DRAIN_RESUME_HINT_MS,
+        state_file: bus_state_file,
+        state_flush_ms: agorabus::DEFAULT_STATE_FLUSH_MS,
     };
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
     let (bus_shutdown_tx, bus_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
