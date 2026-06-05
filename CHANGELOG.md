@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.18.0 — 2026-06-05
+
+### constellation-brain-local: local-llm tier for 5700U APU node
+
+Added `local-llm` tier to the brain ladder — a dedicated qwen2.5-8B Q4_K_M
+rung served by the Ryzen 7 5700U node running llama-server. Follows the same
+optional/graceful-absence pattern as `local-gpu`: enabled only when
+`WM_BRAIN_LOCAL_LLM_ENDPOINT` is set, absent otherwise (falls through to cloud).
+Composes with `local-gpu` when both endpoints are set (gpu first, then local-llm).
+
+New constellation config in `constellation/brain-local/`:
+- `detect-backend.sh`: benchmarks Vulkan RADV vs CPU generation on the Vega 8
+  iGPU, picks the faster, explicitly never ROCm (AC1).
+- `llama-server.service`: resource-isolated unit (brain-local.slice, api-key
+  from env file, 0.0.0.0 bind for Tailscale mesh, no-build-worker marker) (AC2/AC4/AC7).
+- `brain-local.slice`: 20 GB memory reservation, swap-off, 6+ of 16 threads (AC4).
+- `brain-local.env.example`: documents model path + api-key config (AC7).
+
+Rust: `TIER_LOCAL_LLM` const, `DEFAULT_LOCAL_LLM_MODEL`, `ladder_with_local_llm()`
+function, `local_llm_endpoint`/`local_llm_model` BrainConfig fields, env vars
+`WM_BRAIN_LOCAL_LLM_ENDPOINT`/`WM_BRAIN_LOCAL_LLM_MODEL`. 8 new tests. 369 total pass.
+
 ## v0.17.0 — 2026-06-04
 
 constellation-brain-gpu: add `local-gpu` tier to the brain ladder. A new rung
