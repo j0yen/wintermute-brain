@@ -34,9 +34,9 @@ use crate::anthropic::{
     SystemBlock,
 };
 use crate::bus::{
-    self, ConfirmDeniedEvent, ConfirmGrantedEvent, DecodeError, Emit, ErrorEvent, ReplyEvent,
-    ReplyDestructiveEvent, Request, ToolCallEvent, ToolResultEvent, TurnUserEvent, decode_request,
-    now_unix_ms, outgoing,
+    self, BrainContextEvent, ConfirmDeniedEvent, ConfirmGrantedEvent, DecodeError, Emit,
+    ErrorEvent, RecallHitDigest, ReplyDestructiveEvent, ReplyEvent, Request, ToolCallEvent,
+    ToolResultEvent, TurnUserEvent, decode_request, now_unix_ms, outgoing,
 };
 use crate::degrade::{
     HealthState, RateLimitState, HEALTH_SNAPSHOT_INTERVAL_MS, HEALTH_SNAPSHOT_TOPIC,
@@ -1922,6 +1922,8 @@ async fn handle_turn_user(
         history.trimmed_messages(DEFAULT_MAX_TOKENS as usize)
     };
     let req = compose_request(model, &stable_prefix, recall_ctx.as_deref(), recap.as_deref(), &history_msgs, &turn.transcript);
+    // Publish injected-context digest (PRD-build-lucid-mind-brain-context §2, AC1-AC4).
+    publish_context_event(publish, &hits, child_lock, history_msgs.len() / 2, now_ms).await;
     match llm.collect_messages(&req).await {
         Ok(events) => {
             // PRD-brain-prompt-cache AC6: log cache usage counters per turn.
@@ -2083,6 +2085,10 @@ async fn handle_turn_user_ladder(
         history.trimmed_messages(DEFAULT_MAX_TOKENS as usize)
     };
     let req = compose_request(model, &stable_prefix, recall_ctx.as_deref(), recap.as_deref(), &history_msgs, &turn.transcript);
+
+    // Publish the injected-context digest (PRD-build-lucid-mind-brain-context §2, AC1-AC4).
+    // Emitted once per turn, before the LLM call, using the same turn_id as wm.brain.route.
+    publish_context_event(publish, &hits, child_lock, history_msgs.len() / 2, now_ms).await;
 
     let start_ms = crate::bus::now_unix_ms();
     let sink = crate::ladder::BufferingSink::default();
@@ -2540,6 +2546,53 @@ async fn publish_error_at(
     publish
         .publish(outgoing::ERROR, serde_json::to_value(&ev)?)
         .await
+}
+
+/// Publish a `wm.brain.context` digest event (PRD-build-lucid-mind-brain-context §2).
+///
+/// Emitted once per turn, before the LLM call, carrying the ids+subjects of the
+/// recall memories injected into the prompt, the persona tier, and the history
+/// turn count. Uses the same `turn_id` / `ts` as the companion `wm.brain.route`
+/// event so lucid-mind can join them without extra wiring (AC1, AC2).
+///
+/// Publish failures are logged as warnings and do NOT abort the turn — the
+/// context digest is observability-only and must not degrade the voice path.
+async fn publish_context_event(
+    publish: &mut dyn EventSink,
+    hits: &[QueryHit],
+    child_lock: bool,
+    history_turns: usize,
+    ts: u64,
+) {
+    let recall_hits = hits
+        .iter()
+        .map(|h| RecallHitDigest {
+            id: h.id.clone(),
+            subject: h.subject.clone(),
+        })
+        .collect();
+    let persona_tier = if child_lock {
+        "child_lock".to_string()
+    } else {
+        "default".to_string()
+    };
+    let evt = BrainContextEvent {
+        turn_id: ts,
+        recall_hits,
+        persona_tier,
+        history_turns,
+        ts,
+    };
+    match serde_json::to_value(&evt) {
+        Ok(v) => {
+            if let Err(e) = publish.publish(outgoing::CONTEXT, v).await {
+                warn!(err = %e, "wm-brain: failed to publish context event");
+            }
+        }
+        Err(e) => {
+            warn!(err = %e, "wm-brain: failed to serialise context event");
+        }
+    }
 }
 
 async fn publish_error(publish: &mut dyn EventSink, kind: &str, message: &str) -> Result<()> {
@@ -3060,15 +3113,30 @@ mod tests {
 
     impl MemSink {
         /// Return only events that are NOT session boundary events
-        /// (`wm.brain.session.*`). Used by tests focused on LLM dispatch
-        /// behaviour so they don't need to account for the session events
-        /// that are always emitted by the session tracker.
+        /// (`wm.brain.session.*`) and NOT observability digest events
+        /// (`wm.brain.context`, `wm.brain.route`). Used by tests focused on
+        /// LLM dispatch behaviour so they don't need to account for the
+        /// session or observability events that are always emitted.
         fn non_session_events(&self) -> Vec<(String, Value)> {
             self.events
                 .lock()
                 .expect("mem sink poisoned")
                 .iter()
-                .filter(|(topic, _)| !topic.starts_with(bus::SESSION_TOPIC_PREFIX))
+                .filter(|(topic, _)| {
+                    !topic.starts_with(bus::SESSION_TOPIC_PREFIX)
+                        && topic.as_str() != outgoing::CONTEXT
+                })
+                .cloned()
+                .collect()
+        }
+
+        /// Return only `wm.brain.context` events (observability digest).
+        fn context_events(&self) -> Vec<(String, Value)> {
+            self.events
+                .lock()
+                .expect("mem sink poisoned")
+                .iter()
+                .filter(|(topic, _)| topic.as_str() == outgoing::CONTEXT)
                 .cloned()
                 .collect()
         }
@@ -5696,6 +5764,98 @@ mod tests {
             .filter(|(t, _)| t == outgoing::ROUTE)
             .collect();
         assert_eq!(route_events.len(), 1, "exactly one route event published");
+    }
+
+    // ── wm.brain.context event tests (PRD-build-lucid-mind-brain-context) ────────
+
+    /// AC1 + AC2: the ladder path publishes exactly one `wm.brain.context` event
+    /// per turn, and its `turn_id` equals the `turn_id` in `wm.brain.route`.
+    #[tokio::test]
+    async fn dispatch_ladder_publishes_context_event_with_matching_turn_id() {
+        let ladder = Arc::new(crate::ladder::LadderClient::new(
+            crate::default_ladder(),
+            Arc::new(AlwaysAnswersLocal("context test answer".to_string())),
+            None,
+            Arc::new(FixedStakes(wm_router::Stakes::Ordinary)),
+            Arc::new(RecallUp(true)),
+        ));
+        let state = Arc::new(DaemonState::new(BrainConfig::default()).with_ladder(ladder));
+        let mut sink = MemSink::default();
+        let now_ms: u64 = 9_000_000_000_001;
+        dispatch(
+            state.as_ref(),
+            &mut sink,
+            Request::TurnUser(TurnUserEvent {
+                transcript: "context test".to_string(),
+                confidence: 1.0,
+                ts: now_ms,
+            }),
+            now_ms,
+        )
+        .await
+        .expect("dispatch ok");
+        // AC1: exactly one context event per turn.
+        let ctx_events = sink.context_events();
+        assert_eq!(ctx_events.len(), 1, "exactly one context event published");
+        let ctx = &ctx_events[0].1;
+        // Event carries expected fields.
+        assert!(ctx.get("turn_id").is_some(), "turn_id present");
+        assert!(ctx.get("recall_hits").is_some(), "recall_hits present");
+        assert!(ctx.get("persona_tier").is_some(), "persona_tier present");
+        assert!(ctx.get("history_turns").is_some(), "history_turns present");
+        assert!(ctx.get("ts").is_some(), "ts present");
+        // AC2: turn_id in context event matches turn_id in route event.
+        let all_events = sink.non_session_events();
+        let route_events: Vec<_> = all_events
+            .iter()
+            .filter(|(t, _)| t.as_str() == outgoing::ROUTE)
+            .collect();
+        assert_eq!(route_events.len(), 1, "exactly one route event published");
+        assert_eq!(
+            ctx["turn_id"], route_events[0].1["turn_id"],
+            "context turn_id must equal route turn_id (AC2)"
+        );
+    }
+
+    /// AC1: single-client (non-ladder) path also publishes exactly one
+    /// `wm.brain.context` event per turn.
+    #[tokio::test]
+    async fn dispatch_single_client_publishes_context_event() {
+        let llm = FakeLlm {
+            response: Ok(vec![
+                StreamEvent::MessageStart { usage: crate::anthropic::MessageUsage::default() },
+                text_delta("hello context"),
+                StreamEvent::MessageStop,
+            ]),
+        };
+        let state = state_with_llm(llm);
+        let mut sink = MemSink::default();
+        dispatch(
+            state.as_ref(),
+            &mut sink,
+            Request::TurnUser(TurnUserEvent {
+                transcript: "hi".to_string(),
+                confidence: 1.0,
+                ts: 42,
+            }),
+            42,
+        )
+        .await
+        .expect("dispatch ok");
+        let ctx_events = sink.context_events();
+        assert_eq!(ctx_events.len(), 1, "exactly one context event per turn (AC1)");
+        let ctx = &ctx_events[0].1;
+        // Persona tier default.
+        assert_eq!(ctx["persona_tier"], "default");
+        // turn_id set from now_ms.
+        assert_eq!(ctx["turn_id"], 42_u64);
+        // AC3: no body/snippet/text in recall_hits entries.
+        let hits = ctx["recall_hits"].as_array().expect("recall_hits is array");
+        for hit in hits {
+            let obj = hit.as_object().expect("hit is object");
+            assert!(!obj.contains_key("body"), "body must not leak (AC3)");
+            assert!(!obj.contains_key("snippet"), "snippet must not leak (AC3)");
+        }
     }
 
     // ── almanac-acknowledge integration tests (PRD-almanac-acknowledge) ────────

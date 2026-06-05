@@ -54,6 +54,10 @@ pub mod outgoing {
     /// Per-turn routing decision — `{ turn_id, tier, reason, latency_ms, model, ts }`.
     /// PRD-wintermute-brain-routing §2.5.
     pub const ROUTE: &str = "wm.brain.route";
+    /// Per-turn injected-context digest —
+    /// `{ turn_id, recall_hits, persona_tier, history_turns, ts }`.
+    /// PRD-build-lucid-mind-brain-context §2.
+    pub const CONTEXT: &str = "wm.brain.context";
 }
 
 /// Self-emitted `wm.brain.route` topic.  The daemon's subscribe-loop
@@ -195,6 +199,41 @@ pub struct ErrorEvent {
     /// Human-readable detail.
     pub message: String,
     /// Unix milliseconds at emission.
+    pub ts: u64,
+}
+
+// ── Context digest (PRD-build-lucid-mind-brain-context) ──────────────────────
+
+/// One entry in [`BrainContextEvent::recall_hits`]: the memory id and its
+/// one-line subject. The memory body is intentionally omitted to keep the
+/// payload privacy-light (AC3).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecallHitDigest {
+    /// Stable memory id (matches recall's `QueryHit::id`).
+    pub id: String,
+    /// Subject the memory was filed under (e.g. `wintermute-profile`).
+    pub subject: String,
+}
+
+/// `wm.brain.context` digest event — published once per turn right after
+/// the brain assembles its prompt and alongside `wm.brain.route`.
+///
+/// The `turn_id` is the same millisecond timestamp used as the key in the
+/// `wm.brain.route` event, enabling lucid-mind to join the two events with
+/// no extra wiring (AC2).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrainContextEvent {
+    /// Correlation id shared with `wm.brain.route` (equals `ts` for now;
+    /// will be a proper UUID once the brain mints turn ids).
+    pub turn_id: u64,
+    /// Recall memories that were injected into the prompt this turn.
+    /// Contains only `id + subject` — no body text (AC3).
+    pub recall_hits: Vec<RecallHitDigest>,
+    /// Persona tier tag used for this turn (e.g. `"default"`, `"child_lock"`).
+    pub persona_tier: String,
+    /// Number of prior dialog turns included in the prompt as history context.
+    pub history_turns: usize,
+    /// Unix milliseconds at publish time.
     pub ts: u64,
 }
 
@@ -422,7 +461,79 @@ mod tests {
         assert_eq!(outgoing::TOOL_CALL, "wm.brain.tool.call");
         assert_eq!(outgoing::TOOL_RESULT, "wm.brain.tool.result");
         assert_eq!(outgoing::ERROR, "wm.brain.error");
+        assert_eq!(outgoing::CONTEXT, "wm.brain.context");
         assert_eq!(DIALOG_TOPIC_PREFIX, "wm.dialog.");
+    }
+
+    // ── BrainContextEvent tests (AC3 + AC4) ──────────────────────────────────
+
+    #[test]
+    fn brain_context_event_roundtrip() {
+        // AC4: serialize → deserialize is identity.
+        let evt = BrainContextEvent {
+            turn_id: 1_717_000_000_000_u64,
+            recall_hits: vec![
+                RecallHitDigest { id: "m-1".to_string(), subject: "wintermute-profile".to_string() },
+                RecallHitDigest { id: "m-2".to_string(), subject: "tea-preference".to_string() },
+            ],
+            persona_tier: "default".to_string(),
+            history_turns: 3,
+            ts: 1_717_000_000_001_u64,
+        };
+        let v = serde_json::to_value(&evt).expect("serialises");
+        let back: BrainContextEvent = serde_json::from_value(v).expect("round-trips");
+        assert_eq!(back, evt);
+    }
+
+    #[test]
+    fn brain_context_event_no_body_field() {
+        // AC3: the serialised payload must NOT contain any "body", "snippet",
+        // or "text" key inside recall_hits entries.
+        let evt = BrainContextEvent {
+            turn_id: 42_u64,
+            recall_hits: vec![
+                RecallHitDigest { id: "m-7".to_string(), subject: "some-subject".to_string() },
+            ],
+            persona_tier: "default".to_string(),
+            history_turns: 0,
+            ts: 42_u64,
+        };
+        let v = serde_json::to_value(&evt).expect("serialises");
+        let hits = v.get("recall_hits").and_then(|h| h.as_array()).expect("has recall_hits");
+        for hit in hits {
+            let obj = hit.as_object().expect("hit is object");
+            assert!(!obj.contains_key("body"), "body must not leak into digest");
+            assert!(!obj.contains_key("snippet"), "snippet must not leak into digest");
+            assert!(!obj.contains_key("text"), "text must not leak into digest");
+        }
+    }
+
+    #[test]
+    fn brain_context_event_empty_recall_hits_roundtrip() {
+        let evt = BrainContextEvent {
+            turn_id: 1_u64,
+            recall_hits: vec![],
+            persona_tier: "child_lock".to_string(),
+            history_turns: 0,
+            ts: 1_u64,
+        };
+        let v = serde_json::to_value(&evt).expect("serialises");
+        let back: BrainContextEvent = serde_json::from_value(v).expect("round-trips");
+        assert_eq!(back, evt);
+        assert!(back.recall_hits.is_empty());
+    }
+
+    #[test]
+    fn recall_hit_digest_contains_only_id_and_subject() {
+        let digest = RecallHitDigest {
+            id: "m-99".to_string(),
+            subject: "persona-override".to_string(),
+        };
+        let v = serde_json::to_value(&digest).expect("serialises");
+        let obj = v.as_object().expect("object");
+        assert_eq!(obj.len(), 2, "digest must have exactly 2 fields: id + subject");
+        assert!(obj.contains_key("id"));
+        assert!(obj.contains_key("subject"));
     }
 
     #[test]
