@@ -2619,8 +2619,23 @@ fn into_dyn_llm<T: LlmClient + 'static>(client: T) -> Arc<dyn LlmClient> {
 /// the cloud tiers (the single-rung ladder is safe: start_index clamps via
 /// first_cloud_index→last rung, and a hard escalate at_top degrades instead
 /// of climbing — see ladder.rs AC5: never a panic, never a hang).
-fn capped_ladder() -> Vec<crate::Tier> {
-    let mut tiers = crate::default_ladder();
+fn capped_ladder(cfg: &BrainConfig) -> Vec<crate::Tier> {
+    // Build the base ladder, inserting local-gpu if the GPU endpoint is
+    // configured (either via BrainConfig or the env var).  The env var
+    // takes precedence; BrainConfig.gpu_endpoint acts as the persisted form.
+    let gpu_ep = cfg
+        .gpu_endpoint
+        .as_deref()
+        .filter(|s| !s.is_empty());
+    let mut tiers = crate::ladder_with_gpu(gpu_ep, &cfg.gpu_model);
+    if gpu_ep.is_some() {
+        info!(
+            gpu_endpoint = %cfg.gpu_endpoint.as_deref().unwrap_or(""),
+            gpu_model = %cfg.gpu_model,
+            "wm-brain: local-gpu rung inserted into tier ladder \
+             (PRD-constellation-brain-gpu; graceful-absent if unreachable)"
+        );
+    }
     // Optional CEILING: WM_BRAIN_MAX_TIER truncates the ladder at the named
     // rung (inclusive). Unset/empty/unknown → no truncation.
     if let Ok(cap) = std::env::var("WM_BRAIN_MAX_TIER") {
@@ -2657,7 +2672,7 @@ fn build_ladder(
     cfg: &BrainConfig,
     llm: Option<&Arc<dyn LlmClient>>,
 ) -> Arc<crate::ladder::LadderClient> {
-    let tiers = capped_ladder();
+    let tiers = capped_ladder(cfg);
     let rung_names: Vec<String> = tiers.iter().map(|t| t.name.clone()).collect();
     let ladder = Arc::new(crate::ladder::LadderClient::new(
         tiers,

@@ -283,6 +283,7 @@ pub const ALLOWED_MODEL_NAMES: &[&str] = &[
     // Tier names accepted by the ladder switches (swap-model/default-model).
     TIER_LOCAL_3B,
     TIER_LOCAL_8B,
+    TIER_LOCAL_GPU,
 ];
 
 /// Built-in tier names, lowest→highest rung. PRD-brain-backend-ladder §2.1.
@@ -291,11 +292,24 @@ pub const ALLOWED_MODEL_NAMES: &[&str] = &[
 pub const TIER_LOCAL_3B: &str = "local-3b";
 /// The 8B local tier name. PRD-brain-backend-ladder §2.1.
 pub const TIER_LOCAL_8B: &str = "local-8b";
+/// The GPU-accelerated local tier (desktop Radeon via llama.cpp Vulkan).
+///
+/// Sits between `local-8b` and the cloud tiers. Enabled only when
+/// `WM_BRAIN_GPU_ENDPOINT` is set; otherwise the tier is absent from the
+/// ladder and the brain falls through to cloud exactly as today.
+/// PRD-constellation-brain-gpu AC5 / AC6.
+pub const TIER_LOCAL_GPU: &str = "local-gpu";
 
 /// Default ollama model id for the `local-3b` tier. Config-overridable.
 pub const DEFAULT_LOCAL_3B_MODEL: &str = "qwen2.5:3b";
 /// Default ollama model id for the `local-8b` tier. Config-overridable.
 pub const DEFAULT_LOCAL_8B_MODEL: &str = "qwen3:8b";
+/// Default model id served by the GPU host's `llama-server`.
+///
+/// Overridable via `WM_BRAIN_GPU_MODEL`. `Q4_K_M` is recommended for
+/// ≥8 GB VRAM; 14B variants are selectable for ≥12 GB VRAM hosts.
+/// PRD-constellation-brain-gpu §2.
+pub const DEFAULT_LOCAL_GPU_MODEL: &str = "qwen2.5-7b-instruct:Q4_K_M";
 
 /// Default OpenAI-compatible endpoint for the local backend (ollama on
 /// loopback). PRD-brain-backend-ladder §2.1.
@@ -326,16 +340,44 @@ pub struct Tier {
     /// [`Backend::Local`], or a short/canonical Anthropic id for
     /// [`Backend::Anthropic`].
     pub model: String,
+    /// Per-tier OpenAI-compatible endpoint override for local tiers.
+    ///
+    /// When `Some`, this endpoint is used instead of `BrainConfig::local_endpoint`
+    /// for [`Backend::Local`] tiers. Used by the `local-gpu` tier to point at
+    /// the desktop's `llama-server` on its own endpoint.
+    /// PRD-constellation-brain-gpu §2 (brain ladder integration).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_override: Option<String>,
 }
 
 impl Tier {
-    /// Construct a tier.
+    /// Construct a tier with no endpoint override (uses the default local endpoint).
     #[must_use]
     pub fn new(name: impl Into<String>, backend: Backend, model: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             backend,
             model: model.into(),
+            endpoint_override: None,
+        }
+    }
+
+    /// Construct a tier with an explicit endpoint override.
+    ///
+    /// Used for [`TIER_LOCAL_GPU`] which points at the desktop `llama-server`
+    /// rather than the local ollama.
+    #[must_use]
+    pub fn with_endpoint(
+        name: impl Into<String>,
+        backend: Backend,
+        model: impl Into<String>,
+        endpoint: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            backend,
+            model: model.into(),
+            endpoint_override: Some(endpoint.into()),
         }
     }
 }
@@ -346,6 +388,9 @@ impl Tier {
 /// (PRD-brain-backend-ladder §2.1). The local rungs' endpoints come from
 /// `local_endpoint`; the cloud rungs carry short model ids resolved by
 /// [`canonical_model`] at request time.
+///
+/// The `local-gpu` tier is NOT included here; it is injected by
+/// [`build_ladder_with_gpu`] when `WM_BRAIN_GPU_ENDPOINT` is set.
 #[must_use]
 pub fn default_ladder() -> Vec<Tier> {
     vec![
@@ -355,6 +400,36 @@ pub fn default_ladder() -> Vec<Tier> {
         Tier::new(SHORT_MODEL_SONNET, Backend::Anthropic, SHORT_MODEL_SONNET),
         Tier::new(SHORT_MODEL_OPUS, Backend::Anthropic, SHORT_MODEL_OPUS),
     ]
+}
+
+/// Build the tier ladder, optionally inserting a `local-gpu` rung.
+///
+/// When `gpu_endpoint` is `Some`, a [`TIER_LOCAL_GPU`] rung is inserted
+/// between `local-8b` and the cloud tiers. When `None` (the GPU endpoint
+/// env var is unset or empty), the ladder is identical to [`default_ladder`].
+///
+/// Graceful absence: if the GPU endpoint is unreachable at turn time,
+/// [`crate::ladder::LiveLocalBackend`] maps the failure to
+/// [`wm_local_llm::LocalOutcome::Escalate`] and the ladder climbs to the
+/// next rung (haiku) without any turn failure. PRD-constellation-brain-gpu
+/// AC6.
+#[must_use]
+pub fn ladder_with_gpu(gpu_endpoint: Option<&str>, gpu_model: &str) -> Vec<Tier> {
+    let mut tiers = default_ladder();
+    if let Some(endpoint) = gpu_endpoint {
+        if !endpoint.is_empty() {
+            // Insert after local-8b (index 1), before haiku (index 2).
+            let insert_pos = tiers
+                .iter()
+                .position(|t| t.backend == Backend::Anthropic)
+                .unwrap_or(tiers.len());
+            tiers.insert(
+                insert_pos,
+                Tier::with_endpoint(TIER_LOCAL_GPU, Backend::Local, gpu_model, endpoint),
+            );
+        }
+    }
+    tiers
 }
 
 /// The lowest *cloud* (Anthropic) tier name in the default ladder.
@@ -419,6 +494,20 @@ pub struct BrainConfig {
     /// PRD-brain-backend-ladder §2.1.
     #[serde(default = "default_local_endpoint")]
     pub local_endpoint: String,
+    /// Optional OpenAI-compatible endpoint for the GPU-accelerated local tier
+    /// (`local-gpu`). When set (or env var `WM_BRAIN_GPU_ENDPOINT` is set),
+    /// a `local-gpu` rung is inserted between `local-8b` and the cloud tiers.
+    /// When absent, the tier is not present and the ladder falls through to
+    /// cloud exactly as today (graceful absence, AC6).
+    /// PRD-constellation-brain-gpu §2.
+    #[serde(default)]
+    pub gpu_endpoint: Option<String>,
+    /// Model id served by the GPU host's `llama-server`. Defaults to
+    /// [`DEFAULT_LOCAL_GPU_MODEL`]. Override via `WM_BRAIN_GPU_MODEL` or
+    /// `brain.toml` `gpu_model = "…"`.
+    /// PRD-constellation-brain-gpu §2.
+    #[serde(default = "default_gpu_model")]
+    pub gpu_model: String,
     /// Number of recent `(user, assistant)` turn pairs retained in the
     /// in-memory rolling history ring. `0` disables history (restores
     /// single-message behaviour). Persisted through `brain.toml`.
@@ -509,6 +598,8 @@ impl Default for BrainConfig {
             default_tier: default_tier(),
             pending_tier: None,
             local_endpoint: default_local_endpoint(),
+            gpu_endpoint: None,
+            gpu_model: default_gpu_model(),
             history_turns: default_history_turns(),
             almanac_speak: default_almanac_speak(),
             writeback_auto_commit: false,
@@ -536,6 +627,10 @@ fn default_tier() -> String {
 
 fn default_local_endpoint() -> String {
     DEFAULT_LOCAL_ENDPOINT.to_string()
+}
+
+fn default_gpu_model() -> String {
+    DEFAULT_LOCAL_GPU_MODEL.to_string()
 }
 
 fn default_history_turns() -> usize {
@@ -706,6 +801,11 @@ impl BrainConfig {
     /// Returns [`BrainError::InvalidEnv`] when a var is set but
     /// unparseable, or [`BrainError::UnknownModel`] if the parsed model
     /// name fails [`validate_model_name`].
+    #[allow(
+        clippy::too_many_lines,
+        reason = "env-var mapper: each var is one flat let binding; \
+                  extracting sub-fns would require passing error context around"
+    )]
     pub fn from_env() -> Result<Self, BrainError> {
         let default_model = env_string("WM_BRAIN_DEFAULT_MODEL").unwrap_or_else(default_model);
         validate_model_name(&default_model)?;
@@ -731,6 +831,10 @@ impl BrainConfig {
         let default_tier = env_string("WM_BRAIN_DEFAULT_TIER").unwrap_or_else(default_tier);
         let local_endpoint =
             env_string("WM_BRAIN_LOCAL_ENDPOINT").unwrap_or_else(default_local_endpoint);
+        // GPU tier — optional; absent means local-gpu is not in the ladder.
+        let gpu_endpoint = env_string("WM_BRAIN_GPU_ENDPOINT");
+        let gpu_model =
+            env_string("WM_BRAIN_GPU_MODEL").unwrap_or_else(default_gpu_model);
 
         let writeback_auto_commit = match env_string("WM_BRAIN_WRITEBACK_AUTO_COMMIT") {
             Some(raw) => parse_bool_env("WM_BRAIN_WRITEBACK_AUTO_COMMIT", &raw)?,
@@ -781,6 +885,8 @@ impl BrainConfig {
             default_tier,
             pending_tier: None,
             local_endpoint,
+            gpu_endpoint,
+            gpu_model,
             history_turns: default_history_turns(),
             writeback_auto_commit,
             writeback_model,
@@ -1029,6 +1135,68 @@ mod tests {
                 ("opus", Backend::Anthropic, "opus"),
             ]
         );
+    }
+
+    // ── local-gpu tier (PRD-constellation-brain-gpu) ─────────────────────────
+
+    #[test]
+    fn ladder_with_gpu_inserts_local_gpu_between_8b_and_cloud() {
+        // AC5: when gpu_endpoint is Some, local-gpu is inserted between
+        // local-8b and the cloud tiers.
+        let ladder = ladder_with_gpu(Some("http://desktop:8080/v1"), DEFAULT_LOCAL_GPU_MODEL);
+        let names: Vec<&str> = ladder.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                TIER_LOCAL_3B,
+                TIER_LOCAL_8B,
+                TIER_LOCAL_GPU,
+                SHORT_MODEL_HAIKU,
+                SHORT_MODEL_SONNET,
+                SHORT_MODEL_OPUS,
+            ],
+            "local-gpu must sit between local-8b and haiku"
+        );
+        // Endpoint override is wired into the gpu tier.
+        let gpu = ladder.iter().find(|t| t.name == TIER_LOCAL_GPU).unwrap();
+        assert_eq!(
+            gpu.endpoint_override.as_deref(),
+            Some("http://desktop:8080/v1"),
+            "local-gpu tier must carry the GPU endpoint override"
+        );
+        assert_eq!(gpu.backend, Backend::Local, "local-gpu is a Local backend");
+    }
+
+    #[test]
+    fn ladder_with_gpu_absent_when_endpoint_none() {
+        // AC6: when gpu_endpoint is None the ladder is identical to the
+        // five-rung default (graceful absence).
+        let without = ladder_with_gpu(None, DEFAULT_LOCAL_GPU_MODEL);
+        let default = default_ladder();
+        let names_w: Vec<&str> = without.iter().map(|t| t.name.as_str()).collect();
+        let names_d: Vec<&str> = default.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names_w, names_d, "no gpu_endpoint → ladder identical to default");
+        assert!(
+            without.iter().all(|t| t.name != TIER_LOCAL_GPU),
+            "local-gpu must not appear when endpoint is absent"
+        );
+    }
+
+    #[test]
+    fn ladder_with_gpu_absent_when_endpoint_empty() {
+        // An empty string is treated as absent (consistent with env-var handling).
+        let without = ladder_with_gpu(Some(""), DEFAULT_LOCAL_GPU_MODEL);
+        assert!(
+            without.iter().all(|t| t.name != TIER_LOCAL_GPU),
+            "empty gpu_endpoint string → local-gpu absent"
+        );
+    }
+
+    #[test]
+    fn local_gpu_in_allowed_model_names() {
+        // AC7: the local-gpu tier name must be accepted by validate_model_name
+        // so `wmd swap-model local-gpu` works.
+        validate_model_name(TIER_LOCAL_GPU).expect("local-gpu must be in ALLOWED_MODEL_NAMES");
     }
 
     #[test]

@@ -396,7 +396,17 @@ impl LadderClient {
         sink: &dyn LadderSink,
         at_top: bool,
     ) -> RungResult {
-        match self.local.generate(&tier.model, prompt, sink).await {
+        // Use the tier's endpoint override (e.g. for local-gpu pointing at a
+        // remote llama-server) if set; otherwise use the default local backend.
+        // An unreachable endpoint maps to LocalOutcome::Escalate, which causes
+        // the ladder to climb to the next rung without a turn failure (AC6).
+        let outcome = if let Some(ep) = &tier.endpoint_override {
+            let override_backend = LiveLocalBackend::new(ep.clone());
+            override_backend.generate(&tier.model, prompt, sink).await
+        } else {
+            self.local.generate(&tier.model, prompt, sink).await
+        };
+        match outcome {
             LocalOutcome::Answer { text } => {
                 let ctx = VerifyCtx {
                     utterance: transcript,

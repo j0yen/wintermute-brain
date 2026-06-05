@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.17.0 — 2026-06-04
+
+constellation-brain-gpu: add `local-gpu` tier to the brain ladder. A new rung
+(`TIER_LOCAL_GPU`) sits between `local-8b` and the cloud tiers, pointing at the
+desktop Radeon's `llama-server` via `WM_BRAIN_GPU_ENDPOINT`. When the endpoint
+is absent or unreachable the tier is either not inserted or naturally escalates
+to the next rung — cloud fallback unchanged. `Tier` gains `endpoint_override`
+so per-rung local endpoints work without a shared ollama. `BrainConfig` gains
+`gpu_endpoint` + `gpu_model` (env `WM_BRAIN_GPU_ENDPOINT` / `WM_BRAIN_GPU_MODEL`).
+`capped_ladder()` reads these and inserts the rung; `wmd swap-model local-gpu`
+is now accepted. Four new unit tests cover presence, absence, empty-string, and
+allow-list validation (AC5, AC6, AC7).
+
 ## v0.16.0 — 2026-06-04
 
 lucid-mind-brain-context: publish `wm.brain.context` digest per turn so lucid-mind can show injected recall context.
