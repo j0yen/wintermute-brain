@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.19.0 — 2026-06-12
+
+Add SemanticCache to intercept semantically identical turns before the LLM tier ladder, reducing redundant API calls. SQLite-backed, 256-entry LRU, 0.92 cosine threshold. Time/date/weather turns bypass the cache safely.
+
 ## v0.18.0 — 2026-06-05
 
 ### lucid-turn-id: adopt inbound turn_id for brain.route/reply (AC4 + AC3-brain)
