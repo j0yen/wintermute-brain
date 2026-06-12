@@ -219,6 +219,7 @@ impl PersonaConfig {
 pub mod almanac;
 pub mod anthropic;
 pub mod bus;
+pub mod cache;
 pub mod daemon;
 pub mod degrade;
 pub mod greeting;

@@ -62,6 +62,7 @@ wm-local-llm = { path = "/home/jsy/wintermute/wm-local-llm", version = "0.1" }
 wm-verify = { path = "/home/jsy/wintermute/wm-verify", version = "0.1" }
 wm-router = { path = "/home/jsy/wintermute/wm-router", version = "0.1" }
 anyhow = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
 async-trait = "0.1"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
