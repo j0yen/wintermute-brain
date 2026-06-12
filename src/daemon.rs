@@ -49,6 +49,7 @@ use crate::session::{AdvanceOutcome, CloseReason, SessionTracker};
 use crate::repair::{self, Repair};
 use crate::writeback::{ExtractorClient, WritebackGuard};
 use crate::router::{RouteEvent, RouteTier, apply_routing_policy, PolicyInputs, canned_phrase};
+use crate::cache::{self, SemanticCache};
 use crate::{BrainConfig, PROFILE_SUBJECT, THREAD_SUBJECT_PREFIX, canonical_model};
 
 /// Default upper bound on tokens the daemon requests per turn.
@@ -1114,6 +1115,13 @@ pub struct DaemonState {
     pub recap_context: Mutex<Option<String>>,
     /// Monotonic count of thread queries fired (AC3: exactly one per session).
     pub session_thread_query_count: std::sync::atomic::AtomicU64,
+    /// Semantic turn cache (PRD-thrift-turn-cache).
+    ///
+    /// `None` when the cache is explicitly disabled via
+    /// `WM_BRAIN_CACHE_DISABLED=1` or when the db failed to open.
+    /// The cache intercepts semantically-identical turns before the
+    /// LLM tier ladder to reduce redundant API calls.
+    pub turn_cache: Option<Arc<SemanticCache>>,
 }
 
 impl DaemonState {
@@ -1155,6 +1163,7 @@ impl DaemonState {
             extractor: None,
             recap_context: Mutex::new(None),
             session_thread_query_count: AtomicU64::new(0),
+            turn_cache: None,
         }
     }
 
@@ -1188,6 +1197,16 @@ impl DaemonState {
     #[must_use]
     pub fn with_ladder(mut self, ladder: Arc<crate::ladder::LadderClient>) -> Self {
         self.ladder = Some(ladder);
+        self
+    }
+
+    /// Attach a semantic turn cache.
+    ///
+    /// When set, `TurnUser` dispatch checks the cache before the ladder;
+    /// cache-safe hits short-circuit the ladder entirely.
+    #[must_use]
+    pub fn with_turn_cache(mut self, cache: Arc<SemanticCache>) -> Self {
+        self.turn_cache = Some(cache);
         self
     }
 
@@ -2089,6 +2108,71 @@ async fn handle_turn_user_ladder(
     // may override it (e.g. command → local-3b even when config default is sonnet).
     let effective_tier = routing_start_tier;
 
+    // --- Semantic cache lookup (PRD-thrift-turn-cache §2.1) ---
+    //
+    // Try the cache before recall + LLM. Skip when:
+    //   1. No cache is configured (turn_cache is None).
+    //   2. WM_BRAIN_CACHE_DISABLED=1.
+    //   3. The transcript contains a time/date/weather pattern (cache_unsafe).
+    let cache_lookup_start = crate::bus::now_unix_ms();
+    if let Some(ref turn_cache) = state.turn_cache {
+        if !SemanticCache::is_disabled() && !cache::cache_unsafe(&turn.transcript) {
+            let cache_arc = Arc::clone(turn_cache);
+            let transcript_for_cache = turn.transcript.clone();
+            let lookup_result = tokio::task::spawn_blocking(move || cache_arc.lookup(&transcript_for_cache)).await;
+            let cache_latency_ms = crate::bus::now_unix_ms().saturating_sub(cache_lookup_start);
+            match lookup_result {
+                Ok(Ok(Some(hit))) => {
+                    let cache_evt = json!({
+                        "hit": true,
+                        "similarity": hit.similarity,
+                        "tier": "cache",
+                        "latency_ms": cache_latency_ms,
+                    });
+                    if let Err(e) = publish.publish(outgoing::CACHE, cache_evt).await {
+                        warn!(err = %e, "wm-brain: failed to publish cache hit event");
+                    }
+                    let reply = ReplyEvent {
+                        text: hit.reply.clone(),
+                        ts: now_ms,
+                        loudness: None,
+                        turn_id: Some(turn_corr.clone()),
+                    };
+                    publish
+                        .publish(outgoing::REPLY, serde_json::to_value(&reply)?)
+                        .await
+                        .context("publish cache reply")?;
+                    let mut history = state.history.lock().await;
+                    history.push(Turn {
+                        user: turn.transcript.clone(),
+                        assistant: hit.reply.clone(),
+                        ts: now_ms,
+                    });
+                    drop(history);
+                    return Ok(());
+                }
+                Ok(Ok(None)) => {
+                    // miss — publish miss event and continue to ladder
+                    let cache_evt = json!({
+                        "hit": false,
+                        "similarity": serde_json::Value::Null,
+                        "tier": serde_json::Value::Null,
+                        "latency_ms": cache_latency_ms,
+                    });
+                    if let Err(e) = publish.publish(outgoing::CACHE, cache_evt).await {
+                        warn!(err = %e, "wm-brain: failed to publish cache miss event");
+                    }
+                }
+                Ok(Err(e)) => {
+                    warn!(err = %e, "wm-brain: cache lookup error; continuing to ladder");
+                }
+                Err(e) => {
+                    warn!(err = %e, "wm-brain: cache spawn_blocking panicked; continuing to ladder");
+                }
+            }
+        }
+    }
+
     let hits = match state.recall.fetch(&turn.transcript).await {
         Ok(h) => h,
         Err(err) => {
@@ -2187,6 +2271,22 @@ async fn handle_turn_user_ladder(
                     .publish(outgoing::REPLY, serde_json::to_value(&reply)?)
                     .await
                     .context("publish ladder reply")?;
+                // Cache insert: store this reply so future similar
+                // transcripts can be served without hitting the ladder.
+                if let Some(ref turn_cache) = state.turn_cache {
+                    if !SemanticCache::is_disabled() && !cache::cache_unsafe(&turn.transcript) {
+                        let cache_arc = Arc::clone(turn_cache);
+                        let t = turn.transcript.clone();
+                        let r = stored.clone();
+                        let tier_name = served.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            if let Err(e) = cache_arc.insert(&t, &r, &tier_name) {
+                                tracing::warn!(err = %e, "wm-brain: cache insert failed");
+                            }
+                        })
+                        .await;
+                    }
+                }
                 let mut history = state.history.lock().await;
                 history.push(Turn {
                     user: turn.transcript.clone(),

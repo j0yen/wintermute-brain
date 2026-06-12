@@ -58,6 +58,10 @@ pub mod outgoing {
     /// `{ turn_id, recall_hits, persona_tier, history_turns, ts }`.
     /// PRD-build-lucid-mind-brain-context §2.
     pub const CONTEXT: &str = "wm.brain.context";
+    /// Semantic-cache lookup result —
+    /// `{ hit, similarity, tier, latency_ms }`.
+    /// PRD-thrift-turn-cache §2.
+    pub const CACHE: &str = "wm.brain.cache";
 }
 
 /// Self-emitted `wm.brain.route` topic.  The daemon's subscribe-loop
