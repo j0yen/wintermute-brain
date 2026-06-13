@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.21.0 — 2026-06-13
+
+persona-redline: output-side enforcement — scan reply for forbidden terms before TTS publish; SafePhrase (replace with configured phrase or built-in default) when RedlineAction::SafePhrase active; RedlineAction::Off is default (existing configs unaffected); all 427 tests pass including 23 new redline tests
+
 ## v0.20.0 — 2026-06-12
 
 Add `forbidden_terms` to `PersonaConfig`: firm LLM avoidance instruction for tech jargon (Jocelyn elder-companion preset). When non-empty, `compose_base` appends an explicit "never use" clause listing the terms. Includes `brain.toml.example` with annotated Jocelyn preset.
