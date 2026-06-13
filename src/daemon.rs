@@ -3080,14 +3080,12 @@ pub async fn run(cfg: BrainConfig, config_path: Option<PathBuf>) -> Result<()> {
         if let crate::introduction::IntroductionMode::FirstEverBoot { ack_timeout_secs } =
             intro_mode
         {
-            // Probe recall to determine first-ever-boot (same check as greeting).
+            // Probe recall to determine first-ever-boot: fetch with an empty
+            // transcript (returns profile memories if any exist).  An empty
+            // slice means no profile memories → first-ever boot.
             let is_first_ever = state
                 .recall
-                .query(QueryArgs {
-                    subject: PROFILE_SUBJECT.to_string(),
-                    query: String::new(),
-                    limit: 1,
-                })
+                .fetch("")
                 .await
                 .map(|hits| hits.is_empty())
                 .unwrap_or(true); // treat recall outage as first-ever (conservative)

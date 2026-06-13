@@ -2,10 +2,9 @@
 //!
 //! Fires *before* the regular first-ever boot greeting (or on demand
 //! via `wm.persona.introduce`) when the deployment opts in.  The
-//! ceremony speaks "Hello. My name is [self_name]. You can call me
-//! that any time you need me — just say my name, and I'll be right
-//! here.", then waits up to `ack_timeout_secs` for a voiced
-//! acknowledgment on `wm.stt.final`.
+//! ceremony speaks the assistant's name and invites the user to call it
+//! whenever they need help, then waits up to `ack_timeout_secs` for a
+//! voiced acknowledgment on `wm.stt.final`.
 //!
 //! Outcomes:
 //! - **Ack** received within the window → transition to the regular
