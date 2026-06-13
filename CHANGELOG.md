@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.20.0 — 2026-06-12
+
+Add `forbidden_terms` to `PersonaConfig`: firm LLM avoidance instruction for tech jargon (Jocelyn elder-companion preset). When non-empty, `compose_base` appends an explicit "never use" clause listing the terms. Includes `brain.toml.example` with annotated Jocelyn preset.
+
 ## v0.19.0 — 2026-06-12
 
 Add SemanticCache to intercept semantically identical turns before the LLM tier ladder, reducing redundant API calls. SQLite-backed, 256-entry LRU, 0.92 cosine threshold. Time/date/weather turns bypass the cache safely.

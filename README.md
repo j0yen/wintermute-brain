@@ -117,6 +117,7 @@ Published: `wm.brain.{reply, reply.destructive, tool.call, tool.result, error}`.
 
 ## Recent
 
+- v0.20.0 — `PersonaConfig.forbidden_terms`: structured forbidden-vocab instruction for elder-companion deployments
 - **v0.3.0** — bounded in-memory turn-history ring: the brain now chains
   conversation turns. `compose_request` prepends the last N `(user, assistant)`
   pairs (default `history_turns = 6`) so "say that again" / "what did you mean"
