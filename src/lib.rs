@@ -194,6 +194,16 @@ pub struct PersonaConfig {
     /// PRD-persona-name-ceremony §2.1.
     #[serde(default)]
     pub introduction: introduction::IntroductionMode,
+    /// Output-side enforcement for forbidden vocabulary.
+    ///
+    /// When active, any reply containing a term from `forbidden_terms` is
+    /// intercepted before TTS publish and replaced (or, in a future
+    /// iteration, regenerated). Default is [`redline::RedlineAction::Off`]
+    /// (no enforcement — existing deployments unaffected).
+    ///
+    /// PRD-persona-redline §2.1.
+    #[serde(default)]
+    pub redline: redline::RedlineAction,
 }
 
 impl Default for PersonaConfig {
@@ -208,6 +218,7 @@ impl Default for PersonaConfig {
             wake_word: default_wake_word(),
             forbidden_terms: Vec::new(),
             introduction: introduction::IntroductionMode::default(),
+            redline: redline::RedlineAction::default(),
         }
     }
 }
@@ -256,6 +267,7 @@ pub mod history;
 pub mod ladder;
 pub mod persist;
 pub mod recall_client;
+pub mod redline;
 pub mod repair;
 pub mod router;
 pub mod session;
