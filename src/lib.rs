@@ -182,6 +182,18 @@ pub struct PersonaConfig {
     /// PRD-persona-forbidden-vocab §2.1.
     #[serde(default)]
     pub forbidden_terms: Vec<String>,
+    /// Controls whether (and when) the daemon speaks a name-introduction
+    /// ceremony before the regular first-ever boot greeting.
+    ///
+    /// Default is [`introduction::IntroductionMode::Off`] (no ceremony).
+    /// Set to [`introduction::IntroductionMode::FirstEverBoot`] to fire once
+    /// on the companion's very first boot, or
+    /// [`introduction::IntroductionMode::Explicit`] to fire on demand via
+    /// `wm.persona.introduce`.
+    ///
+    /// PRD-persona-name-ceremony §2.1.
+    #[serde(default)]
+    pub introduction: introduction::IntroductionMode,
 }
 
 impl Default for PersonaConfig {
@@ -195,6 +207,7 @@ impl Default for PersonaConfig {
             greeting: greeting::GreetingMode::default(),
             wake_word: default_wake_word(),
             forbidden_terms: Vec::new(),
+            introduction: introduction::IntroductionMode::default(),
         }
     }
 }
@@ -238,6 +251,7 @@ pub mod cache;
 pub mod daemon;
 pub mod degrade;
 pub mod greeting;
+pub mod introduction;
 pub mod history;
 pub mod ladder;
 pub mod persist;

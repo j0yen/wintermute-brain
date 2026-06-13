@@ -1122,6 +1122,12 @@ pub struct DaemonState {
     /// The cache intercepts semantically-identical turns before the
     /// LLM tier ladder to reduce redundant API calls.
     pub turn_cache: Option<Arc<SemanticCache>>,
+    /// Phase of the name-introduction ceremony (PRD-persona-name-ceremony §2.2).
+    ///
+    /// Starts as [`crate::introduction::IntroductionPhase::Idle`].  Transitions
+    /// to `AwaitingAck` when the intro speech is published, then to either
+    /// `Idle` (on ack/unrecognized) or `WaitingForWakeWord` (on timeout).
+    pub introduction_phase: Mutex<crate::introduction::IntroductionPhase>,
 }
 
 impl DaemonState {
@@ -1164,6 +1170,7 @@ impl DaemonState {
             recap_context: Mutex::new(None),
             session_thread_query_count: AtomicU64::new(0),
             turn_cache: None,
+            introduction_phase: Mutex::new(crate::introduction::IntroductionPhase::Idle),
         }
     }
 
@@ -2965,6 +2972,11 @@ pub async fn run(cfg: BrainConfig, config_path: Option<PathBuf>) -> Result<()> {
     ] {
         sub_client.subscribe(error_topic).await?;
     }
+    // Subscribe to `wm.persona.introduce` for the name-ceremony Explicit mode
+    // (PRD-persona-name-ceremony §2.3).
+    sub_client
+        .subscribe(crate::introduction::INTRODUCE_TOPIC)
+        .await?;
     info!(
         dialog_prefix = bus::DIALOG_TOPIC_PREFIX,
         stt_prefix = crate::almanac::STT_TOPIC_PREFIX,
@@ -3054,6 +3066,48 @@ pub async fn run(cfg: BrainConfig, config_path: Option<PathBuf>) -> Result<()> {
         }
     });
 
+    // ── Name-introduction ceremony: FirstEverBoot startup check ───────────────
+    //
+    // When `persona.introduction = FirstEverBoot { ack_timeout_secs }` and
+    // recall is empty (same first-boot marker as the greeting module), publish
+    // the intro speech and enter AwaitingAck phase *before* the event loop.
+    // PRD-persona-name-ceremony §2.2 (AC2, AC3).
+    {
+        let (intro_mode, self_name) = {
+            let cfg = state.config.lock().await;
+            (cfg.persona.introduction.clone(), cfg.persona.self_name.clone())
+        };
+        if let crate::introduction::IntroductionMode::FirstEverBoot { ack_timeout_secs } =
+            intro_mode
+        {
+            // Probe recall to determine first-ever-boot (same check as greeting).
+            let is_first_ever = state
+                .recall
+                .query(QueryArgs {
+                    subject: PROFILE_SUBJECT.to_string(),
+                    query: String::new(),
+                    limit: 1,
+                })
+                .await
+                .map(|hits| hits.is_empty())
+                .unwrap_or(true); // treat recall outage as first-ever (conservative)
+
+            if is_first_ever {
+                let text = crate::introduction::compose_introduction_text(&self_name);
+                let now = now_unix_ms();
+                let payload = speak_payload(&text, now);
+                if let Err(e) = sink.publish(TTS_SPEAK_TOPIC, payload).await {
+                    warn!(error = %e, "wm-brain: intro ceremony publish failed");
+                } else {
+                    info!(self_name = %self_name, "wm-brain: name-introduction ceremony fired");
+                    let deadline_ms = now.saturating_add(ack_timeout_secs * 1_000);
+                    *state.introduction_phase.lock().await =
+                        crate::introduction::IntroductionPhase::AwaitingAck { deadline_ms };
+                }
+            }
+        }
+    }
+
     // Manual InboundLine reader replaces `sub_client.next_event()`.
     // `next_event` takes `&mut self` on the whole Client, which a
     // spawned task cannot reach after `into_halves`.
@@ -3077,10 +3131,38 @@ pub async fn run(cfg: BrainConfig, config_path: Option<PathBuf>) -> Result<()> {
             agorabus::client::InboundLine::Reply(_) => continue,
             agorabus::client::InboundLine::Event(ev) => ev,
         };
-        // Route `wm.stt.final` events to the almanac ack handler first.
-        // When a PendingAck is open and the transcript is consumed (Done or
-        // Snooze/exhausted), the event is NOT forwarded to the normal dialog
-        // dispatch (AC7: no double-processing).  For Unrelated transcripts
+        // Route `wm.persona.introduce` to the introduction ceremony handler
+        // (PRD-persona-name-ceremony §2.3, Explicit mode AC6).
+        if ev.topic == crate::introduction::INTRODUCE_TOPIC {
+            let (intro_mode, self_name) = {
+                let cfg = state.config.lock().await;
+                (cfg.persona.introduction.clone(), cfg.persona.self_name.clone())
+            };
+            if let crate::introduction::IntroductionMode::Explicit { ack_timeout_secs } =
+                intro_mode
+            {
+                let now = now_unix_ms();
+                let text = crate::introduction::compose_introduction_text(&self_name);
+                let payload = speak_payload(&text, now);
+                if let Err(e) = sink.publish(TTS_SPEAK_TOPIC, payload).await {
+                    warn!(error = %e, "wm-brain: explicit intro ceremony publish failed");
+                } else {
+                    info!(self_name = %self_name, "wm-brain: explicit name-introduction ceremony fired");
+                    let deadline_ms = now.saturating_add(ack_timeout_secs * 1_000);
+                    *state.introduction_phase.lock().await =
+                        crate::introduction::IntroductionPhase::AwaitingAck { deadline_ms };
+                }
+            } else {
+                debug!("wm-brain: wm.persona.introduce received but introduction mode is not Explicit; ignoring");
+            }
+            continue;
+        }
+
+        // Route `wm.stt.final` events: first check introduction ceremony ack
+        // window (PRD-persona-name-ceremony §2.2, AC3–AC5), then almanac ack
+        // handler. When a PendingAck is open and the transcript is consumed
+        // (Done or Snooze/exhausted), the event is NOT forwarded to the normal
+        // dialog dispatch (AC7: no double-processing).  For Unrelated transcripts
         // `handle_stt_final_for_ack` returns false and we fall through to
         // the normal path.
         if ev.topic == crate::almanac::STT_FINAL_TOPIC {
@@ -3091,6 +3173,100 @@ pub async fn run(cfg: BrainConfig, config_path: Option<PathBuf>) -> Result<()> {
                 .unwrap_or("")
                 .to_string();
             let now = now_unix_ms();
+
+            // Introduction ceremony ack window takes priority over almanac.
+            // When AwaitingAck, classify the transcript and transition phase.
+            // Consumed → skip almanac handler and normal dispatch.
+            {
+                let phase = state.introduction_phase.lock().await.clone();
+                match phase {
+                    crate::introduction::IntroductionPhase::AwaitingAck { deadline_ms } => {
+                        let (self_name, wake_word, user_name) = {
+                            let cfg = state.config.lock().await;
+                            (
+                                cfg.persona.self_name.clone(),
+                                cfg.persona.wake_word.clone(),
+                                cfg.user_name.clone(),
+                            )
+                        };
+                        if now > deadline_ms {
+                            // Timeout path: patience phrase, defer FirstEver.
+                            let patience = crate::introduction::compose_patience_text();
+                            let patience_payload = speak_payload(&patience, now);
+                            if let Err(e) = sink.publish(TTS_SPEAK_TOPIC, patience_payload).await {
+                                warn!(error = %e, "wm-brain: intro patience phrase publish failed");
+                            }
+                            *state.introduction_phase.lock().await =
+                                crate::introduction::IntroductionPhase::WaitingForWakeWord;
+                            info!("wm-brain: intro ceremony timed out; waiting for next wake-word");
+                            continue;
+                        }
+                        match crate::introduction::classify_intro_response(&transcript) {
+                            crate::introduction::IntroAckClass::Ack => {
+                                // Ack received: transition to Idle, fire FirstEver greeting.
+                                *state.introduction_phase.lock().await =
+                                    crate::introduction::IntroductionPhase::Idle;
+                                let kind = crate::greeting::GreetingKind::FirstEver;
+                                let persona_cfg = {
+                                    let cfg = state.config.lock().await;
+                                    cfg.persona.clone()
+                                };
+                                if let Some(text) = crate::greeting::compose_greeting(
+                                    kind,
+                                    &persona_cfg,
+                                    user_name.as_deref(),
+                                    &wake_word,
+                                ) {
+                                    let g_payload = speak_payload(&text, now);
+                                    if let Err(e) =
+                                        sink.publish(TTS_SPEAK_TOPIC, g_payload).await
+                                    {
+                                        warn!(error = %e, "wm-brain: intro→greeting publish failed");
+                                    }
+                                }
+                                info!("wm-brain: intro ceremony ack received; greeting fired");
+                                continue;
+                            }
+                            crate::introduction::IntroAckClass::Unrecognized => {
+                                // Unrecognized: reassurance + FirstEver.
+                                let reassurance =
+                                    crate::introduction::compose_reassurance_text(&self_name);
+                                let r_payload = speak_payload(&reassurance, now);
+                                if let Err(e) = sink.publish(TTS_SPEAK_TOPIC, r_payload).await {
+                                    warn!(error = %e, "wm-brain: intro reassurance publish failed");
+                                }
+                                *state.introduction_phase.lock().await =
+                                    crate::introduction::IntroductionPhase::Idle;
+                                let kind = crate::greeting::GreetingKind::FirstEver;
+                                let persona_cfg = {
+                                    let cfg = state.config.lock().await;
+                                    cfg.persona.clone()
+                                };
+                                if let Some(text) = crate::greeting::compose_greeting(
+                                    kind,
+                                    &persona_cfg,
+                                    user_name.as_deref(),
+                                    &wake_word,
+                                ) {
+                                    let g_payload = speak_payload(&text, now);
+                                    if let Err(e) =
+                                        sink.publish(TTS_SPEAK_TOPIC, g_payload).await
+                                    {
+                                        warn!(error = %e, "wm-brain: intro→greeting publish failed");
+                                    }
+                                }
+                                info!("wm-brain: intro ceremony unrecognized; reassurance+greeting fired");
+                                continue;
+                            }
+                        }
+                    }
+                    crate::introduction::IntroductionPhase::Idle
+                    | crate::introduction::IntroductionPhase::WaitingForWakeWord => {
+                        // Not in ack window; fall through to almanac handler.
+                    }
+                }
+            }
+
             match handle_stt_final_for_ack(state.as_ref(), &mut sink, &transcript, now).await {
                 Ok(true) => {
                     // Consumed by ack path — also run the timeout check in
@@ -3184,6 +3360,43 @@ pub async fn run(cfg: BrainConfig, config_path: Option<PathBuf>) -> Result<()> {
         if ev.topic.starts_with(bus::SESSION_TOPIC_PREFIX) {
             debug!(topic = %ev.topic, "wm-brain: ignoring self-emitted session topic");
             continue;
+        }
+
+        // Introduction ceremony: WaitingForWakeWord path.
+        //
+        // When the user triggers a dialog.turn.user (wake-word fired) and the
+        // intro ceremony is waiting for the next trigger, fire the FirstEver
+        // greeting *before* processing the turn, then clear the phase so the
+        // greeting fires only once (PRD-persona-name-ceremony AC4).
+        if ev.topic.starts_with(bus::DIALOG_TOPIC_PREFIX) {
+            let phase = state.introduction_phase.lock().await.clone();
+            if phase == crate::introduction::IntroductionPhase::WaitingForWakeWord {
+                let (wake_word, user_name) = {
+                    let cfg = state.config.lock().await;
+                    (cfg.persona.wake_word.clone(), cfg.user_name.clone())
+                };
+                let persona_cfg = {
+                    let cfg = state.config.lock().await;
+                    cfg.persona.clone()
+                };
+                let now = now_unix_ms();
+                let kind = crate::greeting::GreetingKind::FirstEver;
+                if let Some(text) = crate::greeting::compose_greeting(
+                    kind,
+                    &persona_cfg,
+                    user_name.as_deref(),
+                    &wake_word,
+                ) {
+                    let g_payload = speak_payload(&text, now);
+                    if let Err(e) = sink.publish(TTS_SPEAK_TOPIC, g_payload).await {
+                        warn!(error = %e, "wm-brain: intro WaitingForWakeWord greeting publish failed");
+                    }
+                }
+                *state.introduction_phase.lock().await =
+                    crate::introduction::IntroductionPhase::Idle;
+                info!("wm-brain: intro ceremony WaitingForWakeWord → greeting fired on wake-word");
+                // Fall through to normal dispatch — the user's turn is still processed.
+            }
         }
 
         match decode_request(&ev.topic, &ev.data) {
