@@ -2050,12 +2050,14 @@ async fn handle_turn_user_ladder(
     // Compute the routing decision before the ladder runs. The decision
     // supplies an *advisory* starting tier and a machine-readable reason for
     // the `wm.brain.route` observability envelope.
-    let (routing_config, pending_tier_override, api_key_present) = {
+    let (routing_config, pending_tier_override, api_key_present, redline_forbidden, redline_action) = {
         let cfg = state.config.lock().await;
         (
             cfg.routing.clone(),
             cfg.pending_tier.clone(),
             !std::env::var(&cfg.api_key_env).unwrap_or_default().is_empty(),
+            cfg.persona.forbidden_terms.clone(),
+            cfg.persona.redline.clone(),
         )
     };
     // Reachability is currently derived from whether we have an API key and the
@@ -2267,6 +2269,33 @@ async fn handle_turn_user_ladder(
                 drop(history);
                 record_turn_for_writeback(state, &turn.transcript, &assistant_stored, now_ms).await;
             } else {
+                // Redline enforcement (PRD-persona-redline §2.1):
+                // intercept any reply that contains a forbidden term before
+                // it reaches TTS. When active, the dirty text is replaced
+                // with the configured safe phrase (or the built-in default).
+                // Off is the default — existing deployments are unaffected.
+                let text = if let Some(safe) = crate::redline::enforce(
+                    &text,
+                    &redline_forbidden,
+                    &redline_action,
+                ) {
+                    info!(
+                        counter = crate::redline::REDLINE_COUNTER.load(std::sync::atomic::Ordering::Relaxed),
+                        "wm-brain: redline enforcement triggered; replacing reply with safe phrase"
+                    );
+                    // Publish observability event so the bus shows the enforcement.
+                    let redline_evt = serde_json::json!({
+                        "ts": now_ms,
+                        "turn_id": turn_corr,
+                        "action": "safe_phrase",
+                    });
+                    if let Err(e) = publish.publish("wm.persona.redline", redline_evt).await {
+                        warn!(err = %e, "wm-brain: failed to publish redline event");
+                    }
+                    safe
+                } else {
+                    text
+                };
                 let stored = text.clone();
                 let reply = ReplyEvent {
                     text,
