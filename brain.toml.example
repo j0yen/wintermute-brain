@@ -1,0 +1,52 @@
+# brain.toml.example — annotated reference configuration for wintermute-brain.
+# Copy to ~/.config/wintermute/brain.toml and adjust as needed.
+
+# ── Core settings ─────────────────────────────────────────────────────────────
+
+# Model shorthand: "sonnet" | "opus" | "haiku"
+default_model = "sonnet"
+
+# Your first name — woven into the companion's greeting when addresses_user = true.
+# user_name = "Alice"
+
+# ── Persona (PRD-hearth-persona-config + PRD-persona-forbidden-vocab) ─────────
+
+[persona]
+# What the companion calls herself out loud.
+self_name = "wintermute"
+
+# Tone/vocabulary preset: "warm-elder" | "brisk" | "plain"
+register = "warm-elder"
+
+# Weave the user's name into greetings and replies (requires user_name above).
+addresses_user = true
+
+# Soft spoken-reply brevity ceiling. 0 = no ceiling.
+max_sentences = 3
+
+# Free-form instructions appended verbatim to the base persona.
+# extra = "Always end your answers with a friendly goodbye."
+
+# ── Jocelyn elder-companion preset ───────────────────────────────────────────
+# Uncomment the block below to activate the Jocelyn preset.
+# This configures a warm, non-technical persona that avoids tech jargon
+# entirely — ideal when the primary user is uncomfortable with AI terminology.
+#
+# [persona]
+# self_name = "Wren"
+# register = "warm-elder"
+# forbidden_terms = [
+#   "AI",
+#   "artificial intelligence",
+#   "computer",
+#   "algorithm",
+#   "model",
+#   "machine learning",
+#   "neural network",
+#   "robot",
+#   "device",
+#   "technology",
+#   "software",
+#   "program",
+#   "digital assistant",
+# ]
