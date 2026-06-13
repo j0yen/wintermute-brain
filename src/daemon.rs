@@ -2269,32 +2269,129 @@ async fn handle_turn_user_ladder(
                 drop(history);
                 record_turn_for_writeback(state, &turn.transcript, &assistant_stored, now_ms).await;
             } else {
-                // Redline enforcement (PRD-persona-redline §2.1):
+                // Redline enforcement (PRD-persona-redline §2.1, PRD-persona-redline-regenerate §2):
                 // intercept any reply that contains a forbidden term before
                 // it reaches TTS. When active, the dirty text is replaced
-                // with the configured safe phrase (or the built-in default).
+                // with the configured safe phrase (or the built-in default),
+                // or re-issued with a hardened system addendum (Regenerate).
                 // Off is the default — existing deployments are unaffected.
-                let text = if let Some(safe) = crate::redline::enforce(
-                    &text,
-                    &redline_forbidden,
-                    &redline_action,
-                ) {
-                    info!(
-                        counter = crate::redline::REDLINE_COUNTER.load(std::sync::atomic::Ordering::Relaxed),
-                        "wm-brain: redline enforcement triggered; replacing reply with safe phrase"
-                    );
-                    // Publish observability event so the bus shows the enforcement.
-                    let redline_evt = serde_json::json!({
-                        "ts": now_ms,
-                        "turn_id": turn_corr,
-                        "action": "safe_phrase",
-                    });
-                    if let Err(e) = publish.publish("wm.persona.redline", redline_evt).await {
-                        warn!(err = %e, "wm-brain: failed to publish redline event");
+                let text = {
+                    let hits = if redline_action.is_active() && !redline_forbidden.is_empty() {
+                        crate::redline::scan(&text, &redline_forbidden)
+                    } else {
+                        vec![]
+                    };
+                    if hits.is_empty() {
+                        text
+                    } else {
+                        crate::redline::REDLINE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        match &redline_action {
+                            crate::redline::RedlineAction::Off => text,
+                            crate::redline::RedlineAction::SafePhrase { safe_phrase } => {
+                                let safe = safe_phrase
+                                    .as_deref()
+                                    .unwrap_or(crate::redline::DEFAULT_SAFE_PHRASE)
+                                    .to_string();
+                                info!(
+                                    counter = crate::redline::REDLINE_COUNTER.load(std::sync::atomic::Ordering::Relaxed),
+                                    "wm-brain: redline enforcement triggered; replacing reply with safe phrase"
+                                );
+                                let redline_evt = serde_json::json!({
+                                    "ts": now_ms,
+                                    "turn_id": turn_corr,
+                                    "action": "safe_phrase",
+                                    "attempts": 0u32,
+                                    "outcome": "safe_phrase",
+                                });
+                                if let Err(e) = publish.publish("wm.persona.redline", redline_evt).await {
+                                    warn!(err = %e, "wm-brain: failed to publish redline event");
+                                }
+                                safe
+                            }
+                            crate::redline::RedlineAction::Regenerate { max_attempts, fallback } => {
+                                // Re-issue up to max_attempts times with a hardened system addendum
+                                // naming the specific leaked terms. Invariant: dirty reply never published.
+                                let max = (*max_attempts).max(1);
+                                let fallback_phrase = fallback
+                                    .as_deref()
+                                    .unwrap_or(crate::redline::DEFAULT_SAFE_PHRASE)
+                                    .to_string();
+                                let mut current_hits = hits;
+                                let mut attempt: u8 = 0;
+                                let mut final_text: Option<String> = None;
+                                while attempt < max {
+                                    attempt += 1;
+                                    let addendum = crate::redline::hardened_addendum(&current_hits);
+                                    // Build a new request with the addendum appended as a tail system block.
+                                    let regen_req = {
+                                        let base_req = compose_request(
+                                            model,
+                                            &stable_prefix,
+                                            recall_ctx.as_deref(),
+                                            recap.as_deref(),
+                                            &history_msgs,
+                                            &turn.transcript,
+                                        );
+                                        // Append the hardened addendum as an additional non-cached system block.
+                                        let mut blocks = match &base_req.system {
+                                            Some(crate::anthropic::SystemField::Blocks(b)) => b.clone(),
+                                            Some(crate::anthropic::SystemField::Plain(p)) => {
+                                                vec![crate::anthropic::SystemBlock::text(p.clone())]
+                                            }
+                                            None => vec![],
+                                        };
+                                        blocks.push(crate::anthropic::SystemBlock::text(addendum));
+                                        base_req.with_system_blocks(blocks)
+                                    };
+                                    let regen_sink = crate::ladder::BufferingSink::default();
+                                    let regen_outcome = ladder
+                                        .run_turn_sticky(
+                                            &turn.transcript,
+                                            &regen_req,
+                                            &served,
+                                            &regen_sink,
+                                            &state.session_floor,
+                                        )
+                                        .await;
+                                    let candidate = match regen_outcome {
+                                        crate::ladder::LadderOutcome::Answer { text: t, .. } => t,
+                                        crate::ladder::LadderOutcome::Degraded { .. } => {
+                                            // Ladder degraded during regeneration — fall back immediately.
+                                            break;
+                                        }
+                                    };
+                                    let new_hits = crate::redline::scan(&candidate, &redline_forbidden);
+                                    if new_hits.is_empty() {
+                                        // Clean result — use it.
+                                        final_text = Some(candidate);
+                                        break;
+                                    }
+                                    current_hits = new_hits;
+                                }
+                                let (outcome_str, result_text) = match final_text {
+                                    Some(clean) => ("regenerated", clean),
+                                    None => ("fellback", fallback_phrase),
+                                };
+                                info!(
+                                    counter = crate::redline::REDLINE_COUNTER.load(std::sync::atomic::Ordering::Relaxed),
+                                    attempts = attempt,
+                                    outcome = outcome_str,
+                                    "wm-brain: redline Regenerate triggered"
+                                );
+                                let redline_evt = serde_json::json!({
+                                    "ts": now_ms,
+                                    "turn_id": turn_corr,
+                                    "action": "regenerate",
+                                    "attempts": attempt,
+                                    "outcome": outcome_str,
+                                });
+                                if let Err(e) = publish.publish("wm.persona.redline", redline_evt).await {
+                                    warn!(err = %e, "wm-brain: failed to publish redline event");
+                                }
+                                result_text
+                            }
+                        }
                     }
-                    safe
-                } else {
-                    text
                 };
                 let stored = text.clone();
                 let reply = ReplyEvent {
