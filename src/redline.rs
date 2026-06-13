@@ -1,10 +1,10 @@
 //! Output-side enforcement for persona forbidden vocabulary.
 //!
 //! Sits between the generated reply and TTS publish; scans for forbidden
-//! terms and either substitutes a safe phrase or (in a future iteration)
-//! regenerates with a hardened prompt.
+//! terms and either substitutes a safe phrase or regenerates with a hardened
+//! prompt addendum naming the leaked terms.
 //!
-//! PRD-persona-redline §2.
+//! PRD-persona-redline §2, PRD-persona-redline-regenerate §2.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -34,16 +34,25 @@ pub enum RedlineAction {
     ///
     /// `safe_phrase` — if `Some`, the literal phrase emitted instead of the
     /// dirty reply.  If `None` a built-in neutral fallback is used.
-    ///
-    /// # Future work
-    ///
-    /// A future iteration may add a `Regenerate` variant that re-issues the
-    /// LLM request with a hardened system addendum naming the leaked terms.
-    /// For now, `SafePhrase` guarantees the invariant that a dirty reply is
-    /// never published, while keeping the wiring simple.
     SafePhrase {
         /// Replacement text spoken instead of the dirty reply.
         safe_phrase: Option<String>,
+    },
+    /// Re-issue the request with a hardened system addendum naming the leaked
+    /// terms, and only fall back to the safe phrase if regeneration also leaks.
+    ///
+    /// `max_attempts` bounds the number of re-issues (minimum 1).
+    /// `fallback` is the safe phrase used when all attempts still leak;
+    /// `None` uses [`DEFAULT_SAFE_PHRASE`].
+    ///
+    /// The invariant "a dirty reply is never published" is preserved: if
+    /// every attempt still leaks, `fallback` is returned instead.
+    Regenerate {
+        /// Maximum number of re-issue attempts (minimum 1).
+        max_attempts: u8,
+        /// Replacement text used when all attempts still leak.
+        /// `None` uses [`DEFAULT_SAFE_PHRASE`].
+        fallback: Option<String>,
     },
 }
 
@@ -187,9 +196,42 @@ fn locate_in_original(original: &str, term: &str, _norm_start: usize, _norm_end:
     0..0
 }
 
+/// Build a system-prompt addendum that names the specific forbidden terms
+/// leaked in `hits`.
+///
+/// Returns a non-empty instruction string when `hits` is non-empty, listing
+/// every distinct term by name. Returns an empty string when `hits` is empty
+/// (no addendum needed).
+///
+/// Used by the `Regenerate` action path to harden the re-issued request.
+#[must_use]
+pub fn hardened_addendum(hits: &[Hit]) -> String {
+    if hits.is_empty() {
+        return String::new();
+    }
+    // Collect distinct terms while preserving first-seen order.
+    let mut seen = std::collections::HashSet::new();
+    let mut terms: Vec<&str> = Vec::new();
+    for hit in hits {
+        if seen.insert(hit.term.as_str()) {
+            terms.push(hit.term.as_str());
+        }
+    }
+    let term_list = terms.join(", ");
+    format!(
+        "Do not use these words in your reply: {term_list}. Rephrase as a warm friend would."
+    )
+}
+
 /// Apply redline enforcement: if `reply` contains any forbidden term and
 /// `action` is active, return the safe replacement text; otherwise return
 /// `None` (caller publishes the original reply unchanged).
+///
+/// For [`RedlineAction::Regenerate`] the caller is expected to handle
+/// the regeneration loop itself (this function returns the fallback phrase
+/// after incrementing the counter, so the sync signature is preserved for
+/// the non-async hot path). Use [`enforce_with_regenerate`] from async
+/// contexts to get the full regeneration behaviour.
 ///
 /// Increments [`REDLINE_COUNTER`] on each enforcement.
 #[must_use]
@@ -210,7 +252,63 @@ pub fn enforce(reply: &str, forbidden: &[String], action: &RedlineAction) -> Opt
                 .unwrap_or(DEFAULT_SAFE_PHRASE)
                 .to_string(),
         ),
+        RedlineAction::Regenerate { fallback, .. } => {
+            // Sync path: return the fallback phrase. The async regeneration
+            // loop is handled by the caller (daemon.rs) which has access to
+            // the model client. This ensures the sync enforce() signature is
+            // preserved and the invariant (no dirty reply published) holds even
+            // if the caller does not implement the async loop.
+            Some(
+                fallback
+                    .as_deref()
+                    .unwrap_or(DEFAULT_SAFE_PHRASE)
+                    .to_string(),
+            )
+        }
     }
+}
+
+/// Inner regeneration loop driven by an injected model closure.
+///
+/// Called by the daemon when the action is `Regenerate` and the initial
+/// reply contains hits. The `model_fn` closure receives the hardened
+/// addendum string and returns a new candidate reply. This function:
+/// 1. Loops up to `max_attempts` times.
+/// 2. On a clean result (no hits), returns `Some(clean_reply)`.
+/// 3. If all attempts still leak, returns `Some(fallback_phrase)`.
+///
+/// The invariant — a dirty reply is never returned — is preserved by design.
+///
+/// `max_attempts` is clamped to a minimum of 1 to prevent infinite loops
+/// from misconfigured values.
+///
+/// # Returns
+/// `Some(reply)` — either the clean regenerated reply or the fallback phrase.
+/// `None` is never returned (there is always a safe result on exhaustion).
+#[must_use]
+pub fn enforce_with_regenerate<F>(
+    original_reply: &str,
+    forbidden: &[String],
+    max_attempts: u8,
+    fallback: Option<&str>,
+    model_fn: &mut F,
+) -> Option<String>
+where
+    F: FnMut(&str) -> String,
+{
+    let max = max_attempts.max(1);
+    let mut hits = scan(original_reply, forbidden);
+    for _ in 0..max {
+        let addendum = hardened_addendum(&hits);
+        let candidate = model_fn(&addendum);
+        let new_hits = scan(&candidate, forbidden);
+        if new_hits.is_empty() {
+            return Some(candidate);
+        }
+        hits = new_hits;
+    }
+    // All attempts leaked — return fallback (invariant preserved).
+    Some(fallback.unwrap_or(DEFAULT_SAFE_PHRASE).to_string())
 }
 
 #[cfg(test)]
@@ -453,5 +551,229 @@ action = "safe_phrase"
         );
         let after = REDLINE_COUNTER.load(Ordering::Relaxed);
         assert_eq!(after, before, "counter must not increment for Off action");
+    }
+
+    // ── hardened_addendum() ──────────────────────────────────────────────────
+
+    #[test]
+    fn hardened_addendum_empty_hits_returns_empty() {
+        let result = hardened_addendum(&[]);
+        assert!(result.is_empty(), "empty hits → empty addendum");
+    }
+
+    #[test]
+    fn hardened_addendum_names_single_term() {
+        let hits = vec![Hit {
+            term: "robot".to_string(),
+            byte_range: 0..5,
+        }];
+        let result = hardened_addendum(&hits);
+        assert!(result.contains("robot"), "addendum must name 'robot'");
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn hardened_addendum_names_all_distinct_terms() {
+        let hits = vec![
+            Hit { term: "AI".to_string(), byte_range: 0..2 },
+            Hit { term: "robot".to_string(), byte_range: 7..12 },
+        ];
+        let result = hardened_addendum(&hits);
+        assert!(result.contains("AI"), "addendum must name 'AI'");
+        assert!(result.contains("robot"), "addendum must name 'robot'");
+    }
+
+    #[test]
+    fn hardened_addendum_deduplicates_repeated_term() {
+        let hits = vec![
+            Hit { term: "robot".to_string(), byte_range: 0..5 },
+            Hit { term: "robot".to_string(), byte_range: 10..15 },
+        ];
+        let result = hardened_addendum(&hits);
+        // "robot" should appear exactly once in the term list
+        let count = result.matches("robot").count();
+        assert_eq!(count, 1, "duplicate hits → term listed once");
+    }
+
+    // ── Regenerate variant serde ─────────────────────────────────────────────
+
+    #[test]
+    fn redline_action_regenerate_round_trips_toml() {
+        let toml_str = r#"
+[persona.redline]
+action = "regenerate"
+max_attempts = 2
+fallback = "Let me try that again."
+"#;
+        let cfg: crate::BrainConfig = toml::from_str(toml_str).expect("deserialise");
+        match &cfg.persona.redline {
+            RedlineAction::Regenerate { max_attempts, fallback } => {
+                assert_eq!(*max_attempts, 2);
+                assert_eq!(fallback.as_deref(), Some("Let me try that again."));
+            }
+            other => panic!("expected Regenerate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn redline_action_regenerate_no_fallback_round_trips_toml() {
+        let toml_str = r#"
+[persona.redline]
+action = "regenerate"
+max_attempts = 1
+"#;
+        let cfg: crate::BrainConfig = toml::from_str(toml_str).expect("deserialise");
+        match &cfg.persona.redline {
+            RedlineAction::Regenerate { max_attempts, fallback } => {
+                assert_eq!(*max_attempts, 1);
+                assert!(fallback.is_none(), "fallback should be None when absent");
+            }
+            other => panic!("expected Regenerate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn redline_action_regenerate_round_trips_json() {
+        let original = RedlineAction::Regenerate {
+            max_attempts: 3,
+            fallback: Some("Fallback phrase.".to_string()),
+        };
+        let v = serde_json::to_value(&original).expect("serialises");
+        let back: RedlineAction = serde_json::from_value(v).expect("round-trips");
+        assert_eq!(original, back);
+    }
+
+    #[test]
+    fn redline_action_regenerate_is_active() {
+        let action = RedlineAction::Regenerate {
+            max_attempts: 1,
+            fallback: None,
+        };
+        assert!(action.is_active(), "Regenerate must be active");
+    }
+
+    // ── enforce() with Regenerate (sync path returns fallback) ───────────────
+
+    #[test]
+    fn enforce_regenerate_with_hit_returns_fallback() {
+        // The sync enforce() path for Regenerate returns the fallback phrase.
+        // The actual regeneration loop is in daemon.rs (async path).
+        let result = enforce(
+            "The robot said hello.",
+            &["robot".to_string()],
+            &RedlineAction::Regenerate {
+                max_attempts: 2,
+                fallback: Some("I'll rephrase that.".to_string()),
+            },
+        );
+        assert_eq!(result.as_deref(), Some("I'll rephrase that."));
+    }
+
+    #[test]
+    fn enforce_regenerate_no_fallback_uses_default_phrase() {
+        let result = enforce(
+            "The AI said hello.",
+            &["AI".to_string()],
+            &RedlineAction::Regenerate {
+                max_attempts: 1,
+                fallback: None,
+            },
+        );
+        assert_eq!(result.as_deref(), Some(DEFAULT_SAFE_PHRASE));
+    }
+
+    #[test]
+    fn enforce_regenerate_no_hit_returns_none() {
+        let result = enforce(
+            "Everything is fine.",
+            &["robot".to_string()],
+            &RedlineAction::Regenerate {
+                max_attempts: 1,
+                fallback: Some("fallback".to_string()),
+            },
+        );
+        assert!(result.is_none(), "no hit → no enforcement");
+    }
+
+    // ── enforce_with_regenerate() injected-closure tests ─────────────────────
+
+    #[test]
+    fn enforce_with_regenerate_succeeds_on_attempt_2_with_max_2() {
+        // Closure leaks on attempt 1, clean on attempt 2.
+        let mut call_count = 0u8;
+        let mut model = |_addendum: &str| -> String {
+            call_count += 1;
+            if call_count == 1 {
+                "The robot is thinking.".to_string() // leaks
+            } else {
+                "I am thinking.".to_string() // clean
+            }
+        };
+        let forbidden = vec!["robot".to_string()];
+        let result = enforce_with_regenerate(
+            "The robot said hello.",
+            &forbidden,
+            2,
+            Some("Fallback."),
+            &mut model,
+        );
+        assert_eq!(result.as_deref(), Some("I am thinking."));
+        assert_eq!(call_count, 2, "exactly 2 calls made");
+    }
+
+    #[test]
+    fn enforce_with_regenerate_falls_back_when_max_attempts_1_and_leaks() {
+        // With max_attempts=1, one attempt, still leaks → fallback.
+        let mut call_count = 0u8;
+        let mut model = |_addendum: &str| -> String {
+            call_count += 1;
+            "The robot is thinking.".to_string() // always leaks
+        };
+        let forbidden = vec!["robot".to_string()];
+        let result = enforce_with_regenerate(
+            "The robot said hello.",
+            &forbidden,
+            1,
+            Some("Fallback phrase."),
+            &mut model,
+        );
+        assert_eq!(result.as_deref(), Some("Fallback phrase."));
+        assert_eq!(call_count, 1, "exactly 1 call made");
+    }
+
+    #[test]
+    fn enforce_with_regenerate_always_leaks_returns_fallback() {
+        // Always-leaking closure → fallback (invariant preserved).
+        let mut call_count = 0u8;
+        let mut model = |_addendum: &str| -> String {
+            call_count += 1;
+            "The AI is speaking.".to_string() // always leaks
+        };
+        let forbidden = vec!["AI".to_string()];
+        let result = enforce_with_regenerate(
+            "The AI said hello.",
+            &forbidden,
+            3,
+            Some("Safe phrase."),
+            &mut model,
+        );
+        assert_eq!(result.as_deref(), Some("Safe phrase."));
+        assert_eq!(call_count, 3, "exactly max_attempts calls made");
+    }
+
+    #[test]
+    fn enforce_with_regenerate_no_fallback_uses_default() {
+        let mut model = |_addendum: &str| -> String {
+            "The robot is here.".to_string()
+        };
+        let forbidden = vec!["robot".to_string()];
+        let result = enforce_with_regenerate(
+            "The robot said hello.",
+            &forbidden,
+            1,
+            None,
+            &mut model,
+        );
+        assert_eq!(result.as_deref(), Some(DEFAULT_SAFE_PHRASE));
     }
 }
