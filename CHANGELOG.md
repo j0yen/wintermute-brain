@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.22.0 — 2026-06-13
+
+persona-profile: named profile registry + wm-brain persona subcommand (list/show/diff/apply); jocelyn and default presets; apply --write patches only [persona] section preserving other tables
+
 ## v0.21.0 — 2026-06-13
 
 persona-redline: output-side enforcement — scan reply for forbidden terms before TTS publish; SafePhrase (replace with configured phrase or built-in default) when RedlineAction::SafePhrase active; RedlineAction::Off is default (existing configs unaffected); all 427 tests pass including 23 new redline tests
