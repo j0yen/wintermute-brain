@@ -255,6 +255,7 @@ pub mod introduction;
 pub mod history;
 pub mod ladder;
 pub mod persist;
+pub mod profile;
 pub mod recall_client;
 pub mod repair;
 pub mod router;

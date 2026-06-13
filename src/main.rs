@@ -18,6 +18,7 @@ use tracing_subscriber::EnvFilter;
 use wintermute_brain::{
     BrainConfig, BrainError, DEFAULT_API_KEY_ENV, Register, daemon,
     default_config_path, validate_model_name,
+    profile::{PersonaProfile, apply_profile_to_config, diff_profile_vs_config},
     router::RoutePrefer,
 };
 
@@ -93,6 +94,41 @@ enum PersonaCommand {
         /// Register name: `warm-elder`, `plain`, or `brisk`.
         register: String,
     },
+    /// Inspect or apply named persona profiles.
+    /// PRD-persona-profile §2.
+    Profile {
+        #[command(subcommand)]
+        cmd: ProfileCommand,
+    },
+}
+
+/// Sub-commands for `wmd persona profile`.
+#[derive(Subcommand, Debug)]
+enum ProfileCommand {
+    /// List all built-in profiles (name + description).
+    List,
+    /// Print the TOML fragment for a named profile.
+    Show {
+        /// Profile name, e.g. `jocelyn` or `default`.
+        name: String,
+    },
+    /// Compare a named profile with the live `brain.toml` [persona] section.
+    Diff {
+        /// Profile name, e.g. `jocelyn` or `default`.
+        name: String,
+    },
+    /// Apply a named profile to `brain.toml`.
+    ///
+    /// Without `--write`, prints a diff only (dry-run).
+    /// With `--write`, backs up `brain.toml` to `brain.toml.bak` and
+    /// replaces only the `[persona]` section.
+    Apply {
+        /// Profile name, e.g. `jocelyn` or `default`.
+        name: String,
+        /// Write the profile to `brain.toml` (default: dry-run/diff only).
+        #[arg(long)]
+        write: bool,
+    },
 }
 
 /// Sub-commands for `wmd route`.
@@ -154,6 +190,9 @@ fn main() -> ExitCode {
             }
             PersonaCommand::SetRegister { register } => {
                 run_persona_set_register(&config_path, &register)
+            }
+            PersonaCommand::Profile { cmd } => {
+                run_persona_profile_cmd(&config_path, cmd)
             }
         },
         Command::Route { cmd } => match cmd {
@@ -392,6 +431,86 @@ fn run_route_prefer(path: &std::path::Path, preference: &str) -> ExitCode {
         "wmd route prefer: persisted"
     );
     ExitCode::SUCCESS
+}
+
+/// Dispatch `wmd persona profile <cmd>`.
+///
+/// PRD-persona-profile §2.
+#[allow(clippy::cognitive_complexity, reason = "subcommand dispatch shell")]
+fn run_persona_profile_cmd(config_path: &std::path::Path, cmd: ProfileCommand) -> ExitCode {
+    match cmd {
+        ProfileCommand::List => {
+            for p in PersonaProfile::all() {
+                info!(name = p.name, description = p.description, "persona profile");
+            }
+            ExitCode::SUCCESS
+        }
+        ProfileCommand::Show { name } => {
+            let Some(p) = PersonaProfile::builtin(&name) else {
+                error!(name = %name, "wmd persona profile show: unknown profile");
+                return ExitCode::from(1);
+            };
+            info!(fragment = %p.to_toml_fragment(), "wmd persona profile show");
+            ExitCode::SUCCESS
+        }
+        ProfileCommand::Diff { name } => {
+            let Some(p) = PersonaProfile::builtin(&name) else {
+                error!(name = %name, "wmd persona profile diff: unknown profile");
+                return ExitCode::from(1);
+            };
+            match diff_profile_vs_config(&p, config_path) {
+                Ok(None) => {
+                    info!("wmd persona profile diff: no differences");
+                    ExitCode::SUCCESS
+                }
+                Ok(Some(diff)) => {
+                    info!(diff = %diff, "wmd persona profile diff: differences found");
+                    ExitCode::from(1)
+                }
+                Err(err) => {
+                    error!(error = %err, "wmd persona profile diff: failed");
+                    ExitCode::from(1)
+                }
+            }
+        }
+        ProfileCommand::Apply { name, write } => {
+            let Some(p) = PersonaProfile::builtin(&name) else {
+                error!(name = %name, "wmd persona profile apply: unknown profile");
+                return ExitCode::from(1);
+            };
+            if !write {
+                // Dry-run: show diff only.
+                match diff_profile_vs_config(&p, config_path) {
+                    Ok(None) => {
+                        info!("wmd persona profile apply (dry-run): already matches profile");
+                    }
+                    Ok(Some(diff)) => {
+                        info!(diff = %diff, "wmd persona profile apply (dry-run): changes that would be applied");
+                    }
+                    Err(err) => {
+                        error!(error = %err, "wmd persona profile apply (dry-run): diff failed");
+                        return ExitCode::from(1);
+                    }
+                }
+                return ExitCode::SUCCESS;
+            }
+            // --write: apply and persist.
+            match apply_profile_to_config(&p, config_path) {
+                Ok(()) => {
+                    info!(
+                        profile = p.name,
+                        path = %config_path.display(),
+                        "wmd persona profile apply: profile written"
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(err) => {
+                    error!(error = %err, "wmd persona profile apply: write failed");
+                    ExitCode::from(1)
+                }
+            }
+        }
+    }
 }
 
 /// Parse a register name string into a [`Register`] variant.
