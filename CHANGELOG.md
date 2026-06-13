@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.23.0 — 2026-06-13
+
+persona-redline-regenerate: Added Regenerate variant to RedlineAction for graceful redline recovery. Re-issues LLM request with hardened system prompt, falls back to safe phrase only on exhaustion. 451 tests pass.
+
 ## v0.22.0 — 2026-06-13
 
 persona-profile: named profile registry + wm-brain persona subcommand (list/show/diff/apply); jocelyn and default presets; apply --write patches only [persona] section preserving other tables
