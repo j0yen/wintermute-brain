@@ -174,6 +174,14 @@ pub struct PersonaConfig {
     /// PRD-hearth-first-contact-greeting §2.2.
     #[serde(default = "default_wake_word")]
     pub wake_word: String,
+    /// Words or phrases the companion must never utter in any form.
+    /// When non-empty, an avoidance instruction is appended to the composed
+    /// base persona. Useful for deployments where tech jargon would break
+    /// the illusion (e.g. Jocelyn elder-companion preset).
+    ///
+    /// PRD-persona-forbidden-vocab §2.1.
+    #[serde(default)]
+    pub forbidden_terms: Vec<String>,
 }
 
 impl Default for PersonaConfig {
@@ -186,6 +194,7 @@ impl Default for PersonaConfig {
             extra: String::new(),
             greeting: greeting::GreetingMode::default(),
             wake_word: default_wake_word(),
+            forbidden_terms: Vec::new(),
         }
     }
 }
@@ -211,6 +220,12 @@ impl PersonaConfig {
         if !self.extra.is_empty() {
             base.push_str("\n\n");
             base.push_str(&self.extra);
+        }
+        if !self.forbidden_terms.is_empty() {
+            let joined = self.forbidden_terms.join(", ");
+            base.push_str("\n\nYou must never use the following words or phrases, in any form: ");
+            base.push_str(&joined);
+            base.push_str(". When you would naturally say one of these, rephrase with plain, warm language instead.");
         }
         base
     }
@@ -1635,5 +1650,133 @@ extra = "Always end with a friendly greeting."
         let v = serde_json::to_value(&original).expect("serialises");
         let back: PersonaConfig = serde_json::from_value(v).expect("round-trips");
         assert_eq!(original, back);
+    }
+
+    // ── PersonaConfig forbidden_terms tests (PRD-persona-forbidden-vocab) ────
+
+    #[test]
+    fn forbidden_terms_empty_is_noop() {
+        // AC3: empty vec → composed prompt unchanged.
+        let p_without = PersonaConfig {
+            register: Register::WarmElder,
+            forbidden_terms: vec![],
+            ..PersonaConfig::default()
+        };
+        let p_with = PersonaConfig {
+            register: Register::WarmElder,
+            forbidden_terms: vec![],
+            ..PersonaConfig::default()
+        };
+        assert_eq!(p_without.compose_base(None), p_with.compose_base(None));
+        // Confirm no avoidance instruction leaked in.
+        assert!(!p_without.compose_base(None).contains("never use"));
+    }
+
+    #[test]
+    fn forbidden_terms_single_term() {
+        // AC2: one term → avoidance instruction appended.
+        let p = PersonaConfig {
+            register: Register::WarmElder,
+            forbidden_terms: vec!["robot".to_string()],
+            ..PersonaConfig::default()
+        };
+        let base = p.compose_base(None);
+        assert!(base.contains("robot"), "term present in instruction");
+        assert!(
+            base.contains("You must never use the following words or phrases"),
+            "instruction header present"
+        );
+        assert!(
+            base.contains("rephrase with plain, warm language"),
+            "rephrasing guidance present"
+        );
+    }
+
+    #[test]
+    fn forbidden_terms_multiple_terms() {
+        // AC2: multiple terms → comma-joined correctly.
+        let p = PersonaConfig {
+            register: Register::WarmElder,
+            forbidden_terms: vec!["AI".to_string(), "algorithm".to_string(), "model".to_string()],
+            ..PersonaConfig::default()
+        };
+        let base = p.compose_base(None);
+        assert!(base.contains("AI, algorithm, model"), "terms comma-joined");
+    }
+
+    #[test]
+    fn forbidden_terms_preserved_casing() {
+        // AC1: terms stored as-provided, not lowercased.
+        let p = PersonaConfig {
+            forbidden_terms: vec!["AI".to_string(), "Neural Network".to_string()],
+            ..PersonaConfig::default()
+        };
+        assert_eq!(p.forbidden_terms[0], "AI");
+        assert_eq!(p.forbidden_terms[1], "Neural Network");
+        let base = p.compose_base(None);
+        assert!(base.contains("AI"), "uppercase preserved");
+        assert!(base.contains("Neural Network"), "mixed case preserved");
+    }
+
+    #[test]
+    fn forbidden_terms_in_full_compose() {
+        // AC5/AC6: TOML parse → compose includes forbidden_terms instruction.
+        let toml_str = r#"
+[persona]
+self_name = "Wren"
+register = "warm_elder"
+forbidden_terms = ["AI", "computer", "algorithm"]
+"#;
+        let cfg: BrainConfig = toml::from_str(toml_str).expect("deserialise");
+        assert_eq!(cfg.persona.self_name, "Wren");
+        assert_eq!(cfg.persona.forbidden_terms, vec!["AI", "computer", "algorithm"]);
+        let base = cfg.persona.compose_base(None);
+        assert!(base.contains("AI, computer, algorithm"), "terms in composed output");
+        assert!(base.contains("never use"), "instruction present");
+    }
+
+    #[test]
+    fn forbidden_terms_jocelyn_preset() {
+        // AC4/AC6: Jocelyn example preset deserializes and composes correctly.
+        let toml_str = r#"
+[persona]
+self_name = "Wren"
+register = "warm_elder"
+forbidden_terms = ["AI", "artificial intelligence", "computer", "algorithm", "model", "machine learning", "neural network", "robot", "device", "technology", "software", "program", "digital assistant"]
+"#;
+        let cfg: BrainConfig = toml::from_str(toml_str).expect("deserialise");
+        assert_eq!(cfg.persona.self_name, "Wren");
+        assert_eq!(cfg.persona.forbidden_terms.len(), 13);
+
+        // AC6: Composed prompt with Jocelyn preset ≤200 chars longer than base WarmElder.
+        let base_plain = PersonaConfig {
+            register: Register::WarmElder,
+            ..PersonaConfig::default()
+        }
+        .compose_base(None);
+        let base_jocelyn = cfg.persona.compose_base(None);
+        let delta = base_jocelyn.len().saturating_sub(base_plain.len());
+        assert!(
+            delta <= 200,
+            "Jocelyn preset adds {delta} chars; must be ≤200"
+        );
+    }
+
+    #[test]
+    fn forbidden_terms_does_not_duplicate_extra() {
+        // AC2: extra is still appended after register prose; forbidden_terms follows after.
+        let p = PersonaConfig {
+            register: Register::Brisk,
+            extra: "Always greet warmly.".to_string(),
+            forbidden_terms: vec!["device".to_string()],
+            ..PersonaConfig::default()
+        };
+        let base = p.compose_base(None);
+        let extra_pos = base.find("Always greet warmly.").expect("extra present");
+        let forbidden_pos = base.find("never use").expect("forbidden instruction present");
+        assert!(
+            forbidden_pos > extra_pos,
+            "forbidden instruction must come after extra"
+        );
     }
 }
