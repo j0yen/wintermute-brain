@@ -15,8 +15,8 @@ default_model = "sonnet"
 # What the companion calls herself out loud.
 self_name = "wintermute"
 
-# Tone/vocabulary preset: "warm_elder" | "brisk" | "plain"
-register = "warm_elder"
+# Tone/vocabulary preset: "warm-elder" | "brisk" | "plain"
+register = "warm-elder"
 
 # Weave the user's name into greetings and replies (requires user_name above).
 addresses_user = true
@@ -34,7 +34,7 @@ max_sentences = 3
 #
 # [persona]
 # self_name = "Wren"
-# register = "warm_elder"
+# register = "warm-elder"
 # forbidden_terms = [
 #   "AI",
 #   "artificial intelligence",

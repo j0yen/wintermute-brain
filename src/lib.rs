@@ -1724,7 +1724,7 @@ extra = "Always end with a friendly greeting."
         let toml_str = r#"
 [persona]
 self_name = "Wren"
-register = "warm_elder"
+register = "warm-elder"
 forbidden_terms = ["AI", "computer", "algorithm"]
 "#;
         let cfg: BrainConfig = toml::from_str(toml_str).expect("deserialise");
@@ -1741,7 +1741,7 @@ forbidden_terms = ["AI", "computer", "algorithm"]
         let toml_str = r#"
 [persona]
 self_name = "Wren"
-register = "warm_elder"
+register = "warm-elder"
 forbidden_terms = ["AI", "artificial intelligence", "computer", "algorithm", "model", "machine learning", "neural network", "robot", "device", "technology", "software", "program", "digital assistant"]
 "#;
         let cfg: BrainConfig = toml::from_str(toml_str).expect("deserialise");
