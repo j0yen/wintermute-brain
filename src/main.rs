@@ -18,6 +18,7 @@ use tracing_subscriber::EnvFilter;
 use wintermute_brain::{
     BrainConfig, BrainError, DEFAULT_API_KEY_ENV, Register, daemon,
     default_config_path, validate_model_name,
+    floor::{apply_floor, load_base_floor},
     profile::{PersonaProfile, apply_profile_to_config, diff_profile_vs_config},
     router::RoutePrefer,
 };
@@ -99,6 +100,18 @@ enum PersonaCommand {
     Profile {
         #[command(subcommand)]
         cmd: ProfileCommand,
+    },
+    /// Check whether a built-in persona profile is floor-compliant.
+    ///
+    /// Loads the base strain via `inoculate strain --format json` (if
+    /// available), then checks the profile's forbidden-term list against
+    /// the base floor.  Lists any offending rules.
+    ///
+    /// Exit 0 = compliant, Exit 1 = would-weaken.
+    /// PRD-inoculate-immune §2.
+    Lint {
+        /// Profile name (e.g. `jocelyn` or `default`) to lint.
+        profile: String,
     },
 }
 
@@ -193,6 +206,9 @@ fn main() -> ExitCode {
             }
             PersonaCommand::Profile { cmd } => {
                 run_persona_profile_cmd(&config_path, cmd)
+            }
+            PersonaCommand::Lint { profile } => {
+                run_persona_lint(&profile)
             }
         },
         Command::Route { cmd } => match cmd {
@@ -513,6 +529,49 @@ fn run_persona_profile_cmd(config_path: &std::path::Path, cmd: ProfileCommand) -
     }
 }
 
+/// Run `wmd persona lint <profile>`.
+///
+/// Loads the base strain floor (via `inoculate`, fail-open), then checks
+/// the named built-in profile against the floor.  Reports any offending
+/// rules.  Exit 0 = compliant, Exit 1 = would-weaken or unknown profile.
+///
+/// PRD-inoculate-immune §2.
+fn run_persona_lint(profile_name: &str) -> ExitCode {
+    let Some(profile) = PersonaProfile::builtin(profile_name) else {
+        error!(name = %profile_name, "wmd persona lint: unknown profile");
+        return ExitCode::from(1);
+    };
+
+    let base = match load_base_floor() {
+        Ok(b) => b,
+        Err(err) => {
+            error!(error = %err, "wmd persona lint: failed to load base floor");
+            return ExitCode::from(1);
+        }
+    };
+
+    let policy = apply_floor(&base, &profile.forbidden_terms);
+
+    if policy.violations.is_empty() {
+        info!(
+            profile = %profile_name,
+            strain_hash = %policy.strain_hash,
+            "wmd persona lint: compliant"
+        );
+        ExitCode::SUCCESS
+    } else {
+        for v in &policy.violations {
+            error!(violation = %v, "wmd persona lint: floor-violation found");
+        }
+        info!(
+            profile = %profile_name,
+            violation_count = %policy.violations.len(),
+            "wmd persona lint: profile would weaken the base floor"
+        );
+        ExitCode::from(1)
+    }
+}
+
 /// Parse a register name string into a [`Register`] variant.
 ///
 /// Accepts the kebab-case names defined by the serde `rename_all` rule.
@@ -584,5 +643,31 @@ mod tests {
         BrainConfig::default().save_to_file(&path).unwrap();
         let code = run_swap_model(&path, "gpt-4o");
         assert!(!is_success(code), "unknown tier must error");
+    }
+
+    // ── persona lint tests (PRD-inoculate-immune AC4) ─────────────────────────
+
+    #[test]
+    fn persona_lint_unknown_profile_errors() {
+        // AC4: lint with an unknown profile name → exit 1.
+        let code = run_persona_lint("nonexistent-profile-xyz");
+        assert!(!is_success(code), "unknown profile must error");
+    }
+
+    #[test]
+    fn persona_lint_known_profile_without_inoculate_returns_success() {
+        // AC4 / fail-open: when inoculate is absent (always the case in tests),
+        // the base floor is empty and any profile is compliant → exit 0.
+        // This relies on inoculate not being on PATH in the test environment.
+        let code = run_persona_lint("jocelyn");
+        // Either success (inoculate absent, fail-open) or the profile truly
+        // passes.  We assert success because in CI inoculate is always absent.
+        assert!(is_success(code), "jocelyn lint with no base floor must succeed (fail-open)");
+    }
+
+    #[test]
+    fn persona_lint_default_profile_without_inoculate_returns_success() {
+        let code = run_persona_lint("default");
+        assert!(is_success(code), "default lint with no base floor must succeed (fail-open)");
     }
 }

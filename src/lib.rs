@@ -204,6 +204,17 @@ pub struct PersonaConfig {
     /// PRD-persona-redline §2.1.
     #[serde(default)]
     pub redline: redline::RedlineAction,
+    /// SHA-256 hex hash of the base strain the floor was computed against.
+    ///
+    /// Populated by floor resolution ([`floor::apply_floor`]) when an
+    /// `inoculate` base strain is available.  Empty string when no base
+    /// strain was loaded (inoculate absent or failed — fail-open).
+    ///
+    /// Carries through to ledger entries so a persona action can reference
+    /// both the persona name and the base-strain version it was constrained
+    /// against. PRD-inoculate-immune §2.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub strain_hash: String,
 }
 
 impl Default for PersonaConfig {
@@ -219,6 +230,7 @@ impl Default for PersonaConfig {
             forbidden_terms: Vec::new(),
             introduction: introduction::IntroductionMode::default(),
             redline: redline::RedlineAction::default(),
+            strain_hash: String::new(),
         }
     }
 }
@@ -261,6 +273,7 @@ pub mod bus;
 pub mod cache;
 pub mod daemon;
 pub mod degrade;
+pub mod floor;
 pub mod greeting;
 pub mod introduction;
 pub mod history;
@@ -1805,6 +1818,39 @@ forbidden_terms = ["AI", "artificial intelligence", "computer", "algorithm", "mo
         assert!(
             forbidden_pos > extra_pos,
             "forbidden instruction must come after extra"
+        );
+    }
+
+    // ── strain_hash field (PRD-inoculate-immune AC6) ──────────────────────────
+
+    #[test]
+    fn persona_config_strain_hash_defaults_empty() {
+        // AC6: strain_hash defaults to empty string (no floor applied).
+        let cfg = PersonaConfig::default();
+        assert!(cfg.strain_hash.is_empty(), "strain_hash must default to empty");
+    }
+
+    #[test]
+    fn persona_config_strain_hash_round_trips_serde() {
+        // AC6: strain_hash round-trips through JSON serde.
+        let p = PersonaConfig {
+            strain_hash: "deadbeef1234".to_string(),
+            ..PersonaConfig::default()
+        };
+        let v = serde_json::to_value(&p).expect("serialises");
+        let back: PersonaConfig = serde_json::from_value(v).expect("round-trips");
+        assert_eq!(back.strain_hash, "deadbeef1234");
+    }
+
+    #[test]
+    fn persona_config_strain_hash_skipped_when_empty_in_serde() {
+        // AC6: when strain_hash is empty, it is omitted from serialised JSON
+        // (skip_serializing_if = "String::is_empty").
+        let p = PersonaConfig::default();
+        let v = serde_json::to_value(&p).expect("serialises");
+        assert!(
+            v.get("strain_hash").is_none(),
+            "empty strain_hash must not appear in serialised output"
         );
     }
 }

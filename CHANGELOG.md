@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.24.0 — 2026-06-15
+
+inoculate-immune: Persona floor enforcement — base strain Boundaries are a
+non-lowerable floor. Effective policy = base ∪ persona_additions; persona
+rules that weaken the base floor are rejected with `floor-violation: <rule>`.
+`persona lint <profile>` exits 0=compliant, 1=would-weaken. `PersonaConfig`
+carries `strain_hash` from the resolved base. Base-forbid always beats
+persona-allow; persona-forbid adds to base. Fail-open when `inoculate` is
+absent. 480+ tests pass.
+
 ## v0.23.0 — 2026-06-13
 
 persona-redline-regenerate: Added Regenerate variant to RedlineAction for graceful redline recovery. Re-issues LLM request with hardened system prompt, falls back to safe phrase only on exhaustion. 451 tests pass.
