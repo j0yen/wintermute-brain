@@ -277,6 +277,7 @@ pub mod floor;
 pub mod greeting;
 pub mod introduction;
 pub mod history;
+pub mod key_health;
 pub mod ladder;
 pub mod persist;
 pub mod profile;

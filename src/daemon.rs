@@ -18,7 +18,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
@@ -1128,6 +1128,17 @@ pub struct DaemonState {
     /// to `AwaitingAck` when the intro speech is published, then to either
     /// `Idle` (on ack/unrecognized) or `WaitingForWakeWord` (on timeout).
     pub introduction_phase: Mutex<crate::introduction::IntroductionPhase>,
+    /// Whether the Anthropic API key is currently healthy.
+    ///
+    /// Set to `true` on startup when the key passes the initial probe;
+    /// `false` on auth failure (401/403). Updated continuously by the
+    /// background [`crate::key_health::KeyHealthProbe`] running every
+    /// [`crate::key_health::DEFAULT_PROBE_INTERVAL_SECS`] seconds.
+    ///
+    /// When `false`, [`handle_turn_user_ladder`] routes exclusively to
+    /// local tiers, skipping cloud rungs that would produce 401s and
+    /// degrade-fallback nonsense (PRD-fluid-brain-key-health §2).
+    pub key_healthy: Arc<AtomicBool>,
 }
 
 impl DaemonState {
@@ -1171,6 +1182,10 @@ impl DaemonState {
             session_thread_query_count: AtomicU64::new(0),
             turn_cache: None,
             introduction_phase: Mutex::new(crate::introduction::IntroductionPhase::Idle),
+            // Default to true (optimistic) so turns flow even when no probe
+            // has fired yet. The startup probe in `run()` sets this to the
+            // real value before the subscribe loop starts.
+            key_healthy: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -2052,18 +2067,26 @@ async fn handle_turn_user_ladder(
     // the `wm.brain.route` observability envelope.
     let (routing_config, pending_tier_override, api_key_present, redline_forbidden, redline_action) = {
         let cfg = state.config.lock().await;
+        // The key is structurally present (env var is set and non-empty), but
+        // may be invalid (401/403). The key_healthy flag is the authoritative
+        // source once the startup probe has fired.
+        let key_structurally_present =
+            !std::env::var(&cfg.api_key_env).unwrap_or_default().is_empty();
+        // Gate cloud eligibility on BOTH the key being present AND healthy.
+        // When !key_healthy, treat the key as absent so routing policy
+        // sends all turns to local tiers (PRD-fluid-brain-key-health §2).
+        let key_present =
+            key_structurally_present && state.key_healthy.load(Ordering::Relaxed);
         (
             cfg.routing.clone(),
             cfg.pending_tier.clone(),
-            !std::env::var(&cfg.api_key_env).unwrap_or_default().is_empty(),
+            key_present,
             cfg.persona.forbidden_terms.clone(),
             cfg.persona.redline.clone(),
         )
     };
-    // Reachability is currently derived from whether we have an API key and the
-    // ladder has an Anthropic client — a lightweight heuristic that avoids a
-    // blocking TCP probe on the hot path. A full TTL-cached probe is deferred
-    // to a later iteration.
+    // Reachability: key must be present AND healthy. When !key_healthy the
+    // routing policy flags cloud as unavailable and routes to local.
     let online = api_key_present;
     let route_decision = apply_routing_policy(&PolicyInputs {
         transcript: turn.transcript.clone(),
@@ -3056,6 +3079,78 @@ pub async fn run(cfg: BrainConfig, config_path: Option<PathBuf>) -> Result<()> {
         };
         base
     });
+
+    // ── Key-health startup probe (PRD-fluid-brain-key-health §2) ─────────────
+    //
+    // Fire one synchronous check before accepting any turns. When the key is
+    // invalid, set key_healthy=false immediately so the first turn is already
+    // routed to local instead of climbing the cloud ladder and degrading.
+    // The background probe then continues to re-check every
+    // DEFAULT_PROBE_INTERVAL_SECS; when the key is later rotated to a valid
+    // one, key_healthy flips back to true and cloud tiers resume.
+    {
+        let api_key_env = state.config.lock().await.api_key_env.clone();
+        if let Ok(key) = std::env::var(&api_key_env) {
+            if !key.is_empty() {
+                match crate::key_health::KeyHealthProbe::new() {
+                    Ok(probe) => {
+                        let result = probe.check(&key).await;
+                        let healthy = result.is_ok();
+                        state.key_healthy.store(healthy, Ordering::Relaxed);
+                        if healthy {
+                            info!("wm-brain: startup key-health probe OK — cloud tiers enabled");
+                        } else {
+                            error!(
+                                "wm-brain: API key invalid on startup — cloud tiers disabled; \
+                                 turns routed to local until key is rotated"
+                            );
+                        }
+                        // Spawn background probe to re-check periodically.
+                        // The key_healthy AtomicBool is the authoritative routing gate;
+                        // bus event publishing is best-effort observability only.
+                        // The background loop uses a fresh probe so it can't borrow
+                        // from the startup probe (which was consumed above).
+                        let healthy_arc = Arc::clone(&state.key_healthy);
+                        let key_for_bg = key.clone();
+                        match crate::key_health::KeyHealthProbe::new() {
+                            Ok(bg_probe) => {
+                                tokio::spawn(async move {
+                                    let interval = tokio::time::Duration::from_secs(
+                                        crate::key_health::DEFAULT_PROBE_INTERVAL_SECS,
+                                    );
+                                    loop {
+                                        tokio::time::sleep(interval).await;
+                                        let r = bg_probe.check(&key_for_bg).await;
+                                        let ok = r.is_ok();
+                                        let prev = healthy_arc.swap(ok, Ordering::Relaxed);
+                                        if prev != ok {
+                                            if ok {
+                                                info!("wm-brain: API key health recovered; cloud tiers re-enabled");
+                                            } else {
+                                                error!("wm-brain: API key turned invalid; cloud tiers disabled");
+                                            }
+                                        }
+                                    }
+                                });
+                            }
+                            Err(bg_err) => {
+                                warn!(
+                                    error = %bg_err,
+                                    "wm-brain: could not build background key probe; key will not re-check"
+                                );
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        warn!(
+                            error = %err,
+                            "wm-brain: could not build key-health probe; skipping startup check"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     // `WM_BRAIN_BUS_SOCKET` override mirrors `wm-dialog`'s `WM_DIALOG_BUS_SOCKET`
     // / `wm-stt`'s `WM_STT_BUS_SOCKET` / `wm-tts`'s `WM_TTS_BUS_SOCKET` idiom
@@ -7393,6 +7488,70 @@ mod tests {
         assert!(
             ctx.is_none(),
             "new session with NullRecall clears stale recap_context"
+        );
+    }
+
+    // ── PRD-fluid-brain-key-health AC4: key_healthy=false routes to local ────
+
+    /// AC4: when `key_healthy` is false, a turn dispatched through the ladder
+    /// must produce a reply from the local tier (via `AlwaysAnswersLocal`),
+    /// NOT a `wm.brain.error` with `reason=turn degraded`. This proves the
+    /// key-health gate short-circuits the cloud ladder before 401s cascade.
+    #[tokio::test]
+    async fn key_unhealthy_routes_to_local_not_degraded() {
+        // Wire a ladder with a local backend that always answers and NO
+        // Anthropic client (equivalent to api_key_present=false in routing).
+        let ladder = Arc::new(crate::ladder::LadderClient::new(
+            crate::default_ladder(),
+            Arc::new(AlwaysAnswersLocal("local tier answer".to_string())),
+            None, // no API client → cloud rungs cannot serve
+            Arc::new(FixedStakes(wm_router::Stakes::Ordinary)),
+            Arc::new(RecallUp(true)),
+        ));
+        let state = Arc::new(DaemonState::new(BrainConfig::default()).with_ladder(ladder));
+
+        // Mark the key as unhealthy (simulates 401 on startup probe).
+        state.key_healthy.store(false, Ordering::Relaxed);
+
+        let mut sink = MemSink::default();
+        dispatch(
+            state.as_ref(),
+            &mut sink,
+            Request::TurnUser(TurnUserEvent {
+                transcript: "what time is it".to_string(),
+                confidence: 1.0,
+                ts: 1,
+                turn_id: None,
+            }),
+            1,
+        )
+        .await
+        .expect("dispatch must not propagate errors as Err");
+
+        let events = sink.non_session_events();
+
+        // AC4a: a reply is published (local tier served it).
+        let replies: Vec<_> = events.iter().filter(|(t, _)| t == outgoing::REPLY).collect();
+        assert!(
+            !replies.is_empty(),
+            "AC4: a reply must be published even when key_healthy=false (got no reply events)"
+        );
+        assert_eq!(replies[0].1["text"], "local tier answer");
+
+        // AC4b: no degraded error published.
+        let errors: Vec<_> = events.iter().filter(|(t, _)| t == outgoing::ERROR).collect();
+        let degraded: Vec<_> = errors
+            .iter()
+            .filter(|(_, v)| {
+                v["reason"]
+                    .as_str()
+                    .map(|r| r.contains("turn degraded"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert!(
+            degraded.is_empty(),
+            "AC4: must NOT emit a turn-degraded error when key_healthy=false; got {degraded:?}"
         );
     }
 }
