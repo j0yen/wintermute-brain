@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.25.0 — 2026-06-20
+
+Add proactive Anthropic API key health probe (`KeyHealthProbe`) and wire a `key_healthy` flag into the daemon. On startup and every 5 minutes, the probe checks key validity via a minimal API call; when the key is invalid (401/403), cloud tiers are bypassed so the turn routes to local instead of producing 401-cascade degraded nonsense.
+
 ## v0.24.0 — 2026-06-15
 
 inoculate-immune: Persona floor enforcement — base strain Boundaries are a
