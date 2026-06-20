@@ -62,6 +62,12 @@ pub mod outgoing {
     /// `{ hit, similarity, tier, latency_ms }`.
     /// PRD-thrift-turn-cache §2.
     pub const CACHE: &str = "wm.brain.cache";
+    /// Sentence-level partial reply emitted by the streaming TTS path.
+    ///
+    /// Published once per completed sentence while the LLM stream is still
+    /// in flight. Payload: `{ text, ts, turn_id? }`.
+    /// PRD-fluid-brain-streaming-tts §2.
+    pub const REPLY_PARTIAL: &str = "wm.brain.reply.partial";
 }
 
 /// Self-emitted `wm.brain.route` topic.  The daemon's subscribe-loop
@@ -134,6 +140,8 @@ pub struct ConfirmDeniedEvent {
 pub enum Emit {
     /// `wm.brain.reply` event.
     Reply(ReplyEvent),
+    /// `wm.brain.reply.partial` event (per-sentence streaming partial).
+    ReplyPartial(ReplyPartialEvent),
     /// `wm.brain.reply.destructive` event.
     ReplyDestructive(ReplyDestructiveEvent),
     /// `wm.brain.tool.call` event.
@@ -162,6 +170,23 @@ pub struct ReplyEvent {
     /// Cross-daemon turn correlation id, adopted from the inbound
     /// `wm.dialog.turn.user` (PRD lucid-turn-id, AC4). `wm-tts` copies this
     /// onto `wm.tts.*` in a later tick. Optional for backward compat (AC5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+}
+
+/// Outbound `wm.brain.reply.partial` payload.
+///
+/// Published once per completed sentence during a streaming LLM turn, before
+/// the final `wm.brain.reply` event. `wm-dialog` may subscribe to this topic
+/// to hand each sentence to `wm-tts` immediately rather than waiting for the
+/// full response. PRD-fluid-brain-streaming-tts §2.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReplyPartialEvent {
+    /// The completed sentence text.
+    pub text: String,
+    /// Unix milliseconds at emission.
+    pub ts: u64,
+    /// Cross-daemon turn correlation id (PRD lucid-turn-id, AC4). Optional.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
 }
@@ -428,6 +453,27 @@ mod tests {
     }
 
     #[test]
+    fn outbound_reply_partial_roundtrip() {
+        // PRD-fluid-brain-streaming-tts: ReplyPartialEvent serialises cleanly.
+        let p = ReplyPartialEvent {
+            text: "Hello world.".to_string(),
+            ts: 42,
+            turn_id: Some("0000018f-0001".to_string()),
+        };
+        let v = serde_json::to_value(&p).expect("serialises");
+        let back: ReplyPartialEvent = serde_json::from_value(v).expect("round-trips");
+        assert_eq!(back, p);
+    }
+
+    #[test]
+    fn reply_partial_turn_id_absent_from_json_when_none() {
+        // Backward compat: None turn_id must not appear in serialised payload.
+        let p = ReplyPartialEvent { text: "x".into(), ts: 1, turn_id: None };
+        let v = serde_json::to_value(&p).expect("serialize");
+        assert!(v.get("turn_id").is_none(), "None turn_id must be omitted");
+    }
+
+    #[test]
     fn outbound_reply_loudness_roundtrip() {
         // AC6: loudness field is backward-compatible; when absent it deserialises
         // to None, when present it round-trips unchanged.
@@ -522,6 +568,7 @@ mod tests {
         assert_eq!(outgoing::TOOL_RESULT, "wm.brain.tool.result");
         assert_eq!(outgoing::ERROR, "wm.brain.error");
         assert_eq!(outgoing::CONTEXT, "wm.brain.context");
+        assert_eq!(outgoing::REPLY_PARTIAL, "wm.brain.reply.partial");
         assert_eq!(DIALOG_TOPIC_PREFIX, "wm.dialog.");
     }
 
