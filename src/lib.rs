@@ -285,6 +285,7 @@ pub mod recall_client;
 pub mod redline;
 pub mod repair;
 pub mod router;
+pub mod sentence_splitter;
 pub mod session;
 pub mod writeback;
 pub use persist::default_config_path;
